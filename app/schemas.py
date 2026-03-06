@@ -34,6 +34,26 @@ class ExportRequest(BaseModel):
     existing_google_doc_id: str = Field(default="")
 
 
+class CalibrationExampleInput(BaseModel):
+    example_type: str
+    topic_name: str
+    audience: str = Field(default="")
+    title: str
+    source_text: str
+    evidence: List[dict] = Field(default_factory=list)
+    expected_cards: List[dict] = Field(default_factory=list)
+    expected_exclusions: List[dict] = Field(default_factory=list)
+    rationale: str = Field(default="")
+    tags: List[str] = Field(default_factory=list)
+
+
+class CalibrationSetImportRequest(BaseModel):
+    name: str
+    description: str = Field(default="")
+    metadata: dict = Field(default_factory=dict)
+    examples: List[CalibrationExampleInput] = Field(default_factory=list)
+
+
 class RunSummary(BaseModel):
     id: str
     created_at: str

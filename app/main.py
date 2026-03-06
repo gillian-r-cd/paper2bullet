@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse
 
 from .config import Settings, get_settings
 from .db import init_db
-from .schemas import ExportRequest, ReviewRequest, RunCreateRequest
+from .schemas import CalibrationSetImportRequest, ExportRequest, ReviewRequest, RunCreateRequest
 from .llm import LLMCardEngine, LLMGenerationError
 from .services import ExportService, Repository, RunCoordinator
 
@@ -74,6 +74,40 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "access_queue": repository.list_access_queue(run_id),
         }
 
+    @app.get("/api/calibration/sets")
+    def list_calibration_sets() -> dict:
+        return {
+            "active_set": repository.get_active_calibration_set(),
+            "sets": repository.list_calibration_sets(),
+        }
+
+    @app.get("/api/calibration/sets/{calibration_set_id}")
+    def get_calibration_set(calibration_set_id: str) -> dict:
+        calibration_set = repository.get_calibration_set(calibration_set_id)
+        if not calibration_set:
+            raise HTTPException(status_code=404, detail="Calibration set not found")
+        return {"calibration_set": calibration_set}
+
+    @app.post("/api/calibration/sets/import")
+    def import_calibration_set(payload: CalibrationSetImportRequest) -> dict:
+        try:
+            calibration_set = repository.import_calibration_set(
+                name=payload.name,
+                description=payload.description,
+                metadata=payload.metadata,
+                examples=[item.model_dump() for item in payload.examples],
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"calibration_set": calibration_set}
+
+    @app.post("/api/calibration/sets/{calibration_set_id}/activate")
+    def activate_calibration_set(calibration_set_id: str) -> dict:
+        calibration_set = repository.activate_calibration_set(calibration_set_id)
+        if not calibration_set:
+            raise HTTPException(status_code=404, detail="Calibration set not found")
+        return {"calibration_set": calibration_set}
+
     @app.get("/api/cards")
     def list_cards(run_id: str = Query(default=""), topic: str = Query(default="")) -> dict:
         cards = repository.list_cards(run_id=run_id or None, topic=topic)
@@ -128,6 +162,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "topic_runs": repository.list_topic_runs(),
             "cards": repository.list_cards(),
             "access_queue": repository.list_access_queue(),
+            "calibration_sets": repository.list_calibration_sets(),
+            "active_calibration_set": repository.get_active_calibration_set(),
         }
 
     @app.post("/api/llm/smoke")

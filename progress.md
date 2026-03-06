@@ -85,6 +85,37 @@ Main sections: completed work, pending work, known issues, and next starting poi
   - 明确要求将 excluded content 升级为 first-class review object，而不只是 detail 中可见
   - 明确要求建立 evaluation loop，用评估运行而不是感觉来比较 prompt / rubric / model 变化
   - 已同步到验收标准、Phase 0 interrupt requirement 和详细 TODO 列表
+- 已完成插队需求的第一实施阶段：把 calibration corpus 从文档概念落成正式系统对象
+  - `app/db.py` 新增 `calibration_sets` 和 `calibration_examples` 表
+  - `Repository` 新增 calibration set 导入、激活、列出、查询 active set、列出 examples 的持久层方法
+  - 导入时会验证 example_type、必填字段、列表字段结构，避免把脏样本直接写进库
+  - `app/main.py` 新增 calibration API：
+    - `GET /api/calibration/sets`
+    - `GET /api/calibration/sets/{id}`
+    - `POST /api/calibration/sets/import`
+    - `POST /api/calibration/sets/{id}/activate`
+  - 新增 `scripts/import_calibration_examples.py`，支持从 JSON 文件导入并可选激活一套 calibration set
+  - `tests/test_app.py` 新增覆盖：
+    - calibration set API 导入
+    - active set 激活
+    - 非法 example_type 拦截
+    - 脚本导入链路
+  - 当前测试总数已增至 23 个，并全部通过
+- 已完成插队需求的第二实施阶段：把 `LLMCardEngine` 从单阶段生成拆成 extraction / judgement 两步，并接入 active calibration set
+  - `app/llm.py` 新增：
+    - `extract_candidates()`
+    - `judge_candidates()`
+    - `generate_outputs()` 现在只是组合器，不再承载真实阶段边界
+  - extraction prompt 只负责提出 candidate cards 和 excluded content，不再承担最终 judgement
+  - judgement prompt 只负责对 extracted candidates 做最终成型和绿黄红判断
+  - judgement prompt 会注入 active calibration set 名称和筛选后的 calibration examples
+  - `PaperPipeline` 已改成显式调用 extraction -> judgement，而不是单次生成
+  - `app/main.py` 的 debug state 现在会暴露 active calibration set
+  - `tests/test_app.py` 新增覆盖：
+    - pipeline 会把 active calibration examples 传入 judgement
+    - `LLMCardEngine` judgement prompt 会实际携带 calibration examples
+    - 旧的单阶段 stub 测试已全部升级为双阶段调用
+  - 当前测试总数已增至 25 个，并全部通过
 
 ## 还没做什么
 
@@ -109,9 +140,9 @@ Main sections: completed work, pending work, known issues, and next starting poi
 - 已确认一次真实本地失败根因是 LLM provider endpoint 的 DNS / base_url 问题，而非 PDF 解析问题；当前已改为 LLM-only，因此 provider 配置不通时会显式 `0 cards`，不会再混入 heuristic 卡。
 - 当前工作区不是 git repository，无法按常规读取 `git log`；如果后续需要版本历史，需要确认外层仓库结构。
 - 这轮内容校准改造仍然只是第一阶段：
-  - 现在已经有了 `cards + excluded_content` 的统一输出契约，但还没有接入真正的正样本 / 负样本 / 边界 case 校准集
-  - 当前“挡弱卡”的机制仍以 LLM schema 约束 + 结构化质量闸门为主，距离真正贴合老板审美的 judging 还有一段路
+  - 现在已经有了 calibration corpus 的正式持久层和导入链，并且 active set 已接入 judgement prompt，但还没有 evaluation loop
   - review 列表页还没有把 excluded content 做成单独列表或更强筛选器，目前主要在 card detail 中可见
+  - evaluation loop 还没有落库，也没有 prompt/rubric/model 的回归评估执行链
 - 当前目录最初不是 git repository；如果要发布到 GitHub，需要先初始化 git、配置 remote、确认忽略规则，再进行首次提交和推送
 - 已补 `.gitignore`，新增忽略 `.venv/`，避免首次发布时把本地虚拟环境误提交
 - 当前受限执行环境阻止创建 `.git` 目录，因此无法在这里完成 `git init` 和后续推送；如果继续发布，需要在本地终端完成初始化与 push
@@ -127,7 +158,8 @@ Main sections: completed work, pending work, known issues, and next starting poi
 - 下一次若继续做 live 联调，优先在你本地终端直接执行 `python3 scripts/live_llm_smoke_test.py` 或调用 `/api/llm/smoke`。
 - 下一次如果继续提高出卡质量，优先做内容层校准：先整理 5-8 张强正样本、5-8 张强负样本、5-10 个边界 case，再据此改 LLM prompt 和评审 rubric，而不是继续盲调模型。
 - 下一次如果继续做内容校准，先跑一遍当前 20 个测试，再补：
-  - 正样本 / 负样本 / 边界 case 的持久化结构
-  - prompt 变更前后的校准集回归测试
-  - review UI 对 excluded content 的筛选与批量审阅能力
+  - 先跑当前 25 个测试
+  - 然后补 evaluation loop：evaluation_runs / evaluation_results / 指标计算 / 执行脚本
+  - 再把 excluded content 拉进 review list 主视图和批量操作
+  - 最后再重构 `review_decisions`，从 `card_id` 升级成统一 review target
 - 如果下一次继续做 GitHub 发布之后的开发，先确认远端主分支和默认分支名称，再按 `[module] description` 规范继续提交

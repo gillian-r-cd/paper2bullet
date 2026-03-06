@@ -246,37 +246,28 @@ class LLMCardEngine:
     def is_enabled(self) -> bool:
         return self.client is not None
 
-    def generate_outputs(self, *, topic_name: str, paper_title: str, sections: list[dict]) -> dict[str, list[dict]]:
+    def extract_candidates(self, *, topic_name: str, paper_title: str, sections: list[dict]) -> dict[str, list[dict]]:
         if not self.client:
             return {"cards": [], "excluded_content": []}
-        prompt_sections = [
-            {
-                "section_id": section["id"],
-                "page_number": section["page_number"],
-                "text": section["paragraph_text"],
-            }
-            for section in sections[:8]
-        ]
+        prompt_sections = self._build_prompt_sections(sections)
         system_prompt = (
-            "You extract atomic, evidence-backed aha-moment candidate cards from academic paper evidence for course design. "
-            "You are not a paper summarizer. Return strict JSON only. Never invent evidence. Prefer 0-3 cards. "
-            "Only return a card when the evidence supports a learner-facing insight with a clear cognitive shift and a short transfer distance to teaching use. "
-            "Reject content that is merely background theory, literature review, taxonomy recap, generic summary, or technical detail that is too far from course use. "
-            "For important content that should not become a card, record it in excluded_content with a short reason."
+            "You extract candidate aha-moment insights and major rejected content from academic paper evidence for course design. "
+            "You are not a paper summarizer. Return strict JSON only. Never invent evidence. Prefer 0-3 candidate cards. "
+            "At this stage, identify plausible learner-facing candidates and explicit rejected content, but do not assign final green/yellow/red judgement yet."
         )
         user_prompt = json.dumps(
             {
                 "topic": topic_name,
                 "paper_title": paper_title,
                 "sections": prompt_sections,
+                "stage": "candidate_extraction",
                 "content_rules": {
-                    "must_be_true_for_a_card": [
-                        "The idea is a learner-facing aha, not just a paper takeaway.",
-                        "The card can be taught as a concrete course object, frame, pattern, or evidence-backed talking point.",
-                        "The evidence directly supports the claim.",
-                        "The card can be explained in one sentence to a learner.",
+                    "candidate_should_look_like": [
+                        "A plausible learner-facing aha candidate rather than a generic paper summary.",
+                        "A specific pattern, framework, sub-pattern, or evidence-backed detail worth judging later.",
+                        "Clearly tied to provided section_ids.",
                     ],
-                    "must_be_rejected": [
+                    "should_be_rejected_here": [
                         "Background theory or literature review context.",
                         "Classification or taxonomy recap without a sharp insight.",
                         "Generic paper summary or conclusion.",
@@ -290,19 +281,13 @@ class LLMCardEngine:
                             "title": "human-readable card title",
                             "section_ids": ["section_id"],
                             "granularity_level": "framework|subpattern|detail",
-                            "course_transformation": "what it becomes in the course",
-                            "teachable_one_liner": "one sentence a teacher can say out loud",
-                            "draft_body": "short explanation grounded in evidence, focused on the learner-facing insight",
+                            "draft_body": "short explanation grounded in evidence",
                             "evidence_analysis": [
                                 {
                                     "section_id": "section_id",
                                     "analysis": "1-2 sentence explanation of why this quoted evidence matters",
                                 }
                             ],
-                            "judgement": {
-                                "color": "green|yellow|red",
-                                "reason": "short reason",
-                            },
                         }
                     ],
                     "excluded_content": [
@@ -319,7 +304,110 @@ class LLMCardEngine:
             indent=2,
         )
         payload = self.client.chat_json(system_prompt, user_prompt)
-        return self._normalize_outputs(payload, sections)
+        return self._normalize_extraction_output(payload, sections)
+
+    def judge_candidates(
+        self,
+        *,
+        topic_name: str,
+        paper_title: str,
+        extracted_cards: list[dict],
+        calibration_examples: list[dict],
+        calibration_set_name: str = "",
+    ) -> dict[str, list[dict]]:
+        if not self.client or not extracted_cards:
+            return {"cards": []}
+
+        selected_examples = self._select_calibration_examples(calibration_examples, topic_name)
+        prompt_candidates = []
+        for index, card in enumerate(extracted_cards):
+            prompt_candidates.append(
+                {
+                    "candidate_index": index,
+                    "title": card["title"],
+                    "granularity_level": card["granularity_level"],
+                    "draft_body": card["draft_body"],
+                    "evidence": [
+                        {
+                            "section_id": item["section_id"],
+                            "quote": item["quote"],
+                            "analysis": item.get("analysis", ""),
+                        }
+                        for item in card["evidence"]
+                    ],
+                }
+            )
+
+        system_prompt = (
+            "You judge candidate aha-moment cards for course design. "
+            "You receive extracted candidates plus calibration examples that define the desired judgement boundary. "
+            "Return strict JSON only. Never invent evidence. "
+            "Use the calibration examples to decide whether each candidate is a true learner-facing aha, a weak summary, or a boundary case."
+        )
+        user_prompt = json.dumps(
+            {
+                "topic": topic_name,
+                "paper_title": paper_title,
+                "stage": "candidate_judgement",
+                "active_calibration_set": calibration_set_name,
+                "calibration_examples": selected_examples,
+                "candidates": prompt_candidates,
+                "judgement_rules": {
+                    "must_be_true_for_a_card": [
+                        "The candidate expresses a real learner-facing cognitive shift, not just a paper takeaway.",
+                        "The idea can become a concrete course object, frame, pattern, or evidence-backed talking point.",
+                        "The transfer distance to course use is short enough to teach.",
+                        "The claim strength is supported by the cited evidence.",
+                    ],
+                    "must_be_downgraded_or_rejected": [
+                        "The candidate is merely background, summary, taxonomy, or weak-transfer detail.",
+                        "The audience fit is wrong.",
+                        "The idea is academically valid but not teachable for the target learner.",
+                    ],
+                },
+                "output_schema": {
+                    "cards": [
+                        {
+                            "candidate_index": 0,
+                            "title": "final human-readable card title",
+                            "course_transformation": "what it becomes in the course",
+                            "teachable_one_liner": "one sentence a teacher can say out loud",
+                            "draft_body": "final short explanation grounded in evidence and learner-facing insight",
+                            "judgement": {
+                                "color": "green|yellow|red",
+                                "reason": "short reason that reflects the judgement boundary",
+                            },
+                        }
+                    ]
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        payload = self.client.chat_json(system_prompt, user_prompt)
+        return {"cards": self._normalize_judged_cards(payload, extracted_cards)}
+
+    def generate_outputs(
+        self,
+        *,
+        topic_name: str,
+        paper_title: str,
+        sections: list[dict],
+        calibration_examples: Optional[list[dict]] = None,
+        calibration_set_name: str = "",
+    ) -> dict[str, list[dict]]:
+        extracted = self.extract_candidates(topic_name=topic_name, paper_title=paper_title, sections=sections)
+        judged = self.judge_candidates(
+            topic_name=topic_name,
+            paper_title=paper_title,
+            extracted_cards=extracted["cards"],
+            calibration_examples=calibration_examples or [],
+            calibration_set_name=calibration_set_name,
+        )
+        return {
+            "cards": judged["cards"],
+            "excluded_content": extracted["excluded_content"],
+        }
 
     def generate_cards(self, *, topic_name: str, paper_title: str, sections: list[dict]) -> list[dict]:
         return self.generate_outputs(
@@ -361,7 +449,17 @@ class LLMCardEngine:
             "excluded_content": outputs["excluded_content"],
         }
 
-    def _normalize_outputs(self, payload: dict[str, Any], sections: list[dict]) -> dict[str, list[dict]]:
+    def _build_prompt_sections(self, sections: list[dict]) -> list[dict]:
+        return [
+            {
+                "section_id": section["id"],
+                "page_number": section["page_number"],
+                "text": section["paragraph_text"],
+            }
+            for section in sections[:8]
+        ]
+
+    def _normalize_extraction_output(self, payload: dict[str, Any], sections: list[dict]) -> dict[str, list[dict]]:
         raw_cards = payload.get("cards", [])
         raw_excluded = payload.get("excluded_content", [])
         if not isinstance(raw_cards, list):
@@ -375,13 +473,10 @@ class LLMCardEngine:
             if not isinstance(raw_card, dict):
                 continue
             title = str(raw_card.get("title", "")).strip()
-            course_transformation = str(raw_card.get("course_transformation", "")).strip()
-            teachable_one_liner = str(raw_card.get("teachable_one_liner", "")).strip()
             draft_body = str(raw_card.get("draft_body", "")).strip()
             granularity_level = str(raw_card.get("granularity_level", "subpattern")).strip().lower()
             section_ids = raw_card.get("section_ids", [])
             raw_evidence_analysis = raw_card.get("evidence_analysis", [])
-            judgement = raw_card.get("judgement", {})
 
             if not isinstance(section_ids, list) or not isinstance(raw_evidence_analysis, list):
                 continue
@@ -411,10 +506,6 @@ class LLMCardEngine:
                 continue
             if not is_readable_text(title):
                 continue
-            if not is_readable_text(course_transformation):
-                continue
-            if not is_readable_text(teachable_one_liner):
-                continue
             if not is_readable_text(draft_body):
                 continue
             if not all(is_readable_text(item["quote"]) for item in evidence):
@@ -422,28 +513,14 @@ class LLMCardEngine:
             if not all(is_readable_text(item["analysis"]) for item in evidence):
                 continue
 
-            color = str(judgement.get("color", "yellow")).strip().lower()
-            if color not in {"green", "yellow", "red"}:
-                color = "yellow"
-            reason = str(judgement.get("reason", "")).strip() or "LLM judgement did not provide a reason."
-
             normalized.append(
                 {
                     "title": title,
                     "granularity_level": granularity_level if granularity_level in {"framework", "subpattern", "detail"} else "subpattern",
-                    "course_transformation": course_transformation,
-                    "teachable_one_liner": teachable_one_liner,
                     "draft_body": draft_body,
                     "evidence": evidence,
                     "figure_ids": [],
                     "status": "candidate",
-                    "judgement": {
-                        "color": color,
-                        "reason": reason,
-                        "model_version": self.client.model,
-                        "prompt_version": "llm-card-generator-v1",
-                        "rubric_version": "llm-card-rubric-v1",
-                    },
                 }
             )
 
@@ -482,6 +559,92 @@ class LLMCardEngine:
             )
 
         return {"cards": normalized, "excluded_content": normalized_excluded}
+
+    def _normalize_judged_cards(self, payload: dict[str, Any], extracted_cards: list[dict]) -> list[dict]:
+        raw_cards = payload.get("cards", [])
+        if not isinstance(raw_cards, list):
+            raise LLMGenerationError("LLM judgement payload must contain a list named 'cards'")
+
+        normalized = []
+        for raw_card in raw_cards[: len(extracted_cards)]:
+            if not isinstance(raw_card, dict):
+                continue
+            try:
+                candidate_index = int(raw_card.get("candidate_index"))
+            except (TypeError, ValueError):
+                continue
+            if candidate_index < 0 or candidate_index >= len(extracted_cards):
+                continue
+
+            extracted = extracted_cards[candidate_index]
+            title = str(raw_card.get("title", extracted["title"])).strip()
+            course_transformation = str(raw_card.get("course_transformation", "")).strip()
+            teachable_one_liner = str(raw_card.get("teachable_one_liner", "")).strip()
+            draft_body = str(raw_card.get("draft_body", extracted["draft_body"])).strip()
+            judgement = raw_card.get("judgement", {})
+            if not all(
+                [
+                    is_readable_text(title),
+                    is_readable_text(course_transformation),
+                    is_readable_text(teachable_one_liner),
+                    is_readable_text(draft_body),
+                ]
+            ):
+                continue
+
+            color = str(judgement.get("color", "yellow")).strip().lower()
+            if color not in {"green", "yellow", "red"}:
+                color = "yellow"
+            reason = str(judgement.get("reason", "")).strip() or "LLM judgement did not provide a reason."
+            if not is_readable_text(reason):
+                continue
+
+            normalized.append(
+                {
+                    "title": title,
+                    "granularity_level": extracted["granularity_level"],
+                    "course_transformation": course_transformation,
+                    "teachable_one_liner": teachable_one_liner,
+                    "draft_body": draft_body,
+                    "evidence": extracted["evidence"],
+                    "figure_ids": extracted.get("figure_ids", []),
+                    "status": extracted.get("status", "candidate"),
+                    "judgement": {
+                        "color": color,
+                        "reason": reason,
+                        "model_version": self.client.model,
+                        "prompt_version": "llm-card-judge-v1",
+                        "rubric_version": "llm-card-rubric-v2",
+                    },
+                }
+            )
+        return normalized
+
+    def _select_calibration_examples(self, calibration_examples: list[dict], topic_name: str, limit: int = 6) -> list[dict]:
+        if not calibration_examples:
+            return []
+        same_topic = []
+        fallback = []
+        target = topic_name.strip().lower()
+        for example in calibration_examples:
+            compact = {
+                "example_type": example.get("example_type", ""),
+                "topic_name": example.get("topic_name", ""),
+                "audience": example.get("audience", ""),
+                "title": example.get("title", ""),
+                "expected_cards": example.get("expected_cards", []),
+                "expected_exclusions": example.get("expected_exclusions", []),
+                "rationale": example.get("rationale", ""),
+                "tags": example.get("tags", []),
+            }
+            if str(example.get("topic_name", "")).strip().lower() == target:
+                same_topic.append(compact)
+            else:
+                fallback.append(compact)
+        selected = same_topic[:limit]
+        if len(selected) < limit:
+            selected.extend(fallback[: limit - len(selected)])
+        return selected
 
     def _build_client(self, settings: Settings) -> Optional[BaseLLMClient]:
         if settings.llm_mode == "disabled":

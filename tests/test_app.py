@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 import tempfile
 import time
 import urllib.error
@@ -149,29 +150,39 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
 
             def chat_json(self, system_prompt: str, user_prompt: str) -> dict:
                 prompt = json.loads(user_prompt)
-                section_id = prompt["sections"][0]["section_id"]
+                if prompt["stage"] == "candidate_extraction":
+                    section_id = prompt["sections"][0]["section_id"]
+                    return {
+                        "cards": [
+                            {
+                                "title": "Adaptive selling improves perceived customer fit",
+                                "section_ids": [section_id],
+                                "granularity_level": "detail",
+                                "draft_body": "Adaptive selling can outperform rigid scripts when fit matters.",
+                                "evidence_analysis": [
+                                    {
+                                        "section_id": section_id,
+                                        "analysis": "This gives a measurable, learner-facing contrast between adaptive selling and rigid scripts.",
+                                    }
+                                ],
+                            }
+                        ],
+                        "excluded_content": [],
+                    }
                 return {
                     "cards": [
                         {
+                            "candidate_index": 0,
                             "title": "Adaptive selling improves perceived customer fit",
-                            "section_ids": [section_id],
-                            "granularity_level": "detail",
                             "course_transformation": "adaptive selling: evidence-backed talking point",
                             "teachable_one_liner": "Adaptive selling works because it fits the customer better than rigid scripts.",
                             "draft_body": "Adaptive selling can outperform rigid scripts when fit matters.",
-                            "evidence_analysis": [
-                                {
-                                    "section_id": section_id,
-                                    "analysis": "This gives a measurable, learner-facing contrast between adaptive selling and rigid scripts.",
-                                }
-                            ],
                             "judgement": {
                                 "color": "green",
                                 "reason": "Direct finding with measurable evidence.",
                             },
                         }
-                    ],
-                    "excluded_content": [],
+                    ]
                 }
 
         with patch.object(services_module.LLMCardEngine, "_build_client", return_value=StubClient()):
@@ -230,6 +241,80 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn('<textarea id="metadata" rows="4">{}</textarea>', response.text)
+
+    def test_can_import_and_activate_calibration_set_via_api(self) -> None:
+        payload = {
+            "name": "core-aha-boundaries-v1",
+            "description": "Initial positive, negative, and boundary examples.",
+            "metadata": {"owner": "test"},
+            "examples": [
+                {
+                    "example_type": "positive",
+                    "topic_name": "Context Engineering",
+                    "audience": "AI literacy learners",
+                    "title": "Legacy standards can outlive their official replacement in practice",
+                    "source_text": "Practitioners still use retired standards even after successors are published.",
+                    "evidence": [{"quote": "A retired standard remains widely referenced."}],
+                    "expected_cards": [{"title": "Legacy-standard inertia is real"}],
+                    "expected_exclusions": [],
+                    "rationale": "This creates a practical learner-facing insight.",
+                    "tags": ["positive", "weak-transfer-guard"],
+                },
+                {
+                    "example_type": "negative",
+                    "topic_name": "Context Engineering",
+                    "audience": "AI literacy learners",
+                    "title": "Background theory taxonomy",
+                    "source_text": "The paper surveys several classification schemes.",
+                    "evidence": [{"quote": "Several prior taxonomies are reviewed."}],
+                    "expected_cards": [],
+                    "expected_exclusions": [{"label": "Taxonomy recap", "exclusion_type": "summary"}],
+                    "rationale": "Useful background, but not an aha moment.",
+                    "tags": ["negative", "summary"],
+                },
+            ],
+        }
+
+        import_response = self.client.post("/api/calibration/sets/import", json=payload)
+        self.assertEqual(import_response.status_code, 200, import_response.text)
+        calibration_set = import_response.json()["calibration_set"]
+        self.assertEqual(calibration_set["name"], "core-aha-boundaries-v1")
+        self.assertEqual(len(calibration_set["examples"]), 2)
+
+        sets_response = self.client.get("/api/calibration/sets")
+        self.assertEqual(sets_response.status_code, 200, sets_response.text)
+        self.assertEqual(sets_response.json()["active_set"], None)
+        self.assertEqual(len(sets_response.json()["sets"]), 1)
+        self.assertEqual(sets_response.json()["sets"][0]["example_count"], 2)
+
+        activate_response = self.client.post(f"/api/calibration/sets/{calibration_set['id']}/activate")
+        self.assertEqual(activate_response.status_code, 200, activate_response.text)
+        self.assertEqual(activate_response.json()["calibration_set"]["status"], "active")
+
+        active_response = self.client.get("/api/calibration/sets")
+        self.assertEqual(active_response.status_code, 200, active_response.text)
+        self.assertIsNotNone(active_response.json()["active_set"])
+        self.assertEqual(active_response.json()["active_set"]["id"], calibration_set["id"])
+
+    def test_calibration_import_rejects_invalid_example_type(self) -> None:
+        response = self.client.post(
+            "/api/calibration/sets/import",
+            json={
+                "name": "bad-set",
+                "description": "",
+                "metadata": {},
+                "examples": [
+                    {
+                        "example_type": "maybe",
+                        "topic_name": "LLM agent",
+                        "title": "Bad example type",
+                        "source_text": "invalid",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("example_type", response.text)
 
     def test_parser_treats_pdf_magic_signature_as_pdf_even_without_pdf_suffix(self) -> None:
         source_pdf = Path(self.temp_dir.name) / "paper.03314"
@@ -365,14 +450,12 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
             def is_enabled(self) -> bool:
                 return True
 
-            def generate_outputs(self, *, topic_name: str, paper_title: str, sections: list[dict]) -> dict:
+            def extract_candidates(self, *, topic_name: str, paper_title: str, sections: list[dict]) -> dict:
                 return {
                     "cards": [
                         {
                             "title": "Agents improve planning reliability through explicit coordination",
                             "granularity_level": "subpattern",
-                            "course_transformation": f"{topic_name}: coordination lesson",
-                            "teachable_one_liner": "Make agents explain and check one another if you want planning reliability.",
                             "draft_body": "This card comes from the stubbed LLM card generator.",
                             "evidence": [
                                 {
@@ -384,13 +467,6 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                             ],
                             "figure_ids": [],
                             "status": "candidate",
-                            "judgement": {
-                                "color": "green",
-                                "reason": "Stubbed LLM judged this as a strong actionable pattern.",
-                                "model_version": "stub-llm-model",
-                                "prompt_version": "llm-card-generator-v1",
-                                "rubric_version": "llm-card-rubric-v1",
-                            },
                         }
                     ],
                     "excluded_content": [
@@ -401,6 +477,37 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                             "section_ids": [sections[0]["id"]],
                         }
                     ],
+                }
+
+            def judge_candidates(
+                self,
+                *,
+                topic_name: str,
+                paper_title: str,
+                extracted_cards: list[dict],
+                calibration_examples: list[dict],
+                calibration_set_name: str = "",
+            ) -> dict:
+                return {
+                    "cards": [
+                        {
+                            "title": extracted_cards[0]["title"],
+                            "granularity_level": extracted_cards[0]["granularity_level"],
+                            "course_transformation": f"{topic_name}: coordination lesson",
+                            "teachable_one_liner": "Make agents explain and check one another if you want planning reliability.",
+                            "draft_body": extracted_cards[0]["draft_body"],
+                            "evidence": extracted_cards[0]["evidence"],
+                            "figure_ids": [],
+                            "status": "candidate",
+                            "judgement": {
+                                "color": "green",
+                                "reason": "Stubbed LLM judged this as a strong actionable pattern.",
+                                "model_version": "stub-llm-model",
+                                "prompt_version": "llm-card-judge-v1",
+                                "rubric_version": "llm-card-rubric-v2",
+                            },
+                        }
+                    ]
                 }
 
         pipeline = PaperPipeline(self.settings, self.repository, card_engine=StubCardEngine())
@@ -451,7 +558,18 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
             def is_enabled(self) -> bool:
                 return True
 
-            def generate_outputs(self, *, topic_name: str, paper_title: str, sections: list[dict]) -> dict:
+            def extract_candidates(self, *, topic_name: str, paper_title: str, sections: list[dict]) -> dict:
+                return {"cards": [], "excluded_content": []}
+
+            def judge_candidates(
+                self,
+                *,
+                topic_name: str,
+                paper_title: str,
+                extracted_cards: list[dict],
+                calibration_examples: list[dict],
+                calibration_set_name: str = "",
+            ) -> dict:
                 raise LLMGenerationError("request to https://api.example.com/v1/chat/completions failed: boom")
 
         pipeline = PaperPipeline(self.settings, self.repository, card_engine=FailingCardEngine())
@@ -616,39 +734,50 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
             model = "stub-live-model"
 
             def chat_json(self, system_prompt: str, user_prompt: str) -> dict:
+                prompt = json.loads(user_prompt)
+                if prompt["stage"] == "candidate_extraction":
+                    return {
+                        "cards": [
+                            {
+                                "title": "Verifier agents reduce inconsistency in multi-agent workflows",
+                                "section_ids": ["section_demo_1", "section_demo_2"],
+                                "granularity_level": "subpattern",
+                                "draft_body": "Use a verifier agent to catch contradictions between worker agents.",
+                                "evidence_analysis": [
+                                    {
+                                        "section_id": "section_demo_1",
+                                        "analysis": "This explains the mechanism: contradictions have to be checked explicitly.",
+                                    },
+                                    {
+                                        "section_id": "section_demo_2",
+                                        "analysis": "This provides the measurable result that makes the pattern teachable.",
+                                    },
+                                ],
+                            }
+                        ],
+                        "excluded_content": [
+                            {
+                                "label": "General setup for multi-agent pipelines",
+                                "section_ids": ["section_demo_1"],
+                                "exclusion_type": "background",
+                                "reason": "The setup matters as context, but the verifier pattern is the real teachable point.",
+                            }
+                        ],
+                    }
                 return {
                     "cards": [
                         {
+                            "candidate_index": 0,
                             "title": "Verifier agents reduce inconsistency in multi-agent workflows",
-                            "section_ids": ["section_demo_1", "section_demo_2"],
-                            "granularity_level": "subpattern",
                             "course_transformation": "LLM agent: verifier pattern",
                             "teachable_one_liner": "Use a verifier agent when multiple worker agents may contradict one another.",
                             "draft_body": "Use a verifier agent to catch contradictions between worker agents.",
-                            "evidence_analysis": [
-                                {
-                                    "section_id": "section_demo_1",
-                                    "analysis": "This explains the mechanism: contradictions have to be checked explicitly.",
-                                },
-                                {
-                                    "section_id": "section_demo_2",
-                                    "analysis": "This provides the measurable result that makes the pattern teachable.",
-                                },
-                            ],
                             "judgement": {
                                 "color": "green",
                                 "reason": "Actionable orchestration pattern with measurable evidence.",
                             },
                         }
-                    ],
-                    "excluded_content": [
-                        {
-                            "label": "General setup for multi-agent pipelines",
-                            "section_ids": ["section_demo_1"],
-                            "exclusion_type": "background",
-                            "reason": "The setup matters as context, but the verifier pattern is the real teachable point.",
-                        }
-                    ],
+                    ]
                 }
 
         engine = LLMCardEngine(self.settings, client=StubClient())
@@ -693,6 +822,258 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         payload = engine.smoke_test()
         self.assertEqual(payload["card_count"], 0)
         self.assertEqual(len(payload["excluded_content"]), 1)
+
+    def test_pipeline_passes_active_calibration_examples_to_judgement(self) -> None:
+        run = self.repository.create_run("Context Engineering", {"operator": "tester"})
+        topic = self.repository.create_or_get_topic("Context Engineering")
+        paper = self.repository.create_or_get_paper(
+            title="Standards in Practice",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id="paper::standards-practice",
+            source_type="local",
+            local_path="",
+            original_url="",
+            access_status="open_fulltext",
+            ingestion_status="ready",
+            parse_status="parsed",
+            artifact_path="",
+        )
+        self.repository.link_paper_to_topic(paper["id"], topic["id"], run["id"], "local_pdf")
+        self.repository.replace_sections(
+            paper["id"],
+            [
+                {
+                    "id": "section_delta",
+                    "section_order": 1,
+                    "section_title": "Page 1",
+                    "paragraph_text": "Practitioners still use retired standards after successors are published.",
+                    "page_number": 1,
+                    "embedding": [0.0] * 64,
+                }
+            ],
+        )
+        calibration_set = self.repository.import_calibration_set(
+            name="context-engineering-v1",
+            description="Calibration examples for context engineering.",
+            metadata={},
+            examples=[
+                {
+                    "example_type": "positive",
+                    "topic_name": "Context Engineering",
+                    "audience": "operators",
+                    "title": "Legacy standard inertia",
+                    "source_text": "Old standards can outlive their replacements in practice.",
+                    "evidence": [{"quote": "A retired standard remains widely referenced."}],
+                    "expected_cards": [{"title": "Legacy-standard inertia is real"}],
+                    "expected_exclusions": [],
+                    "rationale": "A clear learner-facing aha.",
+                    "tags": ["positive"],
+                }
+            ],
+        )
+        self.repository.activate_calibration_set(calibration_set["id"])
+
+        class RecordingCardEngine:
+            def __init__(self):
+                self.judgement_inputs = None
+
+            def is_enabled(self) -> bool:
+                return True
+
+            def extract_candidates(self, *, topic_name: str, paper_title: str, sections: list[dict]) -> dict:
+                return {
+                    "cards": [
+                        {
+                            "title": "Old standards can outlive official replacement",
+                            "granularity_level": "detail",
+                            "draft_body": "Candidate extracted before judgement.",
+                            "evidence": [
+                                {
+                                    "section_id": sections[0]["id"],
+                                    "quote": sections[0]["paragraph_text"],
+                                    "page_number": sections[0]["page_number"],
+                                    "analysis": "This is a plausible learner-facing candidate.",
+                                }
+                            ],
+                            "figure_ids": [],
+                            "status": "candidate",
+                        }
+                    ],
+                    "excluded_content": [],
+                }
+
+            def judge_candidates(
+                self,
+                *,
+                topic_name: str,
+                paper_title: str,
+                extracted_cards: list[dict],
+                calibration_examples: list[dict],
+                calibration_set_name: str = "",
+            ) -> dict:
+                self.judgement_inputs = {
+                    "topic_name": topic_name,
+                    "paper_title": paper_title,
+                    "calibration_examples": calibration_examples,
+                    "calibration_set_name": calibration_set_name,
+                }
+                return {
+                    "cards": [
+                        {
+                            "title": extracted_cards[0]["title"],
+                            "granularity_level": extracted_cards[0]["granularity_level"],
+                            "course_transformation": "legacy reference translation",
+                            "teachable_one_liner": "Old standards can keep running your workflow long after they are officially retired.",
+                            "draft_body": extracted_cards[0]["draft_body"],
+                            "evidence": extracted_cards[0]["evidence"],
+                            "figure_ids": [],
+                            "status": "candidate",
+                            "judgement": {
+                                "color": "yellow",
+                                "reason": "Boundary-worthy but useful learner-facing insight.",
+                                "model_version": "recording-model",
+                                "prompt_version": "llm-card-judge-v1",
+                                "rubric_version": "llm-card-rubric-v2",
+                            },
+                        }
+                    ]
+                }
+
+        engine = RecordingCardEngine()
+        pipeline = PaperPipeline(self.settings, self.repository, card_engine=engine)
+        created_count = pipeline.build_cards(paper, topic, run["id"])
+
+        self.assertEqual(created_count, 1)
+        self.assertIsNotNone(engine.judgement_inputs)
+        self.assertEqual(engine.judgement_inputs["calibration_set_name"], "context-engineering-v1")
+        self.assertEqual(len(engine.judgement_inputs["calibration_examples"]), 1)
+        self.assertEqual(engine.judgement_inputs["calibration_examples"][0]["title"], "Legacy standard inertia")
+
+    def test_llm_engine_judgement_prompt_uses_calibration_examples(self) -> None:
+        class StubClient:
+            model = "stub-calibration-model"
+
+            def __init__(self):
+                self.calls = []
+
+            def chat_json(self, system_prompt: str, user_prompt: str) -> dict:
+                payload = json.loads(user_prompt)
+                self.calls.append(payload)
+                if payload["stage"] == "candidate_extraction":
+                    return {
+                        "cards": [
+                            {
+                                "title": "Retired standards can persist in real workflows",
+                                "section_ids": ["section_demo_1"],
+                                "granularity_level": "detail",
+                                "draft_body": "Candidate extraction result.",
+                                "evidence_analysis": [
+                                    {
+                                        "section_id": "section_demo_1",
+                                        "analysis": "The evidence suggests operational inertia around standards.",
+                                    }
+                                ],
+                            }
+                        ],
+                        "excluded_content": [],
+                    }
+                return {
+                    "cards": [
+                        {
+                            "candidate_index": 0,
+                            "title": "Retired standards can persist in real workflows",
+                            "course_transformation": "legacy-reference translation",
+                            "teachable_one_liner": "Official replacement does not mean practical replacement.",
+                            "draft_body": "Judged with calibration guidance.",
+                            "judgement": {
+                                "color": "yellow",
+                                "reason": "Calibration examples suggest this is a practical aha rather than a mere summary.",
+                            },
+                        }
+                    ]
+                }
+
+        client = StubClient()
+        engine = LLMCardEngine(self.settings, client=client)
+        outputs = engine.generate_outputs(
+            topic_name="Context Engineering",
+            paper_title="Smoke Test Paper",
+            sections=[
+                {
+                    "id": "section_demo_1",
+                    "page_number": 1,
+                    "paragraph_text": "A retired standard can remain in everyday use after a formal replacement appears.",
+                }
+            ],
+            calibration_examples=[
+                {
+                    "example_type": "positive",
+                    "topic_name": "Context Engineering",
+                    "audience": "operators",
+                    "title": "Legacy standard inertia",
+                    "expected_cards": [{"title": "Legacy-standard inertia is real"}],
+                    "expected_exclusions": [],
+                    "rationale": "Useful learner-facing pattern.",
+                    "tags": ["positive"],
+                }
+            ],
+            calibration_set_name="context-engineering-v1",
+        )
+
+        self.assertEqual(len(outputs["cards"]), 1)
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[1]["stage"], "candidate_judgement")
+        self.assertEqual(client.calls[1]["active_calibration_set"], "context-engineering-v1")
+        self.assertEqual(client.calls[1]["calibration_examples"][0]["title"], "Legacy standard inertia")
+
+    def test_import_calibration_examples_script_persists_set(self) -> None:
+        source_json = Path(self.temp_dir.name) / "calibration-set.json"
+        source_json.write_text(
+            json.dumps(
+                {
+                    "name": "script-imported-v1",
+                    "description": "Imported from script.",
+                    "metadata": {"source": "script"},
+                    "examples": [
+                        {
+                            "example_type": "boundary",
+                            "topic_name": "LLM agent",
+                            "audience": "operators",
+                            "title": "Borderline evidence case",
+                            "source_text": "Some evidence exists, but the transfer distance is debatable.",
+                            "evidence": [{"quote": "The paper reports a partial result."}],
+                            "expected_cards": [{"title": "Borderline orchestration lesson"}],
+                            "expected_exclusions": [{"label": "Background setup", "exclusion_type": "background"}],
+                            "rationale": "Useful for yellow-zone calibration.",
+                            "tags": ["boundary"],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env["P2B_DATA_DIR"] = str(self.settings.data_dir)
+        env["P2B_DB_PATH"] = str(self.settings.db_path)
+        result = subprocess.run(
+            ["python3", "scripts/import_calibration_examples.py", str(source_json), "--activate"],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["calibration_set"]["status"], "active")
+
+        active_set = self.repository.get_active_calibration_set()
+        self.assertIsNotNone(active_set)
+        self.assertEqual(active_set["name"], "script-imported-v1")
+        self.assertEqual(len(active_set["examples"]), 1)
 
 
 if __name__ == "__main__":

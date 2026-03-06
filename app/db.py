@@ -29,6 +29,33 @@ CREATE TABLE IF NOT EXISTS topics (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS calibration_sets (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    activated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS calibration_examples (
+    id TEXT PRIMARY KEY,
+    calibration_set_id TEXT NOT NULL,
+    example_type TEXT NOT NULL,
+    topic_name TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    title TEXT NOT NULL,
+    source_text TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    expected_cards_json TEXT NOT NULL,
+    expected_exclusions_json TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    tags_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (calibration_set_id) REFERENCES calibration_sets(id)
+);
+
 CREATE TABLE IF NOT EXISTS topic_runs (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,

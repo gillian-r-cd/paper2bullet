@@ -64,6 +64,46 @@ def normalize_topics(topics_text: str) -> list[str]:
     return topics
 
 
+def normalize_calibration_example(example: dict) -> dict:
+    example_type = str(example.get("example_type", "")).strip().lower()
+    if example_type not in {"positive", "negative", "boundary"}:
+        raise ValueError("Calibration example_type must be one of: positive, negative, boundary.")
+
+    title = str(example.get("title", "")).strip()
+    source_text = str(example.get("source_text", "")).strip()
+    topic_name = str(example.get("topic_name", "")).strip()
+    audience = str(example.get("audience", "")).strip()
+    rationale = str(example.get("rationale", "")).strip()
+    if not title:
+        raise ValueError("Calibration example title is required.")
+    if not source_text:
+        raise ValueError("Calibration example source_text is required.")
+    if not topic_name:
+        raise ValueError("Calibration example topic_name is required.")
+
+    evidence = example.get("evidence", [])
+    expected_cards = example.get("expected_cards", [])
+    expected_exclusions = example.get("expected_exclusions", [])
+    tags = example.get("tags", [])
+    if not isinstance(evidence, list) or not isinstance(expected_cards, list) or not isinstance(expected_exclusions, list):
+        raise ValueError("Calibration example evidence, expected_cards, and expected_exclusions must be lists.")
+    if not isinstance(tags, list):
+        raise ValueError("Calibration example tags must be a list.")
+
+    return {
+        "example_type": example_type,
+        "topic_name": topic_name,
+        "audience": audience,
+        "title": title,
+        "source_text": source_text,
+        "evidence": evidence,
+        "expected_cards": expected_cards,
+        "expected_exclusions": expected_exclusions,
+        "rationale": rationale,
+        "tags": [str(tag).strip() for tag in tags if str(tag).strip()],
+    }
+
+
 def split_paragraphs(text: str) -> list[str]:
     text = text.replace("\u00ad", "")
     text = re.sub(r"([A-Za-z])-\s+([a-z])", r"\1\2", text)
@@ -136,6 +176,130 @@ class Repository:
                 (topic["id"], topic["name"], topic["description"], topic["created_at"]),
             )
         return topic
+
+    def import_calibration_set(self, name: str, description: str, metadata: dict, examples: list[dict]) -> dict:
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise ValueError("Calibration set name is required.")
+        if not isinstance(metadata, dict):
+            raise ValueError("Calibration set metadata must be an object.")
+        normalized_examples = [normalize_calibration_example(example) for example in examples]
+        if not normalized_examples:
+            raise ValueError("Calibration set import requires at least one example.")
+
+        existing = self._fetchone("SELECT * FROM calibration_sets WHERE lower(name) = lower(?)", (normalized_name,))
+        calibration_set_id = existing["id"] if existing else new_id("cset")
+        created_at = existing["created_at"] if existing else utc_now()
+        activated_at = existing["activated_at"] if existing else ""
+        status = existing["status"] if existing else "draft"
+
+        with db_cursor(self.settings.db_path) as connection:
+            if existing:
+                connection.execute(
+                    """
+                    UPDATE calibration_sets
+                    SET description = ?, metadata_json = ?
+                    WHERE id = ?
+                    """,
+                    (description, json.dumps(metadata, ensure_ascii=False), calibration_set_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO calibration_sets(id, name, description, status, metadata_json, created_at, activated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        calibration_set_id,
+                        normalized_name,
+                        description,
+                        status,
+                        json.dumps(metadata, ensure_ascii=False),
+                        created_at,
+                        activated_at,
+                    ),
+                )
+            connection.execute("DELETE FROM calibration_examples WHERE calibration_set_id = ?", (calibration_set_id,))
+            for example in normalized_examples:
+                connection.execute(
+                    """
+                    INSERT INTO calibration_examples(
+                        id, calibration_set_id, example_type, topic_name, audience, title, source_text,
+                        evidence_json, expected_cards_json, expected_exclusions_json, rationale, tags_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_id("cex"),
+                        calibration_set_id,
+                        example["example_type"],
+                        example["topic_name"],
+                        example["audience"],
+                        example["title"],
+                        example["source_text"],
+                        json.dumps(example["evidence"], ensure_ascii=False),
+                        json.dumps(example["expected_cards"], ensure_ascii=False),
+                        json.dumps(example["expected_exclusions"], ensure_ascii=False),
+                        example["rationale"],
+                        json.dumps(example["tags"], ensure_ascii=False),
+                        utc_now(),
+                    ),
+                )
+        return self.get_calibration_set(calibration_set_id) or {}
+
+    def activate_calibration_set(self, calibration_set_id: str) -> Optional[dict]:
+        target = self._fetchone("SELECT * FROM calibration_sets WHERE id = ?", (calibration_set_id,))
+        if not target:
+            return None
+        activated_at = utc_now()
+        with db_cursor(self.settings.db_path) as connection:
+            connection.execute(
+                "UPDATE calibration_sets SET status = 'draft', activated_at = '' WHERE status = 'active'"
+            )
+            connection.execute(
+                "UPDATE calibration_sets SET status = 'active', activated_at = ? WHERE id = ?",
+                (activated_at, calibration_set_id),
+            )
+        return self.get_calibration_set(calibration_set_id)
+
+    def list_calibration_sets(self) -> list[dict]:
+        rows = self._fetchall("SELECT * FROM calibration_sets ORDER BY created_at DESC")
+        for row in rows:
+            row["metadata"] = json.loads(row["metadata_json"])
+            row["example_count"] = self._fetchone(
+                "SELECT COUNT(*) AS count FROM calibration_examples WHERE calibration_set_id = ?",
+                (row["id"],),
+            )["count"]
+        return rows
+
+    def get_calibration_set(self, calibration_set_id: str) -> Optional[dict]:
+        row = self._fetchone("SELECT * FROM calibration_sets WHERE id = ?", (calibration_set_id,))
+        if not row:
+            return None
+        row["metadata"] = json.loads(row["metadata_json"])
+        row["examples"] = self.list_calibration_examples(calibration_set_id)
+        return row
+
+    def get_active_calibration_set(self) -> Optional[dict]:
+        row = self._fetchone("SELECT * FROM calibration_sets WHERE status = 'active' ORDER BY activated_at DESC LIMIT 1")
+        if not row:
+            return None
+        return self.get_calibration_set(row["id"])
+
+    def list_calibration_examples(self, calibration_set_id: str) -> list[dict]:
+        rows = self._fetchall(
+            """
+            SELECT * FROM calibration_examples
+            WHERE calibration_set_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (calibration_set_id,),
+        )
+        for row in rows:
+            row["evidence"] = json.loads(row["evidence_json"])
+            row["expected_cards"] = json.loads(row["expected_cards_json"])
+            row["expected_exclusions"] = json.loads(row["expected_exclusions_json"])
+            row["tags"] = json.loads(row["tags_json"])
+        return rows
 
     def create_run(self, topics_text: str, metadata: dict) -> dict:
         run = {
@@ -1192,16 +1356,24 @@ class PaperPipeline:
         return len(cards)
 
     def _build_cards_with_llm(self, sections: list[dict], topic: dict, paper: dict) -> dict:
-        generation_output = self.card_engine.generate_outputs(
+        extracted_output = self.card_engine.extract_candidates(
             topic_name=topic["name"],
             paper_title=paper["title"],
             sections=sections,
         )
+        active_calibration_set = self.repository.get_active_calibration_set()
+        judged_output = self.card_engine.judge_candidates(
+            topic_name=topic["name"],
+            paper_title=paper["title"],
+            extracted_cards=extracted_output["cards"],
+            calibration_examples=(active_calibration_set or {}).get("examples", []),
+            calibration_set_name=(active_calibration_set or {}).get("name", ""),
+        )
         return {
-            "cards": [self._finalize_card(card, topic["name"]) for card in generation_output["cards"]],
+            "cards": [self._finalize_card(card, topic["name"]) for card in judged_output["cards"]],
             "excluded_content": [
                 self._finalize_excluded_content(item)
-                for item in generation_output["excluded_content"]
+                for item in extracted_output["excluded_content"]
             ],
         }
 
