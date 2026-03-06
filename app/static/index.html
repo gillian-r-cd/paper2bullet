@@ -10,8 +10,8 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
   <title>Paper to Bullet</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 24px; color: #222; }
-    textarea, input, button { font: inherit; }
-    textarea, input[type="text"] { width: 100%; box-sizing: border-box; padding: 8px; }
+    textarea, input, button, select { font: inherit; }
+    textarea, input[type="text"], select { width: 100%; box-sizing: border-box; padding: 8px; }
     button { padding: 8px 14px; cursor: pointer; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
     .panel { border: 1px solid #ddd; padding: 16px; border-radius: 8px; }
@@ -23,6 +23,11 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     .red { color: #9d1c1c; font-weight: bold; }
     .mono { font-family: Menlo, monospace; font-size: 12px; }
     .details { white-space: pre-wrap; background: #fafafa; padding: 12px; border-radius: 6px; margin-top: 10px; }
+    .inline-details { white-space: pre-wrap; background: #fafafa; padding: 12px; border-radius: 6px; }
+    .paper-link { display: block; margin-top: 4px; font-size: 12px; }
+    .picker { max-height: 240px; overflow: auto; border: 1px solid #ddd; border-radius: 6px; padding: 8px; margin-top: 8px; }
+    .picker-item { display: block; padding: 6px 0; border-bottom: 1px solid #eee; }
+    .picker-item:last-child { border-bottom: none; }
   </style>
 </head>
 <body>
@@ -64,10 +69,31 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         <label for="filter-topic">Filter by Topic</label>
         <input id="filter-topic" type="text" placeholder="adaptive selling">
       </div>
-      <button id="refresh-cards">Refresh Cards</button>
+      <div style="flex: 1;">
+        <label for="filter-item-type">Item Type</label>
+        <select id="filter-item-type">
+          <option value="cards">Cards Only</option>
+          <option value="excluded">Excluded Only</option>
+          <option value="both">Cards + Excluded</option>
+        </select>
+      </div>
+      <div style="flex: 1;">
+        <label for="filter-review-status">Review Status</label>
+        <input id="filter-review-status" type="text" placeholder="accepted">
+      </div>
+      <div style="flex: 1;">
+        <label for="filter-exclusion-type">Exclusion Type</label>
+        <input id="filter-exclusion-type" type="text" placeholder="summary">
+      </div>
+      <button id="refresh-review-items">Refresh Review Items</button>
     </div>
-    <div id="cards"></div>
-    <div id="card-detail" class="details"></div>
+    <div id="review-items"></div>
+  </div>
+
+  <div class="panel" style="margin-top: 20px;">
+    <h2>Calibration Status</h2>
+    <button id="refresh-calibration-status">Refresh Calibration Status</button>
+    <div id="calibration-status" class="details"></div>
   </div>
 
   <div class="grid" style="margin-top: 20px;">
@@ -78,25 +104,131 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     </div>
     <div class="panel">
       <h2>Export</h2>
-      <label for="export-run-id">Run ID</label>
-      <input id="export-run-id" type="text" placeholder="run_xxx">
+      <label for="export-run-id">Run</label>
+      <select id="export-run-id">
+        <option value="">Select a run</option>
+      </select>
       <label for="export-title">Document Title</label>
       <input id="export-title" type="text" placeholder="Boss Report - Adaptive Selling">
-      <label for="export-card-ids">Card IDs, comma separated</label>
-      <textarea id="export-card-ids" rows="5" placeholder="card_xxx,card_yyy"></textarea>
+      <label for="export-card-picker">Accepted Cards</label>
+      <div id="export-card-picker" class="picker">(select a run first)</div>
+      <label for="export-card-ids">Selected Card IDs</label>
+      <textarea id="export-card-ids" rows="5" placeholder="card_xxx,card_yyy" readonly></textarea>
       <button id="export-doc">Build Google Doc Export Package</button>
       <div id="export-result" class="details"></div>
     </div>
   </div>
 
   <script>
+    let reviewItemsState = [];
+    let reviewItemDetailsByKey = {};
+    let expandedReviewItemKey = "";
+    let exportSelectedCardIds = new Set();
+    let exportCandidateCards = [];
+
     async function readJson(url, options) {
       const response = await fetch(url, options);
-      const data = await response.json();
+      const bodyText = await response.text();
+      let data = {};
+      if (bodyText) {
+        try {
+          data = JSON.parse(bodyText);
+        } catch (error) {
+          if (!response.ok) {
+            throw new Error(bodyText);
+          }
+          throw error;
+        }
+      }
       if (!response.ok) {
-        throw new Error(data.detail || JSON.stringify(data));
+        throw new Error(data.detail || bodyText || JSON.stringify(data) || `HTTP ${response.status}`);
       }
       return data;
+    }
+
+    function reviewItemKey(targetType, targetId) {
+      return `${targetType}:${targetId}`;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function formatPaperCell(item) {
+      const title = escapeHtml(item.paper_title || "");
+      if (!item.paper_url) {
+        return title;
+      }
+      const url = escapeHtml(item.paper_url);
+      return `${title}<a class="paper-link" href="${url}" target="_blank" rel="noreferrer">Open paper link</a>`;
+    }
+
+    function syncSelectedCardIdsField() {
+      document.getElementById("export-card-ids").value = Array.from(exportSelectedCardIds).join(",");
+    }
+
+    function setExportSelectedCardIds(cardIds) {
+      exportSelectedCardIds = new Set(cardIds);
+      syncSelectedCardIdsField();
+      renderReviewItems(reviewItemsState);
+      renderExportCardPicker(exportCandidateCards);
+    }
+
+    function toggleExportCardSelection(cardId, checked) {
+      if (checked) {
+        exportSelectedCardIds.add(cardId);
+      } else {
+        exportSelectedCardIds.delete(cardId);
+      }
+      syncSelectedCardIdsField();
+      renderReviewItems(reviewItemsState);
+      renderExportCardPicker(exportCandidateCards);
+    }
+
+    function updateExportRunOptions(runs) {
+      const select = document.getElementById("export-run-id");
+      const previousValue = select.value;
+      const options = ['<option value="">Select a run</option>'];
+      for (const run of runs) {
+        options.push(`<option value="${run.id}">${run.id} | ${run.status}</option>`);
+      }
+      select.innerHTML = options.join("");
+      if (previousValue && runs.some(run => run.id === previousValue)) {
+        select.value = previousValue;
+      } else if (!previousValue && runs.length > 0) {
+        select.value = runs[0].id;
+      }
+    }
+
+    function renderExportCardPicker(cards) {
+      exportCandidateCards = cards;
+      const picker = document.getElementById("export-card-picker");
+      if (!document.getElementById("export-run-id").value) {
+        picker.innerHTML = "(select a run first)";
+        return;
+      }
+      if (!cards.length) {
+        picker.innerHTML = "(no accepted cards available for this run)";
+        return;
+      }
+      picker.innerHTML = cards.map(card => `
+        <label class="picker-item">
+          <input
+            type="checkbox"
+            class="export-picker-select"
+            value="${card.object_id}"
+            ${exportSelectedCardIds.has(card.object_id) ? "checked" : ""}
+          >
+          <strong>${escapeHtml(card.display_title)}</strong><br>
+          <span>${escapeHtml(card.paper_title)}</span><br>
+          <span class="mono">${card.object_id}</span>
+        </label>
+      `).join("");
     }
 
     function parseLocalPdfLines(value) {
@@ -127,35 +259,68 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         <h3>Topic Jobs</h3>
         <table><tr><th>Run</th><th>Topic</th><th>Status</th><th>Stats</th></tr>${topicRows}</table>
       `;
+      updateExportRunOptions(runs);
     }
 
-    function renderCards(cards) {
-      const rows = cards.map(card => {
-        const colorClass = card.color || "yellow";
-        const review = card.review_decision || "";
-        return `
+    function renderReviewItems(items) {
+      reviewItemsState = items;
+      const rows = items.map(item => {
+        const colorClass = item.color || "yellow";
+        const review = item.review_status || "";
+        const selectable = item.object_type === "card" && item.export_eligible;
+        const rowKey = reviewItemKey(item.object_type, item.object_id);
+        const expandedItem = reviewItemDetailsByKey[rowKey];
+        const typeLabel = item.object_type === "card"
+          ? (item.promoted_from_excluded ? "Card (Promoted)" : "Card")
+          : "Excluded";
+        const actionButtons = item.object_type === "card"
+          ? `
+              <button onclick="toggleReviewItem('card', '${item.object_id}')">${expandedReviewItemKey === rowKey ? "Hide" : "View"}</button>
+              <button onclick="reviewItem('card', '${item.object_id}', 'accepted')">Accept</button>
+              <button onclick="reviewItem('card', '${item.object_id}', 'rejected')">Reject</button>
+              <button onclick="reviewItem('card', '${item.object_id}', 'keep_for_later')">Keep</button>
+              <button onclick="reviewItem('card', '${item.object_id}', 'needs_manual_check')">Manual Check</button>
+            `
+          : `
+              <button onclick="toggleReviewItem('excluded', '${item.object_id}')">${expandedReviewItemKey === rowKey ? "Hide" : "View"}</button>
+              <button onclick="reviewItem('excluded', '${item.object_id}', 'accepted')">Confirm Exclusion</button>
+              <button onclick="reviewItem('excluded', '${item.object_id}', 'reopened')">Reopen</button>
+              <button onclick="reviewItem('excluded', '${item.object_id}', 'needs_manual_check')">Manual Check</button>
+              <button onclick="promoteExcludedItem('${item.object_id}')" ${item.promoted_card_id ? "disabled" : ""}>Promote</button>
+            `;
+        const displayTitle = item.object_type === "excluded" && item.promoted_card_id
+          ? `${item.display_title} -> ${item.promoted_card_title}`
+          : item.display_title;
+        const mainRow = `
           <tr>
-            <td><input type="checkbox" class="card-select" value="${card.id}"></td>
-            <td>${card.id}</td>
-            <td>${card.topic_name}</td>
-            <td>${card.paper_title}</td>
-            <td>${card.title}</td>
-            <td class="${colorClass}">${card.color || ""}</td>
-            <td>${card.course_transformation}</td>
+            <td>${selectable ? `<input type="checkbox" class="export-select" value="${item.object_id}" ${exportSelectedCardIds.has(item.object_id) ? "checked" : ""}>` : ""}</td>
+            <td>${typeLabel}</td>
+            <td>${item.object_id}</td>
+            <td>${item.topic_name}</td>
+            <td>${formatPaperCell(item)}</td>
+            <td>${displayTitle}</td>
+            <td class="${colorClass}">${item.color || ""}</td>
+            <td>${item.course_transformation || ""}</td>
+            <td>${item.exclusion_type || ""}</td>
             <td>${review}</td>
-            <td>
-              <button onclick="loadCard('${card.id}')">View</button>
-              <button onclick="reviewCard('${card.id}', 'accepted')">Accept</button>
-              <button onclick="reviewCard('${card.id}', 'rejected')">Reject</button>
-              <button onclick="reviewCard('${card.id}', 'needs_manual_check')">Manual Check</button>
-            </td>
+            <td>${item.export_eligible ? "yes" : ""}</td>
+            <td>${actionButtons}</td>
+          </tr>
+        `;
+        if (expandedReviewItemKey !== rowKey) {
+          return mainRow;
+        }
+        const detailContent = expandedItem ? renderReviewItemDetail(expandedItem) : "Loading...";
+        return `${mainRow}
+          <tr>
+            <td colspan="12"><div class="inline-details">${escapeHtml(detailContent)}</div></td>
           </tr>
         `;
       }).join("");
-      document.getElementById("cards").innerHTML = `
+      document.getElementById("review-items").innerHTML = `
         <table>
           <tr>
-            <th></th><th>ID</th><th>Topic</th><th>Paper</th><th>Card</th><th>Color</th><th>Course Use</th><th>Review</th><th>Actions</th>
+            <th></th><th>Type</th><th>ID</th><th>Topic</th><th>Paper</th><th>Title</th><th>Color</th><th>Course Use</th><th>Exclusion Type</th><th>Review</th><th>Export</th><th>Actions</th>
           </tr>
           ${rows}
         </table>
@@ -183,16 +348,23 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     async function refreshRuns() {
       const payload = await readJson("/api/runs");
       renderRuns(payload);
+      await refreshExportOptions();
     }
 
-    async function refreshCards() {
+    async function refreshReviewItems() {
       const runId = document.getElementById("filter-run").value.trim();
       const topic = document.getElementById("filter-topic").value.trim();
+      const itemType = document.getElementById("filter-item-type").value;
+      const reviewStatus = document.getElementById("filter-review-status").value.trim();
+      const exclusionType = document.getElementById("filter-exclusion-type").value.trim();
       const params = new URLSearchParams();
       if (runId) params.set("run_id", runId);
       if (topic) params.set("topic", topic);
-      const payload = await readJson(`/api/cards?${params.toString()}`);
-      renderCards(payload.cards);
+      if (itemType) params.set("item_type", itemType);
+      if (reviewStatus) params.set("review_status", reviewStatus);
+      if (exclusionType) params.set("exclusion_type", exclusionType);
+      const payload = await readJson(`/api/review-items?${params.toString()}`);
+      renderReviewItems(payload.items);
     }
 
     async function refreshQueue() {
@@ -203,22 +375,73 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       renderQueue(payload.items);
     }
 
-    function renderCardDetail(card) {
-      const evidenceBlock = (card.evidence || []).map(item => {
+    async function refreshCalibrationStatus() {
+      const payload = await readJson("/api/debug/state");
+      const activeSet = payload.active_calibration_set;
+      const latestEvaluation = payload.latest_evaluation_run;
+      const lines = [
+        `Active calibration set: ${activeSet ? activeSet.name : "(none)"}`,
+        `Active example count: ${activeSet ? (activeSet.examples || []).length : 0}`,
+        "",
+        `Latest evaluation run: ${latestEvaluation ? latestEvaluation.id : "(none)"}`,
+        `Latest evaluation status: ${latestEvaluation ? latestEvaluation.status : ""}`,
+        `Latest evaluation summary: ${latestEvaluation ? JSON.stringify(latestEvaluation.summary || {}, null, 2) : "{}"}`
+      ];
+      document.getElementById("calibration-status").textContent = lines.join("\n");
+    }
+
+    function renderReviewItemDetail(item) {
+      if (item.object_type === "excluded") {
+        const evidenceSections = (item.evidence_sections || []).map(section =>
+          `- Evidence (${section.section_title || "Section"}): ${section.paragraph_text}`
+        ).join("\n\n");
+        const promotedCard = item.promoted_card
+          ? `Promoted card: ${item.promoted_card.id} | ${item.promoted_card.title} | ${item.promoted_card.review_status || ""}`
+          : "Promoted card: (none)";
+        const lines = [
+          `Excluded: ${item.label}`,
+          `Paper: ${item.paper_title || ""}`,
+          `Paper link: ${item.paper_url || ""}`,
+          `Type: ${item.exclusion_type || ""}`,
+          `Reason: ${item.reason || ""}`,
+          `Review: ${((item.review || {}).decision) || ""} | ${((item.review || {}).note) || ""}`,
+          promotedCard,
+          "",
+          "Evidence",
+          evidenceSections || "(none)"
+        ];
+        return lines.join("\n");
+      }
+
+      const evidenceBlock = (item.evidence || []).map(item => {
+        const quoteZh = item.quote_zh ? `\nEvidence (ZH): ${item.quote_zh}` : "";
         const analysis = item.analysis ? `\nWhy it matters: ${item.analysis}` : "";
-        return `- Evidence: ${item.quote}${analysis}`;
+        return `- Evidence (EN): ${item.quote}${quoteZh}${analysis}`;
       }).join("\n\n");
-      const excludedBlock = (card.excluded_content || []).map(item =>
+      const excludedBlock = (item.excluded_content || []).map(item =>
         `- ${item.label} [${item.exclusion_type}]\n  Reason: ${item.reason}`
       ).join("\n\n");
+      const neighborBlock = (item.neighbors || []).map(item =>
+        `- ${item.title} | ${item.relationship} | similarity=${item.similarity} | review=${item.review_decision || ""}\n  Why compare: ${item.relationship_reason}`
+      ).join("\n\n");
+      const sourceExcludedBlock = item.source_excluded_item
+        ? `Promoted from excluded: ${item.source_excluded_item.id} | ${item.source_excluded_item.label} | ${item.source_excluded_item.reason}`
+        : "Promoted from excluded: (none)";
       const sections = [
-        `Card: ${card.title}`,
-        `Teach it as: ${card.teachable_one_liner || ""}`,
-        `Course use: ${card.course_transformation || ""}`,
-        `Judgement: ${(card.judgement || {}).color || ""} | ${(card.judgement || {}).reason || ""}`,
+        `Card: ${item.title}`,
+        `Paper: ${item.paper_title || ""}`,
+        `Paper link: ${item.paper_url || ""}`,
+        `Teach it as: ${item.teachable_one_liner || ""}`,
+        `Course use: ${item.course_transformation || ""}`,
+        `Judgement: ${(item.judgement || {}).color || ""} | ${(item.judgement || {}).reason || ""}`,
+        `Review: ${((item.review || {}).decision) || ""} | ${((item.review || {}).note) || ""}`,
+        sourceExcludedBlock,
         "",
         "Evidence",
         evidenceBlock || "(none)",
+        "",
+        "Potential Dedupe Assistance",
+        neighborBlock || "(none)",
         "",
         "Excluded Content From This Paper",
         excludedBlock || "(none)"
@@ -226,19 +449,69 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       return sections.join("\n");
     }
 
-    async function loadCard(cardId) {
-      const payload = await readJson(`/api/cards/${cardId}`);
-      document.getElementById("card-detail").textContent = renderCardDetail(payload.card);
+    async function loadReviewItem(targetType, targetId) {
+      const payload = await readJson(`/api/review-items/${targetType}/${targetId}`);
+      reviewItemDetailsByKey[reviewItemKey(targetType, targetId)] = payload.item;
+      renderReviewItems(reviewItemsState);
     }
 
-    async function reviewCard(cardId, decision) {
-      await readJson(`/api/cards/${cardId}/review`, {
+    async function toggleReviewItem(targetType, targetId) {
+      const key = reviewItemKey(targetType, targetId);
+      if (expandedReviewItemKey === key) {
+        expandedReviewItemKey = "";
+        renderReviewItems(reviewItemsState);
+        return;
+      }
+      expandedReviewItemKey = key;
+      renderReviewItems(reviewItemsState);
+      await loadReviewItem(targetType, targetId);
+    }
+
+    async function reviewItem(targetType, targetId, decision) {
+      await readJson(`/api/review-items/${targetType}/${targetId}/review`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reviewer: "internal-ui", decision, note: "" })
       });
-      await refreshCards();
-      await loadCard(cardId);
+      await refreshReviewItems();
+      await refreshExportOptions();
+      await loadReviewItem(targetType, targetId);
+    }
+
+    async function promoteExcludedItem(targetId) {
+      await readJson(`/api/review-items/excluded/${targetId}/promote`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reviewer: "internal-ui", note: "" })
+      });
+      await refreshReviewItems();
+      await refreshExportOptions();
+      await loadReviewItem("excluded", targetId);
+    }
+
+    async function refreshExportOptions() {
+      const runId = document.getElementById("export-run-id").value;
+      if (!runId) {
+        exportCandidateCards = [];
+        setExportSelectedCardIds([]);
+        renderExportCardPicker([]);
+        return;
+      }
+      const params = new URLSearchParams({
+        run_id: runId,
+        item_type: "cards",
+        review_status: "accepted"
+      });
+      const payload = await readJson(`/api/review-items?${params.toString()}`);
+      const candidateCards = (payload.items || []).filter(item => item.object_type === "card" && item.export_eligible);
+      const nextSelectedIds = Array.from(exportSelectedCardIds).filter(cardId =>
+        candidateCards.some(item => item.object_id === cardId)
+      );
+      exportCandidateCards = candidateCards;
+      exportSelectedCardIds = new Set(nextSelectedIds);
+      syncSelectedCardIdsField();
+      renderReviewItems(reviewItemsState);
+      renderExportCardPicker(candidateCards);
     }
 
     document.getElementById("start-run").addEventListener("click", async () => {
@@ -266,7 +539,8 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
           document.getElementById("export-run-id").value = payload.run.id;
         }
         await refreshRuns();
-        setTimeout(refreshCards, 1000);
+        await refreshExportOptions();
+        setTimeout(refreshReviewItems, 1000);
         setTimeout(refreshQueue, 1000);
       } catch (error) {
         resultNode.textContent = `Run start failed: ${error.message}`;
@@ -274,32 +548,41 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     });
 
     document.getElementById("refresh-runs").addEventListener("click", refreshRuns);
-    document.getElementById("refresh-cards").addEventListener("click", refreshCards);
+    document.getElementById("refresh-review-items").addEventListener("click", refreshReviewItems);
     document.getElementById("refresh-queue").addEventListener("click", refreshQueue);
+    document.getElementById("refresh-calibration-status").addEventListener("click", refreshCalibrationStatus);
+    document.getElementById("export-run-id").addEventListener("change", refreshExportOptions);
 
     document.getElementById("export-doc").addEventListener("click", async () => {
       const runId = document.getElementById("export-run-id").value.trim();
       const title = document.getElementById("export-title").value.trim();
-      const cardIds = document.getElementById("export-card-ids").value.split(",").map(item => item.trim()).filter(Boolean);
-      const payload = await readJson("/api/exports/google-doc", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ run_id: runId, card_ids: cardIds, document_title: title })
-      });
-      document.getElementById("export-result").textContent = JSON.stringify(payload, null, 2);
+      const cardIds = Array.from(exportSelectedCardIds);
+      const resultNode = document.getElementById("export-result");
+      resultNode.textContent = "";
+      try {
+        const payload = await readJson("/api/exports/google-doc", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ run_id: runId, card_ids: cardIds, document_title: title })
+        });
+        resultNode.textContent = JSON.stringify(payload, null, 2);
+      } catch (error) {
+        resultNode.textContent = `Export failed: ${error.message}`;
+      }
     });
 
     document.addEventListener("change", (event) => {
-      if (!event.target.classList.contains("card-select")) {
+      if (!event.target.classList.contains("export-select") && !event.target.classList.contains("export-picker-select")) {
         return;
       }
-      const ids = Array.from(document.querySelectorAll(".card-select:checked")).map(node => node.value);
-      document.getElementById("export-card-ids").value = ids.join(",");
+      toggleExportCardSelection(event.target.value, event.target.checked);
     });
 
     refreshRuns();
-    refreshCards();
+    refreshReviewItems();
     refreshQueue();
+    refreshCalibrationStatus();
+    refreshExportOptions();
   </script>
 </body>
 </html>

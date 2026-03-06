@@ -16,6 +16,13 @@ from typing import Any, Optional
 
 from .config import Settings
 
+EXTRACTION_PROMPT_VERSION = "llm-card-extract-v2-zh"
+JUDGEMENT_PROMPT_VERSION = "llm-card-judge-v3-zh"
+CARD_RUBRIC_VERSION = "llm-card-rubric-v3"
+MAX_PROMPT_SECTIONS = 8
+MAX_PROMPT_FIGURES = 4
+MAX_CALIBRATION_EXAMPLES = 6
+
 
 class LLMGenerationError(RuntimeError):
     pass
@@ -80,7 +87,9 @@ def extract_json_object(text: str) -> dict[str, Any]:
 
 def is_readable_text(text: str) -> bool:
     cleaned = text.strip()
-    if len(cleaned) < 8:
+    contains_cjk = any("\u4e00" <= char <= "\u9fff" for char in cleaned)
+    minimum_length = 4 if contains_cjk else 8
+    if len(cleaned) < minimum_length:
         return False
     blocked_tokens = ["%PDF-", "endstream", "endobj", "xref", "trailer", "stream x"]
     lowered = cleaned.lower()
@@ -93,6 +102,27 @@ def is_readable_text(text: str) -> bool:
         1 for char in cleaned if char.isalpha() or char.isdigit() or char.isspace() or char in ".,;:!?-()[]/%'\":"
     )
     return readable_chars / max(len(cleaned), 1) >= 0.7
+
+
+def compact_text_length(text: str) -> int:
+    return len(re.sub(r"\s+", "", text.strip()))
+
+
+def looks_like_complete_translation(source_text: str, translated_text: str) -> bool:
+    source = source_text.strip()
+    translated = translated_text.strip()
+    if not is_readable_text(source) or not is_readable_text(translated):
+        return False
+
+    source_length = compact_text_length(source)
+    translated_length = compact_text_length(translated)
+    if source_length < 80:
+        return translated_length >= 10
+    if source_length < 160:
+        return translated_length >= max(18, int(source_length * 0.16))
+    if source_length < 320:
+        return translated_length >= max(32, int(source_length * 0.18))
+    return translated_length >= max(60, int(source_length * 0.2))
 
 
 @dataclass(frozen=True)
@@ -246,65 +276,43 @@ class LLMCardEngine:
     def is_enabled(self) -> bool:
         return self.client is not None
 
-    def extract_candidates(self, *, topic_name: str, paper_title: str, sections: list[dict]) -> dict[str, list[dict]]:
+    def extract_candidates(
+        self,
+        *,
+        topic_name: str,
+        paper_title: str,
+        sections: list[dict],
+        figures: Optional[list[dict]] = None,
+        calibration_examples: Optional[list[dict]] = None,
+        calibration_set_name: str = "",
+    ) -> dict[str, list[dict]]:
         if not self.client:
             return {"cards": [], "excluded_content": []}
         prompt_sections = self._build_prompt_sections(sections)
+        prompt_figures = self._build_prompt_figures(figures or [])
+        selected_examples = self._select_calibration_examples(calibration_examples or [], topic_name)
         system_prompt = (
-            "You extract candidate aha-moment insights and major rejected content from academic paper evidence for course design. "
-            "You are not a paper summarizer. Return strict JSON only. Never invent evidence. Prefer 0-3 candidate cards. "
-            "At this stage, identify plausible learner-facing candidates and explicit rejected content, but do not assign final green/yellow/red judgement yet."
+            "You extract learner-facing aha-moment candidates from academic paper evidence for course design. "
+            "You are not a paper summarizer and you must not output generic takeaways. "
+            "Return strict JSON only. Never invent evidence, figures, or course use. "
+            "All learner-facing strings must be written in Simplified Chinese. "
+            "Prefer 0-3 candidate cards. At this stage, identify candidate cards and explicit excluded content only. "
+            "Do not assign final green/yellow/red judgement yet."
         )
         user_prompt = json.dumps(
-            {
-                "topic": topic_name,
-                "paper_title": paper_title,
-                "sections": prompt_sections,
-                "stage": "candidate_extraction",
-                "content_rules": {
-                    "candidate_should_look_like": [
-                        "A plausible learner-facing aha candidate rather than a generic paper summary.",
-                        "A specific pattern, framework, sub-pattern, or evidence-backed detail worth judging later.",
-                        "Clearly tied to provided section_ids.",
-                    ],
-                    "should_be_rejected_here": [
-                        "Background theory or literature review context.",
-                        "Classification or taxonomy recap without a sharp insight.",
-                        "Generic paper summary or conclusion.",
-                        "Technical detail that is academically valid but too far from course use.",
-                        "Policy or management recommendation aimed at the wrong audience.",
-                    ],
-                },
-                "output_schema": {
-                    "cards": [
-                        {
-                            "title": "human-readable card title",
-                            "section_ids": ["section_id"],
-                            "granularity_level": "framework|subpattern|detail",
-                            "draft_body": "short explanation grounded in evidence",
-                            "evidence_analysis": [
-                                {
-                                    "section_id": "section_id",
-                                    "analysis": "1-2 sentence explanation of why this quoted evidence matters",
-                                }
-                            ],
-                        }
-                    ],
-                    "excluded_content": [
-                        {
-                            "label": "short name for rejected content",
-                            "section_ids": ["section_id"],
-                            "exclusion_type": "background|summary|weak_transfer|wrong_audience|replaced_by_stronger_card|insufficient_evidence|other",
-                            "reason": "short explanation of why this should not become a card",
-                        }
-                    ]
-                },
-            },
+            self._build_extraction_prompt_payload(
+                topic_name=topic_name,
+                paper_title=paper_title,
+                prompt_sections=prompt_sections,
+                prompt_figures=prompt_figures,
+                calibration_examples=selected_examples,
+                calibration_set_name=calibration_set_name,
+            ),
             ensure_ascii=False,
             indent=2,
         )
         payload = self.client.chat_json(system_prompt, user_prompt)
-        return self._normalize_extraction_output(payload, sections)
+        return self._normalize_extraction_output(payload, sections, figures or [])
 
     def judge_candidates(
         self,
@@ -342,45 +350,18 @@ class LLMCardEngine:
             "You judge candidate aha-moment cards for course design. "
             "You receive extracted candidates plus calibration examples that define the desired judgement boundary. "
             "Return strict JSON only. Never invent evidence. "
-            "Use the calibration examples to decide whether each candidate is a true learner-facing aha, a weak summary, or a boundary case."
+            "All learner-facing strings must be written in Simplified Chinese. "
+            "Use the calibration examples to decide whether each candidate creates a real learner-facing cognitive shift, "
+            "what it becomes in the course, and whether it is green, yellow, or red under the rubric."
         )
         user_prompt = json.dumps(
-            {
-                "topic": topic_name,
-                "paper_title": paper_title,
-                "stage": "candidate_judgement",
-                "active_calibration_set": calibration_set_name,
-                "calibration_examples": selected_examples,
-                "candidates": prompt_candidates,
-                "judgement_rules": {
-                    "must_be_true_for_a_card": [
-                        "The candidate expresses a real learner-facing cognitive shift, not just a paper takeaway.",
-                        "The idea can become a concrete course object, frame, pattern, or evidence-backed talking point.",
-                        "The transfer distance to course use is short enough to teach.",
-                        "The claim strength is supported by the cited evidence.",
-                    ],
-                    "must_be_downgraded_or_rejected": [
-                        "The candidate is merely background, summary, taxonomy, or weak-transfer detail.",
-                        "The audience fit is wrong.",
-                        "The idea is academically valid but not teachable for the target learner.",
-                    ],
-                },
-                "output_schema": {
-                    "cards": [
-                        {
-                            "candidate_index": 0,
-                            "title": "final human-readable card title",
-                            "course_transformation": "what it becomes in the course",
-                            "teachable_one_liner": "one sentence a teacher can say out loud",
-                            "draft_body": "final short explanation grounded in evidence and learner-facing insight",
-                            "judgement": {
-                                "color": "green|yellow|red",
-                                "reason": "short reason that reflects the judgement boundary",
-                            },
-                        }
-                    ]
-                },
-            },
+            self._build_judgement_prompt_payload(
+                topic_name=topic_name,
+                paper_title=paper_title,
+                prompt_candidates=prompt_candidates,
+                calibration_examples=selected_examples,
+                calibration_set_name=calibration_set_name,
+            ),
             ensure_ascii=False,
             indent=2,
         )
@@ -393,10 +374,18 @@ class LLMCardEngine:
         topic_name: str,
         paper_title: str,
         sections: list[dict],
+        figures: Optional[list[dict]] = None,
         calibration_examples: Optional[list[dict]] = None,
         calibration_set_name: str = "",
     ) -> dict[str, list[dict]]:
-        extracted = self.extract_candidates(topic_name=topic_name, paper_title=paper_title, sections=sections)
+        extracted = self.extract_candidates(
+            topic_name=topic_name,
+            paper_title=paper_title,
+            sections=sections,
+            figures=figures,
+            calibration_examples=calibration_examples,
+            calibration_set_name=calibration_set_name,
+        )
         judged = self.judge_candidates(
             topic_name=topic_name,
             paper_title=paper_title,
@@ -409,11 +398,19 @@ class LLMCardEngine:
             "excluded_content": extracted["excluded_content"],
         }
 
-    def generate_cards(self, *, topic_name: str, paper_title: str, sections: list[dict]) -> list[dict]:
+    def generate_cards(
+        self,
+        *,
+        topic_name: str,
+        paper_title: str,
+        sections: list[dict],
+        figures: Optional[list[dict]] = None,
+    ) -> list[dict]:
         return self.generate_outputs(
             topic_name=topic_name,
             paper_title=paper_title,
             sections=sections,
+            figures=figures,
         )["cards"]
 
     def smoke_test(self) -> dict[str, Any]:
@@ -424,21 +421,21 @@ class LLMCardEngine:
                 "id": "section_demo_1",
                 "page_number": 1,
                 "paragraph_text": (
-                    "We find that delegating subtasks to specialized agents improves solution quality, "
-                    "but only when the orchestration step explicitly checks contradictions between agents."
+                    "我们发现，把任务分给多个专门智能体并不会自动提升质量，"
+                    "真正带来效果的是在编排步骤里显式检查它们之间的矛盾。"
                 ),
             },
             {
                 "id": "section_demo_2",
                 "page_number": 1,
                 "paragraph_text": (
-                    "In our experiments, adding a verifier agent reduced final-answer inconsistency by 23 percent."
+                    "在实验中，加入一个验证者智能体后，最终答案的不一致率下降了 23%。"
                 ),
             },
         ]
         outputs = self.generate_outputs(
-            topic_name="LLM agent",
-            paper_title="Smoke Test Paper",
+            topic_name="多智能体协作",
+            paper_title="联调冒烟测试论文",
             sections=sections,
         )
         return {
@@ -449,17 +446,180 @@ class LLMCardEngine:
             "excluded_content": outputs["excluded_content"],
         }
 
+    def _build_extraction_prompt_payload(
+        self,
+        *,
+        topic_name: str,
+        paper_title: str,
+        prompt_sections: list[dict],
+        prompt_figures: list[dict],
+        calibration_examples: list[dict],
+        calibration_set_name: str,
+    ) -> dict[str, Any]:
+        return {
+            "topic": topic_name,
+            "paper_title": paper_title,
+            "stage": "candidate_extraction",
+            "output_language": "zh-CN",
+            "active_calibration_set": calibration_set_name,
+            "calibration_examples": calibration_examples,
+            "sections": prompt_sections,
+            "figures": prompt_figures,
+            "content_rules": {
+                "candidate_should_look_like": [
+                    "A learner-facing aha candidate that reveals a gap between what the learner would normally assume and what the paper evidence implies instead.",
+                    "Something teachable in a course with short transfer distance, not a generic summary.",
+                    "A pattern, framework, mechanism, or evidence-backed data point that can later become a concrete course object.",
+                    "Grounded in the provided section_ids, and optionally linked to provided figure_ids when a figure materially supports the idea.",
+                ],
+                "card_shape_rules": [
+                    "Write all card-facing strings in Simplified Chinese.",
+                    "Keep the original paper evidence as the primary body material by selecting the right section_ids rather than rewriting the paper.",
+                    "Use evidence_analysis to add only very short 1-2 sentence explanations of why each cited part matters for teaching.",
+                    "Prefer a strong specific title over a paper-topic label.",
+                    "If you cannot articulate a learner-facing candidate, emit no card.",
+                ],
+                "judgement_boundary_hints": [
+                    "Look for belief-gap, counterintuitive, tacit-to-explicit, or highly actionable insight candidates.",
+                    "Prefer ideas with commercial relevance and presentation usefulness, not only academic validity.",
+                    "A mere taxonomy recap, literature background, or weak-transfer technical detail should be rejected here.",
+                ],
+                "should_be_rejected_here": [
+                    "Background theory or literature review context.",
+                    "Classification or taxonomy recap without a sharp insight.",
+                    "Generic paper summary or conclusion.",
+                    "Technical detail that is academically valid but too far from course use.",
+                    "Policy or management recommendation aimed at the wrong audience.",
+                    "Old low-hanging-fruit claims that are already obvious to the target learner.",
+                ],
+            },
+            "output_schema": {
+                "cards": [
+                    {
+                        "title": "中文卡片标题",
+                        "section_ids": ["section_id"],
+                        "figure_ids": ["figure_id"],
+                        "granularity_level": "framework|subpattern|detail",
+                        "draft_body": "基于证据的中文简短说明",
+                        "evidence_analysis": [
+                            {
+                                "section_id": "section_id",
+                                "analysis": "1-2句中文说明，解释这段证据为什么值得教",
+                            }
+                        ],
+                    }
+                ],
+                "excluded_content": [
+                    {
+                        "label": "中文排除项名称",
+                        "section_ids": ["section_id"],
+                        "exclusion_type": "background|summary|weak_transfer|wrong_audience|replaced_by_stronger_card|insufficient_evidence|other",
+                        "reason": "中文简短理由，说明为什么这部分不应该出卡",
+                    }
+                ],
+            },
+        }
+
+    def _build_judgement_prompt_payload(
+        self,
+        *,
+        topic_name: str,
+        paper_title: str,
+        prompt_candidates: list[dict],
+        calibration_examples: list[dict],
+        calibration_set_name: str,
+    ) -> dict[str, Any]:
+        return {
+            "topic": topic_name,
+            "paper_title": paper_title,
+            "stage": "candidate_judgement",
+            "output_language": "zh-CN",
+            "active_calibration_set": calibration_set_name,
+            "calibration_examples": calibration_examples,
+            "candidates": prompt_candidates,
+            "judgement_rules": {
+                "must_be_true_for_a_card": [
+                    "The candidate expresses a real learner-facing cognitive shift instead of a paper takeaway.",
+                    "The idea can be named as a concrete course object, framework, pattern, story, or evidence-backed talking point.",
+                    "The transfer distance to course use is short enough to teach.",
+                    "The evidence strength matches the claim strength.",
+                    "At least one of these qualities is present: belief-gap, counterintuitive, tacit-to-explicit, or highly actionable.",
+                ],
+                "business_and_teaching_rules": [
+                    "Judge from the learner and course-design perspective, not only from academic importance.",
+                    "Prefer ideas that would make sense on one slide with one strong line and, when available, one supporting figure.",
+                    "If you cannot say what this becomes in the course, the card should not pass as green.",
+                ],
+                "evidence_translation_rules": [
+                    "For every evidence quote, provide a complete Simplified Chinese translation in quote_zh.",
+                    "Translate the full quoted evidence, not only the claim-relevant fragment.",
+                    "Do not summarize, compress, paraphrase away caveats, or keep only the punchline.",
+                    "If the quote contains multiple sentences, lists, or numbered parts, translate all of them in order.",
+                    "Preserve informational scope, caveats, enumerations, and logical structure from the English quote.",
+                ],
+                "color_rules": {
+                    "green": "Clear learner belief conflict or tacit-to-explicit shift, evidence is strong, and course use is obvious.",
+                    "yellow": "Potentially valuable but boundary-like: learner prior is uncertain, evidence is partial, or course use needs human judgement.",
+                    "red": "Mostly aligned with common knowledge, generic summary, wrong audience, or too indirect to teach.",
+                },
+                "must_be_downgraded_or_rejected": [
+                    "The candidate is merely background, summary, taxonomy, or weak-transfer detail.",
+                    "The audience fit is wrong.",
+                    "The idea is academically valid but not teachable for the target learner.",
+                    "The claim feels outdated or already obvious to the target learner.",
+                ],
+            },
+            "output_schema": {
+                "cards": [
+                    {
+                        "candidate_index": 0,
+                        "title": "最终中文卡片标题",
+                        "course_transformation": "它在课程里变成什么（中文，最好是可命名对象）",
+                        "teachable_one_liner": "老师可以直接说出来的一句中文",
+                        "draft_body": "基于证据的中文简短说明",
+                        "evidence_localization": [
+                            {
+                                "section_id": "section_id",
+                                "quote_zh": "对应证据原文的完整中文译文，必须覆盖整段证据，不得压缩、提炼或只保留其中一句",
+                            }
+                        ],
+                        "judgement": {
+                            "color": "green|yellow|red",
+                            "reason": "中文简短理由，说明为什么落在这个颜色边界",
+                        },
+                    }
+                ],
+            },
+        }
+
     def _build_prompt_sections(self, sections: list[dict]) -> list[dict]:
         return [
             {
                 "section_id": section["id"],
+                "section_title": section.get("section_title", ""),
                 "page_number": section["page_number"],
                 "text": section["paragraph_text"],
             }
-            for section in sections[:8]
+            for section in sections[:MAX_PROMPT_SECTIONS]
         ]
 
-    def _normalize_extraction_output(self, payload: dict[str, Any], sections: list[dict]) -> dict[str, list[dict]]:
+    def _build_prompt_figures(self, figures: list[dict]) -> list[dict]:
+        return [
+            {
+                "figure_id": figure["id"],
+                "figure_label": figure.get("figure_label", ""),
+                "caption": figure.get("caption", ""),
+                "linked_section_ids": figure.get("linked_section_ids", []),
+            }
+            for figure in figures[:MAX_PROMPT_FIGURES]
+        ]
+
+    def _normalize_extraction_output(
+        self,
+        payload: dict[str, Any],
+        sections: list[dict],
+        figures: list[dict],
+    ) -> dict[str, list[dict]]:
         raw_cards = payload.get("cards", [])
         raw_excluded = payload.get("excluded_content", [])
         if not isinstance(raw_cards, list):
@@ -468,6 +628,7 @@ class LLMCardEngine:
             raise LLMGenerationError("LLM card payload must contain a list named 'excluded_content'")
 
         section_map = {section["id"]: section for section in sections}
+        figure_id_set = {figure["id"] for figure in figures}
         normalized = []
         for raw_card in raw_cards[:3]:
             if not isinstance(raw_card, dict):
@@ -476,9 +637,10 @@ class LLMCardEngine:
             draft_body = str(raw_card.get("draft_body", "")).strip()
             granularity_level = str(raw_card.get("granularity_level", "subpattern")).strip().lower()
             section_ids = raw_card.get("section_ids", [])
+            raw_figure_ids = raw_card.get("figure_ids", [])
             raw_evidence_analysis = raw_card.get("evidence_analysis", [])
 
-            if not isinstance(section_ids, list) or not isinstance(raw_evidence_analysis, list):
+            if not isinstance(section_ids, list) or not isinstance(raw_evidence_analysis, list) or not isinstance(raw_figure_ids, list):
                 continue
             analysis_by_section = {}
             for item in raw_evidence_analysis:
@@ -497,6 +659,7 @@ class LLMCardEngine:
                     {
                         "section_id": section["id"],
                         "quote": section["paragraph_text"],
+                        "quote_zh": "",
                         "page_number": section["page_number"],
                         "analysis": analysis_by_section.get(section["id"], ""),
                     }
@@ -504,6 +667,11 @@ class LLMCardEngine:
 
             if not title or not evidence:
                 continue
+            figure_ids = [
+                str(figure_id).strip()
+                for figure_id in raw_figure_ids
+                if str(figure_id).strip() in figure_id_set
+            ]
             if not is_readable_text(title):
                 continue
             if not is_readable_text(draft_body):
@@ -519,7 +687,7 @@ class LLMCardEngine:
                     "granularity_level": granularity_level if granularity_level in {"framework", "subpattern", "detail"} else "subpattern",
                     "draft_body": draft_body,
                     "evidence": evidence,
-                    "figure_ids": [],
+                    "figure_ids": figure_ids,
                     "status": "candidate",
                 }
             )
@@ -581,7 +749,10 @@ class LLMCardEngine:
             course_transformation = str(raw_card.get("course_transformation", "")).strip()
             teachable_one_liner = str(raw_card.get("teachable_one_liner", "")).strip()
             draft_body = str(raw_card.get("draft_body", extracted["draft_body"])).strip()
+            raw_evidence_localization = raw_card.get("evidence_localization", [])
             judgement = raw_card.get("judgement", {})
+            if not isinstance(raw_evidence_localization, list):
+                continue
             if not all(
                 [
                     is_readable_text(title),
@@ -599,6 +770,30 @@ class LLMCardEngine:
             if not is_readable_text(reason):
                 continue
 
+            quote_zh_by_section = {}
+            for item in raw_evidence_localization:
+                if not isinstance(item, dict):
+                    continue
+                section_id = str(item.get("section_id", "")).strip()
+                quote_zh = str(item.get("quote_zh", "")).strip()
+                if section_id and is_readable_text(quote_zh):
+                    quote_zh_by_section[section_id] = quote_zh
+
+            evidence = []
+            for evidence_item in extracted["evidence"]:
+                quote_zh = quote_zh_by_section.get(evidence_item["section_id"], evidence_item.get("analysis", "").strip())
+                if not looks_like_complete_translation(evidence_item["quote"], quote_zh):
+                    evidence = []
+                    break
+                evidence.append(
+                    {
+                        **evidence_item,
+                        "quote_zh": quote_zh,
+                    }
+                )
+            if not evidence:
+                continue
+
             normalized.append(
                 {
                     "title": title,
@@ -606,21 +801,26 @@ class LLMCardEngine:
                     "course_transformation": course_transformation,
                     "teachable_one_liner": teachable_one_liner,
                     "draft_body": draft_body,
-                    "evidence": extracted["evidence"],
+                    "evidence": evidence,
                     "figure_ids": extracted.get("figure_ids", []),
                     "status": extracted.get("status", "candidate"),
                     "judgement": {
                         "color": color,
                         "reason": reason,
                         "model_version": self.client.model,
-                        "prompt_version": "llm-card-judge-v1",
-                        "rubric_version": "llm-card-rubric-v2",
+                        "prompt_version": JUDGEMENT_PROMPT_VERSION,
+                        "rubric_version": CARD_RUBRIC_VERSION,
                     },
                 }
             )
         return normalized
 
-    def _select_calibration_examples(self, calibration_examples: list[dict], topic_name: str, limit: int = 6) -> list[dict]:
+    def _select_calibration_examples(
+        self,
+        calibration_examples: list[dict],
+        topic_name: str,
+        limit: int = MAX_CALIBRATION_EXAMPLES,
+    ) -> list[dict]:
         if not calibration_examples:
             return []
         same_topic = []
@@ -632,6 +832,8 @@ class LLMCardEngine:
                 "topic_name": example.get("topic_name", ""),
                 "audience": example.get("audience", ""),
                 "title": example.get("title", ""),
+                "source_text": example.get("source_text", ""),
+                "evidence": example.get("evidence", [])[:2],
                 "expected_cards": example.get("expected_cards", []),
                 "expected_exclusions": example.get("expected_exclusions", []),
                 "rationale": example.get("rationale", ""),

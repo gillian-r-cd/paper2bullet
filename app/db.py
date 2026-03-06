@@ -68,6 +68,47 @@ CREATE TABLE IF NOT EXISTS topic_runs (
     FOREIGN KEY (topic_id) REFERENCES topics(id)
 );
 
+CREATE TABLE IF NOT EXISTS discovery_strategies (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    topic_run_id TEXT NOT NULL,
+    topic_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    strategy_type TEXT NOT NULL,
+    query_text TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_count INTEGER NOT NULL,
+    metadata_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id),
+    FOREIGN KEY (topic_run_id) REFERENCES topic_runs(id),
+    FOREIGN KEY (topic_id) REFERENCES topics(id)
+);
+
+CREATE TABLE IF NOT EXISTS discovery_results (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    topic_run_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    source_external_id TEXT NOT NULL,
+    paper_title TEXT NOT NULL,
+    authors_json TEXT NOT NULL,
+    publication_year INTEGER,
+    original_url TEXT NOT NULL,
+    asset_url TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    dedupe_status TEXT NOT NULL,
+    paper_id TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id),
+    FOREIGN KEY (topic_run_id) REFERENCES topic_runs(id),
+    FOREIGN KEY (strategy_id) REFERENCES discovery_strategies(id),
+    FOREIGN KEY (paper_id) REFERENCES papers(id)
+);
+
 CREATE TABLE IF NOT EXISTS papers (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -143,10 +184,12 @@ CREATE TABLE IF NOT EXISTS candidate_cards (
     figure_ids_json TEXT NOT NULL,
     status TEXT NOT NULL,
     embedding_json TEXT NOT NULL,
+    source_excluded_content_id TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (paper_id) REFERENCES papers(id),
     FOREIGN KEY (topic_id) REFERENCES topics(id),
-    FOREIGN KEY (run_id) REFERENCES runs(id)
+    FOREIGN KEY (run_id) REFERENCES runs(id),
+    FOREIGN KEY (source_excluded_content_id) REFERENCES paper_excluded_content(id)
 );
 
 CREATE TABLE IF NOT EXISTS judgements (
@@ -163,7 +206,9 @@ CREATE TABLE IF NOT EXISTS judgements (
 
 CREATE TABLE IF NOT EXISTS review_decisions (
     id TEXT PRIMARY KEY,
-    card_id TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    card_id TEXT,
     reviewer TEXT NOT NULL,
     decision TEXT NOT NULL,
     note TEXT NOT NULL,
@@ -211,6 +256,41 @@ CREATE TABLE IF NOT EXISTS exports (
     completed_at TEXT NOT NULL,
     FOREIGN KEY (run_id) REFERENCES runs(id)
 );
+
+CREATE TABLE IF NOT EXISTS evaluation_runs (
+    id TEXT PRIMARY KEY,
+    calibration_set_id TEXT NOT NULL,
+    calibration_set_name TEXT NOT NULL,
+    llm_mode TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    extraction_prompt_version TEXT NOT NULL,
+    judgement_prompt_version TEXT NOT NULL,
+    rubric_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    FOREIGN KEY (calibration_set_id) REFERENCES calibration_sets(id)
+);
+
+CREATE TABLE IF NOT EXISTS evaluation_results (
+    id TEXT PRIMARY KEY,
+    evaluation_run_id TEXT NOT NULL,
+    calibration_example_id TEXT NOT NULL,
+    example_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    source_text TEXT NOT NULL,
+    extraction_json TEXT NOT NULL,
+    judgement_json TEXT NOT NULL,
+    expected_json TEXT NOT NULL,
+    actual_json TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    regression_type TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (evaluation_run_id) REFERENCES evaluation_runs(id),
+    FOREIGN KEY (calibration_example_id) REFERENCES calibration_examples(id)
+);
 """
 
 
@@ -240,6 +320,10 @@ def ensure_migrations(connection: sqlite3.Connection) -> None:
     ensure_column(connection, "papers", "card_generation_status", "TEXT NOT NULL DEFAULT 'pending'")
     ensure_column(connection, "papers", "card_generation_failure_reason", "TEXT NOT NULL DEFAULT ''")
     ensure_column(connection, "candidate_cards", "teachable_one_liner", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(connection, "candidate_cards", "source_excluded_content_id", "TEXT")
+    ensure_promoted_linkage_index(connection)
+    ensure_review_decisions_target_schema(connection)
+    ensure_discovery_indexes(connection)
 
 
 def ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, column_sql: str) -> None:
@@ -250,6 +334,88 @@ def ensure_column(connection: sqlite3.Connection, table_name: str, column_name: 
     if column_name in existing_columns:
         return
     connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+
+
+def ensure_review_decisions_target_schema(connection: sqlite3.Connection) -> None:
+    existing_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(review_decisions)").fetchall()
+    }
+    if {"target_type", "target_id"}.issubset(existing_columns):
+        connection.execute(
+            """
+            UPDATE review_decisions
+            SET target_type = COALESCE(NULLIF(target_type, ''), 'card'),
+                target_id = COALESCE(NULLIF(target_id, ''), card_id)
+            """
+        )
+        return
+
+    connection.execute("PRAGMA foreign_keys = OFF;")
+    try:
+        connection.execute("ALTER TABLE review_decisions RENAME TO review_decisions_legacy")
+        connection.execute(
+            """
+            CREATE TABLE review_decisions (
+                id TEXT PRIMARY KEY,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                card_id TEXT,
+                reviewer TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                note TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (card_id) REFERENCES candidate_cards(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO review_decisions(id, target_type, target_id, card_id, reviewer, decision, note, created_at)
+            SELECT id, 'card', card_id, card_id, reviewer, decision, note, created_at
+            FROM review_decisions_legacy
+            """
+        )
+        connection.execute("DROP TABLE review_decisions_legacy")
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON;")
+
+
+def ensure_promoted_linkage_index(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_cards_source_excluded_content_id
+        ON candidate_cards(source_excluded_content_id)
+        WHERE source_excluded_content_id IS NOT NULL
+        """
+    )
+
+
+def ensure_discovery_indexes(connection: sqlite3.Connection) -> None:
+    existing_tables = {
+        row["name"]
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    }
+    if "discovery_strategies" not in existing_tables or "discovery_results" not in existing_tables:
+        return
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_discovery_strategies_topic_run_id
+        ON discovery_strategies(topic_run_id, created_at)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_discovery_results_topic_run_id
+        ON discovery_results(topic_run_id, created_at)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_discovery_results_dedupe_key
+        ON discovery_results(dedupe_key)
+        """
+    )
 
 
 @contextmanager

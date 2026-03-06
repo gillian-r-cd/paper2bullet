@@ -5,7 +5,7 @@ Data structures: Pydantic models used by FastAPI endpoints.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -23,7 +23,12 @@ class RunCreateRequest(BaseModel):
 
 class ReviewRequest(BaseModel):
     reviewer: str = Field(default="internal")
-    decision: str
+    decision: Literal["accepted", "rejected", "keep_for_later", "needs_manual_check", "reopened"]
+    note: str = Field(default="")
+
+
+class PromoteExcludedRequest(BaseModel):
+    reviewer: str = Field(default="internal")
     note: str = Field(default="")
 
 
@@ -52,6 +57,10 @@ class CalibrationSetImportRequest(BaseModel):
     description: str = Field(default="")
     metadata: dict = Field(default_factory=dict)
     examples: List[CalibrationExampleInput] = Field(default_factory=list)
+
+
+class EvaluationRunRequest(BaseModel):
+    calibration_set_id: str = Field(default="")
 
 
 class RunSummary(BaseModel):

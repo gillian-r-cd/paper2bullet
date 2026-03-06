@@ -6,6 +6,147 @@ Main sections: completed work, pending work, known issues, and next starting poi
 
 ## 本次做了什么
 
+- 已按 `PRD` 推进 discovery / dedupe / saturation 的下一个大阶段：
+  - 已完成 `Track C` 的 discovery foundation 收口：
+    - `DiscoveryService` 不再是硬编码的“两路搜一下就结束”，而是正式引入 provider 抽象
+    - 当前已接入 `OpenAlex`、`arXiv`、`Crossref`、`Semantic Scholar` 四类 provider
+    - discovery 结果不再只按 provider 原始 id 去重，而是用规范化标识构造 canonical paper identity：
+      - 优先 `DOI`
+      - 其次 `arXiv id`
+      - 再其次 provider id
+      - 最后才退到 `title + year + author` 的稳定 hash
+    - 同一篇论文若被多个 provider 命中，现在会在 discovery 阶段先合并成一个 canonical candidate，再进入后续 paper 主链
+  - 已新增正式的 discovery ledger：
+    - `discovery_strategies`
+    - `discovery_results`
+    - 每次 topic run 现在会记录：
+      - 用了哪些 provider / query / strategy type
+      - 每个 strategy 命中了多少条 raw result
+      - 每条命中最终对应哪个 canonical paper
+      - 该命中是 `canonical` 还是 `duplicate_source`
+  - `RunCoordinator` 现会在 topic run 中同步记录 discovery 数据，并把统计写入 `topic_runs.stats_json`
+  - topic run 的 stats 现在新增：
+    - `discovered_raw`
+    - `deduped_candidates`
+    - `duplicate_candidates_collapsed`
+    - `discovery_strategy_count`
+    - `queued_for_access`
+    - `provider_summary`
+  - `GET /api/runs/{run_id}` 和 debug state 现在会直接返回：
+    - `discovery_strategies`
+    - `discovery_results`
+  - 已完成 `Track G` 的 dedupe assistance 收口：
+    - 原有 `neighbors` 不再只是“相似卡片列表”
+    - 现在会按相似度给出结构化关系：
+      - `near_duplicate`
+      - `same_pattern`
+      - `related`
+    - 每个 neighbor 还会带 `relationship_reason` 和 `review_decision`
+    - review detail UI 已新增 `Potential Dedupe Assistance` 区块，实际把这组关系展示出来
+    - 仍明确保持 card 原子性，不做自动 merge
+  - 已完成 `Track K` 的 early metrics：
+    - topic run 完成后会自动计算 `saturation_metrics`
+    - 当前先落地的是早期代理指标，不是假装已经做完最终饱和判断：
+      - `card_count`
+      - `novel_cards`
+      - `same_pattern_cards`
+      - `near_duplicate_cards`
+      - `semantic_duplicate_cards`
+      - `semantic_duplication_ratio`
+      - `search_strategy_comparison`
+    - `search_strategy_comparison` 目前会按 strategy 给出：
+      - `raw_hits`
+      - `canonical_candidates`
+      - `accessible_papers`
+      - `yielded_cards`
+  - 已补齐回归测试：
+    - cross-provider discovery candidate dedupe
+    - run 级 discovery strategy / result 记录
+    - card detail dedupe assistance 结构化输出
+    - early saturation metrics 计算
+    - 旧流程全量回归
+  - 已完成验证：
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 49 个
+    - 现有本地服务 `GET /api/health` 返回正常
+    - 现有本地首页 `GET /` 返回 `200`
+  - 当前边界：
+    - 这次完成的是“可追踪的 discovery foundation + early saturation metrics”，还不是 `CONCEPT.md` 终态里的真正饱和停止器
+    - 目前 strategy 仍以 `topic_query` 为主，尚未展开到更丰富的关键词组合 / 时间窗口 / 子领域策略矩阵
+    - saturation 目前还是 early metrics，还没有“连续 N 篇无新增类别 + 多策略增益趋零”的自动停止逻辑
+
+- 已完成 `Evidence 全文翻译` 的根因修复闭环：
+  - 已确认根因不在 export/UI，而在 `app/llm.py` judgement 阶段：
+    - prompt 对 `quote_zh` 的要求过宽，允许“忠实但简洁”
+    - normalize 对中文 evidence 只校验“可读”，不校验是否覆盖整段英文证据
+  - `JUDGEMENT_PROMPT_VERSION` 已升级到 `llm-card-judge-v3-zh`
+  - judgement prompt 新增显式 `evidence_translation_rules`：
+    - 每条 `quote_zh` 必须是完整简体中文翻译
+    - 必须覆盖整段 evidence，不允许压缩、提炼、只摘 punchline
+    - 若原文有多句、列表、编号，必须按顺序完整翻译
+  - normalize 新增 `looks_like_complete_translation()` 质量闸门：
+    - 结合英文原文长度与中文译文长度做覆盖度判断
+    - 不再接受“长英文证据 + 短中文摘要”这种伪翻译
+    - fail-closed：任何一条 evidence translation 不达标，该候选卡直接不进入最终 cards
+  - 补齐回归测试：
+    - judgement prompt 确认会下发完整翻译契约
+    - 新增专门测试，拦截摘要式 `quote_zh`
+    - 相关 evaluation / promote / export / smoke-test stub 已全部升级到完整翻译形状
+  - 已完成验证：
+    - 定向回归通过
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 45 个
+  - 现状说明：
+    - 新生成卡片现在会被完整翻译质量闸门硬拦截，不会再把摘要式 `quote_zh` 落库
+    - 旧数据仍保留 `Repository._hydrate_evidence()` 的兼容兜底；历史上已经落库的短译文不会自动变长，需重新跑对应 paper/run 才会得到新标准结果
+
+- 已完成本轮 review/export 可用性收尾：
+  - `LLMCardEngine` judgement 输出 schema 新增 evidence bilingual 字段，card evidence 现在可正式携带 `quote_zh`
+  - `Repository` 对新旧 evidence 做统一 hydrate：
+    - 新数据直接读取 `quote_zh`
+    - 旧数据若没有 `quote_zh`，先用已有中文 `analysis` 兜底，避免 UI 继续只剩英文 evidence
+  - card / excluded / review-items / export 读模型已补齐 `paper_url`
+  - 论文标题继续直接使用 `papers.title` 的英文原文，不做额外中文变形
+  - Google Doc export 工件现在会输出：
+    - 英文论文标题
+    - 论文链接
+    - `证据原文（EN）`
+    - `证据译文（ZH）`
+  - review list 的 `View` 已从底部全局详情框改为“当前行下方 inline expand/collapse”
+  - review list 的论文列现在会直接带可点击 paper link
+  - card / excluded detail 都会显示 paper title 与 paper link
+  - export 面板已从“手填 run_id + 手填 card_ids”改成：
+    - run 下拉选择
+    - accepted cards picker
+    - 只读 selected card ids 展示
+  - 前端 `readJson()` 已改成先读文本再解析 JSON，后端报错时会尽量直接显示原始错误，而不是只抛 JSON 解析异常
+  - 已确认用户截图中的 export 失败根因：
+    - 该 run 下当前没有任何 `accepted` card
+    - 触发的是后端 accepted-only 校验，不是 export API 本身坏掉
+  - 当前测试总数已增至 44 个，并全部通过
+- 已完成下一阶段的 review/export 主链收口：
+  - `candidate_cards` 新增 `source_excluded_content_id`，用单向 linkage 记录 promoted candidate 来自哪个 excluded item
+  - SQLite migration 现会补齐 promoted linkage 列和唯一索引，保证同一个 excluded item 最多 promote 出一张 candidate card
+  - `Repository` 抽出了候选卡片 / judgement 的统一写入逻辑，promote 流程和正常 LLM 主链共用同一套落库结构
+  - `ReviewService` 新增：
+    - review decision 的目标类型校验
+    - `excluded -> candidate` promote 专用流程
+    - promote 时自动把 excluded item 记为 `reopened`
+  - promote 流程严格复用现有 extraction -> judgement 主链：
+    - 只取 excluded item 对应的 source sections
+    - 仍走同一套 LLM extraction / judgement / finalize 逻辑
+    - fail-closed：如果 reconsideration 不是恰好产出 1 张 candidate card，就直接报错，不偷偷挑第一张
+  - `app/main.py` 新增 `POST /api/review-items/excluded/{id}/promote`
+  - unified review read model 已补齐 promoted 表达：
+    - promoted card 会带 `source_excluded_item`
+    - excluded detail/list 会带 `promoted_card`
+  - 内部 review 页已新增 excluded 的 `Promote` 动作，并在 card / excluded detail 中展示 promote 关联结果
+  - Google Doc export 的 accepted-only 规则已收成后端硬校验：
+    - 新增统一 export selection resolver
+    - 未评审、非 accepted、foreign-run、nonexistent、mixed valid/invalid selection 都会直接 fail-closed
+    - export artifact 的 `request_json` 现在会记录 `requested_card_ids`、`resolved_card_ids`、`selection_snapshot`、`review_snapshot`
+  - `ReviewRequest.decision` 已从自由字符串收紧为显式受控集合；同时服务层继续按 `card/excluded` 目标类型做二次校验
+  - 已新增 promote / export / review decision 相关回归测试，当前测试总数已增至 43 个，并全部通过
 - 将 `PRD.md` 落成开发基线。
 - 实现了 Phase 0 的最短闭环：
   - 多主题批量输入
@@ -116,6 +257,56 @@ Main sections: completed work, pending work, known issues, and next starting poi
     - `LLMCardEngine` judgement prompt 会实际携带 calibration examples
     - 旧的单阶段 stub 测试已全部升级为双阶段调用
   - 当前测试总数已增至 25 个，并全部通过
+- 已完成这轮“内容校准主链收尾”：
+  - `requirements.txt` 补入 `httpx`，修复 `fastapi.testclient` 在本地测试环境下无法启动的问题
+  - `tests/test_app.py` 改为显式关闭 `.env` 污染和联网 discovery，测试不再依赖本机 LLM 配置或外网结果
+  - `app/llm.py` 抽出了显式的 extraction / judgement prompt version 与 rubric version 常量：
+    - `EXTRACTION_PROMPT_VERSION`
+    - `JUDGEMENT_PROMPT_VERSION`
+    - `CARD_RUBRIC_VERSION`
+  - extraction prompt 现在会：
+    - 强制 learner-facing 输出使用简体中文
+    - 明确按 `CONCEPT.md` 的判断边界抽取候选，而不是泛化摘要
+    - 注入 figure/caption 摘要
+    - 注入更完整的 calibration examples（含 `source_text` / `evidence`）
+  - judgement prompt 现在会：
+    - 强制 `title` / `course_transformation` / `teachable_one_liner` / `reason` 使用中文
+    - 显式编码绿黄红边界、商业视角、演讲可用性和 learner belief gap 要求
+  - 修复了中文内容的可读性闸门：
+    - 旧逻辑对中文短标题/短标签过严，像“分类法回顾”会被误杀
+    - 现在 `is_readable_text()` 会对 CJK 文本采用更合适的最小长度阈值
+  - `app/services.py` 现在会把 `figures` 和 active calibration set 同时传进 extraction 阶段，不再只在 judgement 才见到校准集
+  - 新增 evaluation ledger：
+    - `app/db.py` 新增 `evaluation_runs` / `evaluation_results` 表
+    - `Repository` 新增 evaluation run/result 的持久层读写
+    - `app/services.py` 新增 `EvaluationService`
+    - `app/main.py` 新增：
+      - `POST /api/evaluations/runs`
+      - `GET /api/evaluations/runs`
+      - `GET /api/evaluations/runs/{id}`
+    - 新增 `scripts/evaluate_calibration_set.py`
+  - 新增 unified review target 模型：
+    - `review_decisions` 已从 `card_id` 专属升级为 `target_type + target_id`
+    - 加入 SQLite 迁移逻辑，旧 review 行会自动回填成 `target_type='card'`
+    - `Repository` 新增：
+      - `get_latest_review_decision()`
+      - `get_excluded_content()`
+      - `list_review_items()`
+      - `get_review_item()`
+    - `app/main.py` 新增：
+      - `GET /api/review-items`
+      - `GET /api/review-items/{target_type}/{target_id}`
+      - `POST /api/review-items/{target_type}/{target_id}/review`
+    - 旧的 `POST /api/cards/{card_id}/review` 仍保持兼容
+  - `app/static/index.html` 的 review list 已从 card-only 升级为 cards + excluded 双对象视图：
+    - 支持 item type / review status / exclusion type 过滤
+    - 支持 excluded item detail 和动作
+    - export 选择只保留 export-eligible card rows
+  - 导出工件和 smoke test 样例已切到中文语境：
+    - Google Doc artifact 中的字段标签改为中文
+    - `/api/llm/smoke` 的内置示例主题/论文/段落已改成中文
+  - 首页新增 calibration status 区块，可看到 active calibration set 和最近一次 evaluation summary
+  - 当前测试总数已增至 30 个，并全部通过
 
 ## 还没做什么
 
@@ -123,6 +314,8 @@ Main sections: completed work, pending work, known issues, and next starting poi
 - 真正的 Google Docs 在线写入验证
 - 更强的 PDF 图表抽取
 - 后续阶段的 calibration / saturation 实现
+- 基于 live 数据的浏览器自动化验证仍未补完；当前完成的是 API 回归、HTML/页面挂载检查、本地 `8765` 服务活体验证和 live run 数据检查
+- promote 后如果未来要支持“一个 excluded item 拆成多张 candidate card”，需要重新定义当前的一对一 linkage 不变量
 
 ## 已知的问题和 bug
 
@@ -138,14 +331,24 @@ Main sections: completed work, pending work, known issues, and next starting poi
 - 当前沙箱既不能直接读你的 `.env` 内容，也无法从这里连到你本地启动的 `127.0.0.1:8000` 服务，因此真实 provider 的 live smoke call 无法在这个受限执行环境里完成。
 - 如果本地调用 `POST /api/llm/smoke` 返回 `404 Not Found`，优先判断为本地 `uvicorn` 仍在运行旧代码；需要重启服务进程才能加载新路由。
 - 已确认一次真实本地失败根因是 LLM provider endpoint 的 DNS / base_url 问题，而非 PDF 解析问题；当前已改为 LLM-only，因此 provider 配置不通时会显式 `0 cards`，不会再混入 heuristic 卡。
-- 当前工作区不是 git repository，无法按常规读取 `git log`；如果后续需要版本历史，需要确认外层仓库结构。
+- 当前工作区现在是 git repository；如果后续需要继续交班，优先用 `git log --oneline -n 10` 对齐最近改动。
 - 这轮内容校准改造仍然只是第一阶段：
   - 现在已经有了 calibration corpus 的正式持久层和导入链，并且 active set 已接入 judgement prompt，但还没有 evaluation loop
   - review 列表页还没有把 excluded content 做成单独列表或更强筛选器，目前主要在 card detail 中可见
   - evaluation loop 还没有落库，也没有 prompt/rubric/model 的回归评估执行链
-- 当前目录最初不是 git repository；如果要发布到 GitHub，需要先初始化 git、配置 remote、确认忽略规则，再进行首次提交和推送
+- 上面这组三条旧交班信息已经过时：
+  - evaluation loop 现在已经落库并能通过 API / CLI 执行
+  - excluded content 现在已经是一等 review object，不再只存在 card detail 中
+  - 但“把 excluded item 重新提回 candidate card”还没做，仍是下一阶段工作
+- 当前 review list 虽已支持 excluded item，但还没有真正的浏览器自动化验证；本次仍以 API 层和页面 HTML 结构验证为主
+- 当前 `create_app()` 会同时创建 `LLMCardEngine` 和 `EvaluationService`，如果未来再加更多调度层，需留意启动时依赖注入不要重复膨胀
+- 如果后续要发布到 GitHub，先确认当前 remote、默认分支和忽略规则，再按现有提交规范继续推进
 - 已补 `.gitignore`，新增忽略 `.venv/`，避免首次发布时把本地虚拟环境误提交
 - 当前受限执行环境阻止创建 `.git` 目录，因此无法在这里完成 `git init` 和后续推送；如果继续发布，需要在本地终端完成初始化与 push
+- 当前 promote 流程故意是 fail-closed：如果 LLM reconsideration 返回 0 张或多于 1 张 candidate card，会直接报错交还人工，而不会自动挑一张继续
+- 当前真实页面验证仍以本地 HTTP 访问和结构检查为主，没有对 live 数据做无副作用的完整浏览器交互回放
+- 当前截图对应的 export 失败是业务规则命中：被选中的 card 尚未 `accepted`，所以 accepted-only resolver 正常拒绝导出
+- 当前一些 live LLM 产出的中文字段仍存在编码/可读性异常；这次没有直接改历史数据，只补了 evidence bilingual、paper link、review/export 交互与错误呈现
 
 ## 下次开始时应该先做什么
 
@@ -157,9 +360,9 @@ Main sections: completed work, pending work, known issues, and next starting poi
 - 先在本地补上 `.env`，再用真实 LLM API 对少量 topic 做联调，并根据输出修 prompt/schema。
 - 下一次若继续做 live 联调，优先在你本地终端直接执行 `python3 scripts/live_llm_smoke_test.py` 或调用 `/api/llm/smoke`。
 - 下一次如果继续提高出卡质量，优先做内容层校准：先整理 5-8 张强正样本、5-8 张强负样本、5-10 个边界 case，再据此改 LLM prompt 和评审 rubric，而不是继续盲调模型。
-- 下一次如果继续做内容校准，先跑一遍当前 20 个测试，再补：
-  - 先跑当前 25 个测试
-  - 然后补 evaluation loop：evaluation_runs / evaluation_results / 指标计算 / 执行脚本
-  - 再把 excluded content 拉进 review list 主视图和批量操作
-  - 最后再重构 `review_decisions`，从 `card_id` 升级成统一 review target
+- 下一次如果继续做内容校准，先跑一遍当前 44 个测试，再补：
+  - 现在应先跑当前 44 个测试
+  - 然后优先决定 promote 的 fail-closed 行为是否要继续保持“恰好 1 张卡”，还是扩成“1 个 excluded 可回流多张 card”
+  - 如果 promote / export 主链稳定，再优先处理 live LLM 中文乱码/编码质量问题
+  - 然后继续 saturation / boundary-case workflow 的后续阶段
 - 如果下一次继续做 GitHub 发布之后的开发，先确认远端主分支和默认分支名称，再按 `[module] description` 规范继续提交
