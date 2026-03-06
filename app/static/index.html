@@ -1,0 +1,305 @@
+<!--
+This file renders the minimal internal review surface for the Paper to Bullet Phase 0 workflow.
+Main sections: run intake, run status, review list, access queue, and export actions.
+Data shown: topics, local PDFs, cards, reviews, and export selections.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Paper to Bullet</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; color: #222; }
+    textarea, input, button { font: inherit; }
+    textarea, input[type="text"] { width: 100%; box-sizing: border-box; padding: 8px; }
+    button { padding: 8px 14px; cursor: pointer; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .panel { border: 1px solid #ddd; padding: 16px; border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top; }
+    th { background: #f7f7f7; }
+    .green { color: #0a7b34; font-weight: bold; }
+    .yellow { color: #8b6a00; font-weight: bold; }
+    .red { color: #9d1c1c; font-weight: bold; }
+    .mono { font-family: Menlo, monospace; font-size: 12px; }
+    .details { white-space: pre-wrap; background: #fafafa; padding: 12px; border-radius: 6px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Paper to Bullet</h1>
+  <p>Phase 0 internal operator console. Boss-facing output is generated through export artifacts for Google Docs.</p>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>Start Run</h2>
+      <label for="topics">Topics, one per line</label>
+      <textarea id="topics" rows="7" placeholder="adaptive selling&#10;AI communication coaching"></textarea>
+
+      <label for="pdfs">Local PDFs, one per line: <span class="mono">/abs/path/file.pdf|topic1,topic2</span></label>
+      <textarea id="pdfs" rows="6" placeholder="/Users/name/Desktop/paper.pdf|adaptive selling"></textarea>
+
+      <label for="metadata">Metadata JSON</label>
+      <div class="mono">Optional structured notes for this run. Safe default: <code>{}</code></div>
+      <textarea id="metadata" rows="4">{}</textarea>
+
+      <button id="start-run">Start Parallel Run</button>
+      <div id="start-result" class="details"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Run Status</h2>
+      <button id="refresh-runs">Refresh Runs</button>
+      <div id="runs"></div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top: 20px;">
+    <h2>Review List</h2>
+    <div style="display: flex; gap: 12px; align-items: end;">
+      <div style="flex: 1;">
+        <label for="filter-run">Filter by Run ID</label>
+        <input id="filter-run" type="text" placeholder="run_xxx">
+      </div>
+      <div style="flex: 1;">
+        <label for="filter-topic">Filter by Topic</label>
+        <input id="filter-topic" type="text" placeholder="adaptive selling">
+      </div>
+      <button id="refresh-cards">Refresh Cards</button>
+    </div>
+    <div id="cards"></div>
+    <div id="card-detail" class="details"></div>
+  </div>
+
+  <div class="grid" style="margin-top: 20px;">
+    <div class="panel">
+      <h2>Access Queue</h2>
+      <button id="refresh-queue">Refresh Access Queue</button>
+      <div id="queue"></div>
+    </div>
+    <div class="panel">
+      <h2>Export</h2>
+      <label for="export-run-id">Run ID</label>
+      <input id="export-run-id" type="text" placeholder="run_xxx">
+      <label for="export-title">Document Title</label>
+      <input id="export-title" type="text" placeholder="Boss Report - Adaptive Selling">
+      <label for="export-card-ids">Card IDs, comma separated</label>
+      <textarea id="export-card-ids" rows="5" placeholder="card_xxx,card_yyy"></textarea>
+      <button id="export-doc">Build Google Doc Export Package</button>
+      <div id="export-result" class="details"></div>
+    </div>
+  </div>
+
+  <script>
+    async function readJson(url, options) {
+      const response = await fetch(url, options);
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || JSON.stringify(data));
+      }
+      return data;
+    }
+
+    function parseLocalPdfLines(value) {
+      return value
+        .split("\n")
+        .map(line => line.trim())
+        .filter(Boolean)
+        .map(line => {
+          const [path, topicText = ""] = line.split("|");
+          return {
+            path: path.trim(),
+            topics: topicText.split(",").map(item => item.trim()).filter(Boolean)
+          };
+        });
+    }
+
+    function renderRuns(payload) {
+      const topicRuns = payload.topic_runs || [];
+      const runs = payload.runs || [];
+      const runRows = runs.map(run => `<tr><td>${run.id}</td><td>${run.status}</td><td><pre>${run.topics_text}</pre></td></tr>`).join("");
+      const topicRows = topicRuns.map(item => {
+        const stats = typeof item.stats === "object" ? JSON.stringify(item.stats) : item.stats_json;
+        return `<tr><td>${item.run_id}</td><td>${item.topic_name}</td><td>${item.status}</td><td>${stats}</td></tr>`;
+      }).join("");
+      document.getElementById("runs").innerHTML = `
+        <h3>Runs</h3>
+        <table><tr><th>Run</th><th>Status</th><th>Topics</th></tr>${runRows}</table>
+        <h3>Topic Jobs</h3>
+        <table><tr><th>Run</th><th>Topic</th><th>Status</th><th>Stats</th></tr>${topicRows}</table>
+      `;
+    }
+
+    function renderCards(cards) {
+      const rows = cards.map(card => {
+        const colorClass = card.color || "yellow";
+        const review = card.review_decision || "";
+        return `
+          <tr>
+            <td><input type="checkbox" class="card-select" value="${card.id}"></td>
+            <td>${card.id}</td>
+            <td>${card.topic_name}</td>
+            <td>${card.paper_title}</td>
+            <td>${card.title}</td>
+            <td class="${colorClass}">${card.color || ""}</td>
+            <td>${card.course_transformation}</td>
+            <td>${review}</td>
+            <td>
+              <button onclick="loadCard('${card.id}')">View</button>
+              <button onclick="reviewCard('${card.id}', 'accepted')">Accept</button>
+              <button onclick="reviewCard('${card.id}', 'rejected')">Reject</button>
+              <button onclick="reviewCard('${card.id}', 'needs_manual_check')">Manual Check</button>
+            </td>
+          </tr>
+        `;
+      }).join("");
+      document.getElementById("cards").innerHTML = `
+        <table>
+          <tr>
+            <th></th><th>ID</th><th>Topic</th><th>Paper</th><th>Card</th><th>Color</th><th>Course Use</th><th>Review</th><th>Actions</th>
+          </tr>
+          ${rows}
+        </table>
+      `;
+    }
+
+    function renderQueue(items) {
+      const rows = items.map(item => `
+        <tr>
+          <td>${item.paper_title}</td>
+          <td>${item.reason}</td>
+          <td>${item.priority}</td>
+          <td>${item.status}</td>
+          <td class="mono">${item.original_url || ""}</td>
+        </tr>
+      `).join("");
+      document.getElementById("queue").innerHTML = `
+        <table>
+          <tr><th>Paper</th><th>Reason</th><th>Priority</th><th>Status</th><th>URL</th></tr>
+          ${rows}
+        </table>
+      `;
+    }
+
+    async function refreshRuns() {
+      const payload = await readJson("/api/runs");
+      renderRuns(payload);
+    }
+
+    async function refreshCards() {
+      const runId = document.getElementById("filter-run").value.trim();
+      const topic = document.getElementById("filter-topic").value.trim();
+      const params = new URLSearchParams();
+      if (runId) params.set("run_id", runId);
+      if (topic) params.set("topic", topic);
+      const payload = await readJson(`/api/cards?${params.toString()}`);
+      renderCards(payload.cards);
+    }
+
+    async function refreshQueue() {
+      const runId = document.getElementById("filter-run").value.trim();
+      const params = new URLSearchParams();
+      if (runId) params.set("run_id", runId);
+      const payload = await readJson(`/api/access-queue?${params.toString()}`);
+      renderQueue(payload.items);
+    }
+
+    function renderCardDetail(card) {
+      const evidenceBlock = (card.evidence || []).map(item => {
+        const analysis = item.analysis ? `\nWhy it matters: ${item.analysis}` : "";
+        return `- Evidence: ${item.quote}${analysis}`;
+      }).join("\n\n");
+      const excludedBlock = (card.excluded_content || []).map(item =>
+        `- ${item.label} [${item.exclusion_type}]\n  Reason: ${item.reason}`
+      ).join("\n\n");
+      const sections = [
+        `Card: ${card.title}`,
+        `Teach it as: ${card.teachable_one_liner || ""}`,
+        `Course use: ${card.course_transformation || ""}`,
+        `Judgement: ${(card.judgement || {}).color || ""} | ${(card.judgement || {}).reason || ""}`,
+        "",
+        "Evidence",
+        evidenceBlock || "(none)",
+        "",
+        "Excluded Content From This Paper",
+        excludedBlock || "(none)"
+      ];
+      return sections.join("\n");
+    }
+
+    async function loadCard(cardId) {
+      const payload = await readJson(`/api/cards/${cardId}`);
+      document.getElementById("card-detail").textContent = renderCardDetail(payload.card);
+    }
+
+    async function reviewCard(cardId, decision) {
+      await readJson(`/api/cards/${cardId}/review`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reviewer: "internal-ui", decision, note: "" })
+      });
+      await refreshCards();
+      await loadCard(cardId);
+    }
+
+    document.getElementById("start-run").addEventListener("click", async () => {
+      const resultNode = document.getElementById("start-result");
+      resultNode.textContent = "";
+      try {
+        const topicsText = document.getElementById("topics").value;
+        const metadataText = document.getElementById("metadata").value.trim();
+        let metadata = {};
+        if (metadataText) {
+          metadata = JSON.parse(metadataText);
+        }
+        if (metadata === null || Array.isArray(metadata) || typeof metadata !== "object") {
+          throw new Error("Metadata JSON must be an object, for example {} or {\"operator\":\"rantianshu\"}.");
+        }
+        const localPdfs = parseLocalPdfLines(document.getElementById("pdfs").value);
+        const payload = await readJson("/api/runs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ topics_text: topicsText, metadata, local_pdfs: localPdfs })
+        });
+        resultNode.textContent = JSON.stringify(payload, null, 2);
+        if (payload.run && payload.run.id) {
+          document.getElementById("filter-run").value = payload.run.id;
+          document.getElementById("export-run-id").value = payload.run.id;
+        }
+        await refreshRuns();
+        setTimeout(refreshCards, 1000);
+        setTimeout(refreshQueue, 1000);
+      } catch (error) {
+        resultNode.textContent = `Run start failed: ${error.message}`;
+      }
+    });
+
+    document.getElementById("refresh-runs").addEventListener("click", refreshRuns);
+    document.getElementById("refresh-cards").addEventListener("click", refreshCards);
+    document.getElementById("refresh-queue").addEventListener("click", refreshQueue);
+
+    document.getElementById("export-doc").addEventListener("click", async () => {
+      const runId = document.getElementById("export-run-id").value.trim();
+      const title = document.getElementById("export-title").value.trim();
+      const cardIds = document.getElementById("export-card-ids").value.split(",").map(item => item.trim()).filter(Boolean);
+      const payload = await readJson("/api/exports/google-doc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ run_id: runId, card_ids: cardIds, document_title: title })
+      });
+      document.getElementById("export-result").textContent = JSON.stringify(payload, null, 2);
+    });
+
+    document.addEventListener("change", (event) => {
+      if (!event.target.classList.contains("card-select")) {
+        return;
+      }
+      const ids = Array.from(document.querySelectorAll(".card-select:checked")).map(node => node.value);
+      document.getElementById("export-card-ids").value = ids.join(",");
+    });
+
+    refreshRuns();
+    refreshCards();
+    refreshQueue();
+  </script>
+</body>
+</html>
