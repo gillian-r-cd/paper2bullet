@@ -39,6 +39,16 @@ class ExportRequest(BaseModel):
     existing_google_doc_id: str = Field(default="")
 
 
+class AccessQueueReactivateRequest(BaseModel):
+    local_path: str
+    reviewer: str = Field(default="internal")
+
+
+class SinglePaperValidationRequest(BaseModel):
+    topic_id: str
+    run_id: str
+
+
 class CalibrationExampleInput(BaseModel):
     example_type: str
     topic_name: str

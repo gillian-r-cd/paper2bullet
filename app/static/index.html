@@ -21,13 +21,25 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     .green { color: #0a7b34; font-weight: bold; }
     .yellow { color: #8b6a00; font-weight: bold; }
     .red { color: #9d1c1c; font-weight: bold; }
-    .mono { font-family: Menlo, monospace; font-size: 12px; }
+    .mono { font-family: Menlo, monospace; font-size: 12px; word-break: break-all; }
     .details { white-space: pre-wrap; background: #fafafa; padding: 12px; border-radius: 6px; margin-top: 10px; }
     .inline-details { white-space: pre-wrap; background: #fafafa; padding: 12px; border-radius: 6px; }
     .paper-link { display: block; margin-top: 4px; font-size: 12px; }
     .picker { max-height: 240px; overflow: auto; border: 1px solid #ddd; border-radius: 6px; padding: 8px; margin-top: 8px; }
     .picker-item { display: block; padding: 6px 0; border-bottom: 1px solid #eee; }
     .picker-item:last-child { border-bottom: none; }
+    .stats-cell { min-width: 360px; max-width: 680px; }
+    .stats-summary { margin-bottom: 8px; line-height: 1.4; }
+    .stats-json { max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 0; background: #fafafa; padding: 8px; border-radius: 6px; }
+    .detail-section { margin-bottom: 14px; }
+    .detail-section h4 { margin: 0 0 8px 0; }
+    .detail-line { margin: 2px 0; }
+    .detail-list { margin: 0; padding-left: 18px; }
+    .detail-list li { margin-bottom: 6px; }
+    .figure-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    .figure-card { border: 1px solid #ddd; border-radius: 6px; padding: 10px; background: #fff; }
+    .figure-card img { max-width: 100%; max-height: 180px; display: block; margin-top: 8px; border: 1px solid #eee; }
+    .figure-card a { display: inline-block; margin-top: 6px; }
   </style>
 </head>
 <body>
@@ -96,6 +108,48 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     <div id="calibration-status" class="details"></div>
   </div>
 
+  <div class="panel" style="margin-top: 20px;">
+    <h2>Content Quality Metrics</h2>
+    <button id="refresh-quality-metrics">Refresh Quality Metrics</button>
+    <div id="quality-metrics" class="details"></div>
+  </div>
+
+  <div class="panel" style="margin-top: 20px;">
+    <h2>Single Paper Validation</h2>
+    <div style="display: flex; gap: 12px; align-items: end;">
+      <div style="flex: 1;">
+        <label for="single-validation-paper-id">Paper ID</label>
+        <input id="single-validation-paper-id" type="text" placeholder="paper_xxx">
+      </div>
+      <div style="flex: 1;">
+        <label for="single-validation-topic-id">Topic ID</label>
+        <input id="single-validation-topic-id" type="text" placeholder="topic_xxx">
+      </div>
+      <div style="flex: 1;">
+        <label for="single-validation-run-id">Run ID</label>
+        <input id="single-validation-run-id" type="text" placeholder="run_xxx">
+      </div>
+      <button id="run-single-validation">Run Validation</button>
+    </div>
+    <div style="display: flex; gap: 12px; margin-top: 10px;">
+      <button id="load-understanding">Load Understanding</button>
+      <button id="load-card-plan">Load Card Plan</button>
+    </div>
+    <div id="single-validation-result" class="details"></div>
+  </div>
+
+  <div class="panel" style="margin-top: 20px;">
+    <h2>Saturation Trends</h2>
+    <div style="display: flex; gap: 12px; align-items: end;">
+      <div style="flex: 1;">
+        <label for="saturation-topic-filter">Filter by Topic (optional)</label>
+        <input id="saturation-topic-filter" type="text" placeholder="agentic workflow">
+      </div>
+      <button id="refresh-saturation-trends">Refresh Saturation Trends</button>
+    </div>
+    <div id="saturation-trends"></div>
+  </div>
+
   <div class="grid" style="margin-top: 20px;">
     <div class="panel">
       <h2>Access Queue</h2>
@@ -157,6 +211,48 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#39;");
+    }
+
+    function figureAssetUrl(figure) {
+      if (!figure || !figure.id) {
+        return "";
+      }
+      if (figure.asset_status !== "validated_local_asset" && figure.asset_status !== "external_reference_only") {
+        return "";
+      }
+      return `/api/figures/${encodeURIComponent(figure.id)}/asset`;
+    }
+
+    function renderFigureBlock(figures) {
+      if (!figures || !figures.length) {
+        return "<div>(none)</div>";
+      }
+      return `
+        <div class="figure-grid">
+          ${figures.map(figure => {
+            const assetUrl = figureAssetUrl(figure);
+            const assetStatus = figure.asset_status || "metadata_only";
+            const assetMeta = [
+              `status: ${assetStatus}`,
+              figure.mime_type ? `mime: ${figure.mime_type}` : "",
+              figure.width && figure.height ? `size: ${figure.width}x${figure.height}` : "",
+              figure.byte_size ? `bytes: ${figure.byte_size}` : ""
+            ].filter(Boolean).join(" | ");
+            const preview = assetUrl
+              ? `<a href="${escapeHtml(assetUrl)}" target="_blank" rel="noreferrer">Open asset</a><img src="${escapeHtml(assetUrl)}" alt="${escapeHtml(figure.caption || figure.figure_label || figure.id)}">`
+              : `<div class="mono">${escapeHtml(figure.validation_error || (assetStatus === "metadata_only" ? "No local image asset" : "Only external reference available"))}</div>`;
+            return `
+              <div class="figure-card">
+                <div><strong>${escapeHtml(figure.figure_label || figure.id || "Figure")}</strong></div>
+                <div>${escapeHtml(figure.caption || "(no caption)")}</div>
+                <div class="mono">linked sections: ${escapeHtml((figure.linked_section_ids || []).join(", ") || "(none)")}</div>
+                <div class="mono">${escapeHtml(assetMeta || "status: metadata_only")}</div>
+                ${preview}
+              </div>
+            `;
+          }).join("")}
+        </div>
+      `;
     }
 
     function formatPaperCell(item) {
@@ -245,19 +341,84 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         });
     }
 
+    function formatTopicStats(topicRun) {
+      const rawStats = topicRun && (topicRun.stats || topicRun.stats_json || {});
+      const resolved = typeof rawStats === "object" ? (rawStats || {}) : (() => {
+        try {
+          return JSON.parse(rawStats || "{}");
+        } catch {
+          return { raw_stats: String(rawStats || "") };
+        }
+      })();
+      const saturation = resolved.saturation_metrics || {};
+      const flattening = saturation.flattening_signal || {};
+      const stopDecision = resolved.saturation_stop || saturation.stop_decision || {};
+      const lines = [
+        `stage=${topicRun.current_stage || resolved.current_stage || "pending"}`,
+        `status=${topicRun.derived_status || topicRun.status || "pending"}`,
+        `elapsed=${topicRun.elapsed_seconds ?? 0}s`,
+        `stage_elapsed=${topicRun.stage_elapsed_seconds ?? 0}s`,
+        `discovered=${resolved.discovered ?? 0}`,
+        `accessible=${resolved.accessible ?? 0}`,
+        `parsed=${resolved.parsed_papers ?? 0}`,
+        `cards=${resolved.cards ?? 0}`,
+        `queued_for_access=${resolved.queued_for_access ?? 0}`,
+        `acquisition_errors=${resolved.acquisition_errors ?? 0}`,
+        `paper_processing_errors=${resolved.paper_processing_errors ?? 0}`,
+      ];
+      if (Object.keys(flattening).length) {
+        lines.push(
+          `flattening.likely=${flattening.likely_flattening ? "yes" : "no"}`,
+          `flattening.tail=${JSON.stringify(flattening.tail_incremental_new_cards || [])}`
+        );
+      }
+      if (stopDecision.decision) {
+        lines.push(`stop=${stopDecision.decision}`);
+      }
+      if ((topicRun.latest_failures || []).length) {
+        lines.push(`failures=${topicRun.latest_failures.length}`);
+      }
+      const pretty = JSON.stringify(resolved, null, 2);
+      return `
+        <div class="stats-summary mono">${escapeHtml(lines.join(" | "))}</div>
+        <details>
+          <summary>Show full stats JSON</summary>
+          <pre class="stats-json">${escapeHtml(pretty)}</pre>
+        </details>
+      `;
+    }
+
     function renderRuns(payload) {
       const topicRuns = payload.topic_runs || [];
       const runs = payload.runs || [];
-      const runRows = runs.map(run => `<tr><td>${run.id}</td><td>${run.status}</td><td><pre>${run.topics_text}</pre></td></tr>`).join("");
+      const runRows = runs.map(run => {
+        const summary = run.progress_summary || {};
+        const summaryLine = [
+          `topics=${summary.topic_completed ?? 0}/${summary.topic_total ?? 0}`,
+          `papers=${summary.discovered ?? 0}`,
+          `accessible=${summary.accessible ?? 0}`,
+          `parsed=${summary.parsed ?? 0}`,
+          `cards=${summary.carded ?? 0}`,
+          `reviewed=${summary.reviewed ?? 0}`,
+          `exported=${summary.exported ?? 0}`
+        ].join(" | ");
+        return `<tr><td class="mono">${run.id}</td><td>${run.status}</td><td><pre>${run.topics_text}</pre></td><td class="mono">${escapeHtml(summaryLine)}</td></tr>`;
+      }).join("");
       const topicRows = topicRuns.map(item => {
-        const stats = typeof item.stats === "object" ? JSON.stringify(item.stats) : item.stats_json;
-        return `<tr><td>${item.run_id}</td><td>${item.topic_name}</td><td>${item.status}</td><td>${stats}</td></tr>`;
+        const statsHtml = formatTopicStats(item);
+        const failures = (item.latest_failures || []).map(failure =>
+          `${failure.stage || ""}:${failure.code || ""} ${failure.message || ""}`
+        ).join("\n");
+        const retryButton = ["failed", "stalled"].includes(item.derived_status)
+          ? `<button onclick="retryTopicRun('${item.id}')">Retry</button>`
+          : "";
+        return `<tr><td class="mono">${item.run_id}</td><td>${escapeHtml(item.topic_name || "")}</td><td>${escapeHtml(item.derived_status || item.status || "")}</td><td class="mono">${escapeHtml(item.current_stage || "")}</td><td class="mono">${item.elapsed_seconds ?? 0}s</td><td class="stats-cell">${statsHtml}${failures ? `<div class="details mono">${escapeHtml(failures)}</div>` : ""}</td><td>${retryButton}</td></tr>`;
       }).join("");
       document.getElementById("runs").innerHTML = `
         <h3>Runs</h3>
-        <table><tr><th>Run</th><th>Status</th><th>Topics</th></tr>${runRows}</table>
+        <table><tr><th>Run</th><th>Status</th><th>Topics</th><th>Progress Summary</th></tr>${runRows}</table>
         <h3>Topic Jobs</h3>
-        <table><tr><th>Run</th><th>Topic</th><th>Status</th><th>Stats</th></tr>${topicRows}</table>
+        <table><tr><th>Run</th><th>Topic</th><th>Status</th><th>Stage</th><th>Elapsed</th><th>Stats</th><th>Actions</th></tr>${topicRows}</table>
       `;
       updateExportRunOptions(runs);
     }
@@ -313,7 +474,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         const detailContent = expandedItem ? renderReviewItemDetail(expandedItem) : "Loading...";
         return `${mainRow}
           <tr>
-            <td colspan="12"><div class="inline-details">${escapeHtml(detailContent)}</div></td>
+            <td colspan="12"><div class="inline-details">${detailContent}</div></td>
           </tr>
         `;
       }).join("");
@@ -330,16 +491,18 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     function renderQueue(items) {
       const rows = items.map(item => `
         <tr>
+          <td class="mono">${item.id}</td>
           <td>${item.paper_title}</td>
           <td>${item.reason}</td>
           <td>${item.priority}</td>
           <td>${item.status}</td>
           <td class="mono">${item.original_url || ""}</td>
+          <td>${item.status === "open" ? `<button onclick="reactivateAccessQueueItem('${item.id}')">Reactivate</button>` : ""}</td>
         </tr>
       `).join("");
       document.getElementById("queue").innerHTML = `
         <table>
-          <tr><th>Paper</th><th>Reason</th><th>Priority</th><th>Status</th><th>URL</th></tr>
+          <tr><th>Queue ID</th><th>Paper</th><th>Reason</th><th>Priority</th><th>Status</th><th>URL</th><th>Action</th></tr>
           ${rows}
         </table>
       `;
@@ -376,77 +539,253 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     }
 
     async function refreshCalibrationStatus() {
-      const payload = await readJson("/api/debug/state");
+      const payload = await readJson("/api/calibration/workflow");
       const activeSet = payload.active_calibration_set;
       const latestEvaluation = payload.latest_evaluation_run;
+      const failedExamples = payload.failed_examples || [];
+      const failedBoundaryExamples = payload.failed_boundary_examples || [];
+      const activePromptVersions = payload.active_prompt_versions || [];
+      const activeRubricVersions = payload.active_rubric_versions || [];
+      const exampleCounts = payload.example_counts || {};
       const lines = [
         `Active calibration set: ${activeSet ? activeSet.name : "(none)"}`,
         `Active example count: ${activeSet ? (activeSet.examples || []).length : 0}`,
+        `Example counts: positive=${exampleCounts.positive ?? 0} | negative=${exampleCounts.negative ?? 0} | boundary=${exampleCounts.boundary ?? 0}`,
+        `Active prompt versions: ${activePromptVersions.map(item => `${item.prompt_stage}:${item.version}`).join(" | ") || "(none)"}`,
+        `Active rubric versions: ${activeRubricVersions.map(item => `${item.rubric_name}:${item.version}`).join(" | ") || "(none)"}`,
         "",
         `Latest evaluation run: ${latestEvaluation ? latestEvaluation.id : "(none)"}`,
         `Latest evaluation status: ${latestEvaluation ? latestEvaluation.status : ""}`,
-        `Latest evaluation summary: ${latestEvaluation ? JSON.stringify(latestEvaluation.summary || {}, null, 2) : "{}"}`
+        `Latest evaluation summary: ${latestEvaluation ? JSON.stringify(latestEvaluation.summary || {}, null, 2) : "{}"}`,
+        `Failed examples: ${failedExamples.length}`,
+        `Failed example titles: ${failedExamples.map(item => item.title).join(" | ") || "(none)"}`,
+        `Failed boundary examples: ${failedBoundaryExamples.map(item => item.title).join(" | ") || "(none)"}`
       ];
       document.getElementById("calibration-status").textContent = lines.join("\n");
     }
 
+    async function retryTopicRun(topicRunId) {
+      const payload = await readJson(`/api/topic-runs/${topicRunId}/retry`, { method: "POST" });
+      document.getElementById("start-result").textContent = JSON.stringify(payload, null, 2);
+      await refreshRuns();
+      await refreshQueue();
+    }
+
+    async function reactivateAccessQueueItem(queueItemId) {
+      const localPath = window.prompt("Enter local full text path (.pdf/.html) for this queued paper:");
+      if (!localPath) return;
+      const payload = await readJson(`/api/access-queue/${queueItemId}/reactivate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ local_path: localPath, reviewer: "internal-ui" })
+      });
+      document.getElementById("start-result").textContent = JSON.stringify(payload, null, 2);
+      await refreshQueue();
+      await refreshRuns();
+      await refreshReviewItems();
+    }
+
+    function renderSaturationTrends(payload) {
+      const trends = payload.trends || [];
+      const rows = trends.map(item => {
+        const historyJson = JSON.stringify(item.history || [], null, 2);
+        return `
+          <tr>
+            <td>${escapeHtml(item.topic_name || "")}</td>
+            <td class="mono">${escapeHtml(item.latest_run_id || "")}</td>
+            <td>${item.latest_card_count ?? 0}</td>
+            <td>${item.latest_duplication_ratio ?? 0}</td>
+            <td>${item.duplication_ratio_delta ?? 0}</td>
+            <td>${item.latest_likely_flattening ? "yes" : "no"}</td>
+            <td>${escapeHtml(item.latest_stop_decision || "")}</td>
+            <td>${escapeHtml(item.latest_stop_reason || "")}</td>
+            <td class="mono">${escapeHtml(JSON.stringify(item.latest_tail_incremental_new_cards || []))}</td>
+            <td>
+              <details>
+                <summary>History</summary>
+                <pre class="stats-json">${escapeHtml(historyJson)}</pre>
+              </details>
+            </td>
+          </tr>
+        `;
+      }).join("");
+      if (!rows) {
+        document.getElementById("saturation-trends").innerHTML = "<div class=\"details\">(no saturation snapshots yet)</div>";
+        return;
+      }
+      document.getElementById("saturation-trends").innerHTML = `
+        <table>
+          <tr>
+            <th>Topic</th><th>Latest Run</th><th>Cards</th><th>Dup Ratio</th><th>Delta</th><th>Flattening</th><th>Stop</th><th>Reason</th><th>Tail</th><th>History</th>
+          </tr>
+          ${rows}
+        </table>
+      `;
+    }
+
+    async function refreshSaturationTrends() {
+      const topic = document.getElementById("saturation-topic-filter").value.trim();
+      const params = new URLSearchParams({ history_limit: "5" });
+      if (topic) params.set("topic", topic);
+      const payload = await readJson(`/api/saturation/topics?${params.toString()}`);
+      renderSaturationTrends(payload);
+    }
+
+    async function refreshQualityMetrics() {
+      const runId = document.getElementById("filter-run").value.trim();
+      const params = new URLSearchParams();
+      if (runId) params.set("run_id", runId);
+      const payload = await readJson(`/api/quality/metrics?${params.toString()}`);
+      document.getElementById("quality-metrics").textContent = JSON.stringify(payload.metrics || {}, null, 2);
+    }
+
+    function getSingleValidationInput() {
+      return {
+        paperId: document.getElementById("single-validation-paper-id").value.trim(),
+        topicId: document.getElementById("single-validation-topic-id").value.trim(),
+        runId: document.getElementById("single-validation-run-id").value.trim()
+      };
+    }
+
+    async function runSingleValidation() {
+      const output = document.getElementById("single-validation-result");
+      output.textContent = "";
+      const { paperId, topicId, runId } = getSingleValidationInput();
+      if (!paperId || !topicId || !runId) {
+        output.textContent = "paper_id / topic_id / run_id are required.";
+        return;
+      }
+      try {
+        const payload = await readJson(`/api/papers/${paperId}/validate-single`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ topic_id: topicId, run_id: runId })
+        });
+        output.textContent = JSON.stringify(payload.validation || payload, null, 2);
+      } catch (error) {
+        output.textContent = `Single validation failed: ${error.message}`;
+      }
+    }
+
+    async function loadPaperUnderstanding() {
+      const output = document.getElementById("single-validation-result");
+      output.textContent = "";
+      const { paperId, topicId, runId } = getSingleValidationInput();
+      if (!paperId || !topicId || !runId) {
+        output.textContent = "paper_id / topic_id / run_id are required.";
+        return;
+      }
+      try {
+        const params = new URLSearchParams({ topic_id: topicId, run_id: runId });
+        const payload = await readJson(`/api/papers/${paperId}/understanding?${params.toString()}`);
+        output.textContent = JSON.stringify(payload.understanding_record || payload, null, 2);
+      } catch (error) {
+        output.textContent = `Load understanding failed: ${error.message}`;
+      }
+    }
+
+    async function loadCardPlan() {
+      const output = document.getElementById("single-validation-result");
+      output.textContent = "";
+      const { paperId, topicId, runId } = getSingleValidationInput();
+      if (!paperId || !topicId || !runId) {
+        output.textContent = "paper_id / topic_id / run_id are required.";
+        return;
+      }
+      try {
+        const params = new URLSearchParams({ topic_id: topicId, run_id: runId });
+        const payload = await readJson(`/api/papers/${paperId}/card-plan?${params.toString()}`);
+        output.textContent = JSON.stringify(payload.card_plan || payload, null, 2);
+      } catch (error) {
+        output.textContent = `Load card plan failed: ${error.message}`;
+      }
+    }
+
     function renderReviewItemDetail(item) {
       if (item.object_type === "excluded") {
-        const evidenceSections = (item.evidence_sections || []).map(section =>
-          `- Evidence (${section.section_title || "Section"}): ${section.paragraph_text}`
-        ).join("\n\n");
+        const evidenceSections = (item.evidence_sections || []).map(section => `
+          <li><strong>${escapeHtml(section.section_title || "Section")}:</strong> ${escapeHtml(section.paragraph_text || "")}</li>
+        `).join("");
         const promotedCard = item.promoted_card
-          ? `Promoted card: ${item.promoted_card.id} | ${item.promoted_card.title} | ${item.promoted_card.review_status || ""}`
-          : "Promoted card: (none)";
-        const lines = [
-          `Excluded: ${item.label}`,
-          `Paper: ${item.paper_title || ""}`,
-          `Paper link: ${item.paper_url || ""}`,
-          `Type: ${item.exclusion_type || ""}`,
-          `Reason: ${item.reason || ""}`,
-          `Review: ${((item.review || {}).decision) || ""} | ${((item.review || {}).note) || ""}`,
-          promotedCard,
-          "",
-          "Evidence",
-          evidenceSections || "(none)"
-        ];
-        return lines.join("\n");
+          ? `${escapeHtml(item.promoted_card.id)} | ${escapeHtml(item.promoted_card.title)} | ${escapeHtml(item.promoted_card.review_status || "")}`
+          : "(none)";
+        return `
+          <div class="detail-section">
+            <div class="detail-line"><strong>Excluded:</strong> ${escapeHtml(item.label || "")}</div>
+            <div class="detail-line"><strong>Paper:</strong> ${escapeHtml(item.paper_title || "")}</div>
+            <div class="detail-line"><strong>Paper link:</strong> ${escapeHtml(item.paper_url || "")}</div>
+            <div class="detail-line"><strong>Type:</strong> ${escapeHtml(item.exclusion_type || "")}</div>
+            <div class="detail-line"><strong>Reason:</strong> ${escapeHtml(item.reason || "")}</div>
+            <div class="detail-line"><strong>Review:</strong> ${escapeHtml(((item.review || {}).decision) || "")} | ${escapeHtml(((item.review || {}).note) || "")}</div>
+            <div class="detail-line"><strong>Promoted card:</strong> ${promotedCard}</div>
+          </div>
+          <div class="detail-section">
+            <h4>Evidence</h4>
+            <ul class="detail-list">${evidenceSections || "<li>(none)</li>"}</ul>
+          </div>
+        `;
       }
 
-      const evidenceBlock = (item.evidence || []).map(item => {
-        const quoteZh = item.quote_zh ? `\nEvidence (ZH): ${item.quote_zh}` : "";
-        const analysis = item.analysis ? `\nWhy it matters: ${item.analysis}` : "";
-        return `- Evidence (EN): ${item.quote}${quoteZh}${analysis}`;
-      }).join("\n\n");
-      const excludedBlock = (item.excluded_content || []).map(item =>
-        `- ${item.label} [${item.exclusion_type}]\n  Reason: ${item.reason}`
-      ).join("\n\n");
-      const neighborBlock = (item.neighbors || []).map(item =>
-        `- ${item.title} | ${item.relationship} | similarity=${item.similarity} | review=${item.review_decision || ""}\n  Why compare: ${item.relationship_reason}`
-      ).join("\n\n");
+      const evidenceBlock = (item.evidence || []).map(entry => `
+        <li>
+          <div><strong>Evidence (EN):</strong> ${escapeHtml(entry.quote || "")}</div>
+          <div><strong>Evidence (ZH):</strong> ${escapeHtml(entry.quote_zh || "")}</div>
+          <div><strong>Why it matters:</strong> ${escapeHtml(entry.analysis || "")}</div>
+        </li>
+      `).join("");
+      const excludedBlock = (item.excluded_content || []).map(entry => `
+        <li><strong>${escapeHtml(entry.label || "")}</strong> [${escapeHtml(entry.exclusion_type || "")}]<br>Reason: ${escapeHtml(entry.reason || "")}</li>
+      `).join("");
+      const neighborBlock = (item.neighbors || []).map(entry => `
+        <li><strong>${escapeHtml(entry.title || "")}</strong> | ${escapeHtml(entry.relationship || "")} | similarity=${escapeHtml(entry.similarity || "")} | review=${escapeHtml(entry.review_decision || "")}<br>Why compare: ${escapeHtml(entry.relationship_reason || "")}</li>
+      `).join("");
       const sourceExcludedBlock = item.source_excluded_item
-        ? `Promoted from excluded: ${item.source_excluded_item.id} | ${item.source_excluded_item.label} | ${item.source_excluded_item.reason}`
-        : "Promoted from excluded: (none)";
-      const sections = [
-        `Card: ${item.title}`,
-        `Paper: ${item.paper_title || ""}`,
-        `Paper link: ${item.paper_url || ""}`,
-        `Teach it as: ${item.teachable_one_liner || ""}`,
-        `Course use: ${item.course_transformation || ""}`,
-        `Judgement: ${(item.judgement || {}).color || ""} | ${(item.judgement || {}).reason || ""}`,
-        `Review: ${((item.review || {}).decision) || ""} | ${((item.review || {}).note) || ""}`,
-        sourceExcludedBlock,
-        "",
-        "Evidence",
-        evidenceBlock || "(none)",
-        "",
-        "Potential Dedupe Assistance",
-        neighborBlock || "(none)",
-        "",
-        "Excluded Content From This Paper",
-        excludedBlock || "(none)"
-      ];
-      return sections.join("\n");
+        ? `${escapeHtml(item.source_excluded_item.id)} | ${escapeHtml(item.source_excluded_item.label)} | ${escapeHtml(item.source_excluded_item.reason)}`
+        : "(none)";
+      const diagnostics = item.grounding_diagnostics || {};
+      const mix = diagnostics.section_type_mix || {};
+      const siblingBlock = (diagnostics.same_paper_siblings || []).map(sibling => `
+        <li>${escapeHtml(sibling.id || "")} | ${escapeHtml(sibling.title || "")} | cluster=${escapeHtml(sibling.duplicate_cluster_id || "(none)")} | rank=${escapeHtml(sibling.duplicate_rank || 0)} | disposition=${escapeHtml(sibling.duplicate_disposition || "")}</li>
+      `).join("");
+      return `
+        <div class="detail-section">
+          <div class="detail-line"><strong>Card:</strong> ${escapeHtml(item.title || "")}</div>
+          <div class="detail-line"><strong>Paper:</strong> ${escapeHtml(item.paper_title || "")}</div>
+          <div class="detail-line"><strong>Paper link:</strong> ${escapeHtml(item.paper_url || "")}</div>
+          <div class="detail-line"><strong>Teach it as:</strong> ${escapeHtml(item.teachable_one_liner || "")}</div>
+          <div class="detail-line"><strong>Course use:</strong> ${escapeHtml(item.course_transformation || "")}</div>
+          <div class="detail-line"><strong>Judgement:</strong> ${escapeHtml((item.judgement || {}).color || "")} | ${escapeHtml((item.judgement || {}).reason || "")}</div>
+          <div class="detail-line"><strong>Review:</strong> ${escapeHtml(((item.review || {}).decision) || "")} | ${escapeHtml(((item.review || {}).note) || "")}</div>
+          <div class="detail-line"><strong>Paper-specific object:</strong> ${escapeHtml(item.paper_specific_object || diagnostics.paper_specific_object || "")}</div>
+          <div class="detail-line"><strong>Claim type:</strong> ${escapeHtml(item.claim_type || diagnostics.claim_type || "")}</div>
+          <div class="detail-line"><strong>Evidence level:</strong> ${escapeHtml(item.evidence_level || diagnostics.evidence_level || "")}</div>
+          <div class="detail-line"><strong>Grounding quality:</strong> ${escapeHtml(item.grounding_quality || diagnostics.grounding_quality || "")}</div>
+          <div class="detail-line"><strong>Body grounding reason:</strong> ${escapeHtml(item.body_grounding_reason || diagnostics.body_grounding_reason || "")}</div>
+          <div class="detail-line"><strong>Primary evidence source type mix:</strong> body=${escapeHtml(mix.body || 0)}, abstract=${escapeHtml(mix.abstract || 0)}, front=${escapeHtml(mix.front_matter || 0)}</div>
+          <div class="detail-line"><strong>Duplicate cluster:</strong> ${escapeHtml(item.duplicate_cluster_id || diagnostics.duplicate_cluster_id || "")} | rank=${escapeHtml(item.duplicate_rank || diagnostics.duplicate_rank || 0)} | disposition=${escapeHtml(item.duplicate_disposition || diagnostics.duplicate_disposition || "")}</div>
+          <div class="detail-line"><strong>Promoted from excluded:</strong> ${sourceExcludedBlock}</div>
+        </div>
+        <div class="detail-section">
+          <h4>Figures</h4>
+          ${renderFigureBlock(item.figures || [])}
+        </div>
+        <div class="detail-section">
+          <h4>Evidence</h4>
+          <ul class="detail-list">${evidenceBlock || "<li>(none)</li>"}</ul>
+        </div>
+        <div class="detail-section">
+          <h4>Same-Paper Siblings</h4>
+          <ul class="detail-list">${siblingBlock || "<li>(none)</li>"}</ul>
+        </div>
+        <div class="detail-section">
+          <h4>Potential Dedupe Assistance</h4>
+          <ul class="detail-list">${neighborBlock || "<li>(none)</li>"}</ul>
+        </div>
+        <div class="detail-section">
+          <h4>Excluded Content From This Paper</h4>
+          <ul class="detail-list">${excludedBlock || "<li>(none)</li>"}</ul>
+        </div>
+      `;
     }
 
     async function loadReviewItem(targetType, targetId) {
@@ -551,6 +890,11 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     document.getElementById("refresh-review-items").addEventListener("click", refreshReviewItems);
     document.getElementById("refresh-queue").addEventListener("click", refreshQueue);
     document.getElementById("refresh-calibration-status").addEventListener("click", refreshCalibrationStatus);
+    document.getElementById("refresh-quality-metrics").addEventListener("click", refreshQualityMetrics);
+    document.getElementById("refresh-saturation-trends").addEventListener("click", refreshSaturationTrends);
+    document.getElementById("run-single-validation").addEventListener("click", runSingleValidation);
+    document.getElementById("load-understanding").addEventListener("click", loadPaperUnderstanding);
+    document.getElementById("load-card-plan").addEventListener("click", loadCardPlan);
     document.getElementById("export-run-id").addEventListener("change", refreshExportOptions);
 
     document.getElementById("export-doc").addEventListener("click", async () => {
@@ -582,6 +926,8 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     refreshReviewItems();
     refreshQueue();
     refreshCalibrationStatus();
+    refreshQualityMetrics();
+    refreshSaturationTrends();
     refreshExportOptions();
   </script>
 </body>

@@ -5,12 +5,15 @@ Data structures: temporary app settings, a minimal PDF fixture, and API-level as
 """
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import unittest
@@ -23,16 +26,20 @@ import app.services as services_module
 from app.config import Settings
 from app.llm import (
     CARD_RUBRIC_VERSION,
+    EXTRACTION_PROMPT_VERSION,
     JUDGEMENT_PROMPT_VERSION,
     AnthropicLLMClient,
     GeminiLLMClient,
     LLMGenerationError,
     LLMCardEngine,
     OpenAICompatibleLLMClient,
+    get_prompt_version_records,
 )
 from app.main import create_app
 from app.db import ensure_migrations, get_connection, init_db
 from app.services import EvaluationService, PaperPipeline, PdfParser, Repository, split_paragraphs
+
+ORIGINAL_DISCOVERY_DISCOVER = services_module.DiscoveryService.discover
 
 
 def build_minimal_pdf_bytes(text: str) -> bytes:
@@ -107,6 +114,28 @@ def build_pdf_with_non_text_tj_noise(valid_text: str) -> bytes:
         result += f"{offset:010d} 00000 n \n"
     result += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
     return result.encode("latin-1")
+
+
+def build_png_bytes(size: tuple[int, int] = (24, 16), color: tuple[int, int, int] = (60, 120, 220)) -> bytes:
+    from PIL import Image
+
+    image = Image.new("RGB", size, color)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def build_pdf_with_embedded_png(image_bytes: bytes, caption_text: str) -> bytes:
+    import fitz
+
+    document = fitz.open()
+    try:
+        page = document.new_page(width=400, height=300)
+        page.insert_image(fitz.Rect(50, 40, 250, 180), stream=image_bytes)
+        page.insert_text((50, 230), caption_text, fontsize=12)
+        return document.tobytes()
+    finally:
+        document.close()
 
 
 class FakeHTTPResponse:
@@ -199,7 +228,9 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         review_decision: str | None,
         run: dict | None = None,
         original_url: str = "",
+        figure_ids: list[str] | None = None,
     ) -> dict:
+        figure_ids = figure_ids or []
         run = run or self.repository.create_run("Export Topic", {"operator": "tester"})
         topic = self.repository.create_or_get_topic("Export Topic")
         paper = self.repository.create_or_get_paper(
@@ -249,7 +280,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                             "analysis": "这段证据说明真正有效的是冲突检查，而不是堆更多角色。",
                         }
                     ],
-                    "figure_ids": [],
+                    "figure_ids": figure_ids,
                     "status": "candidate",
                     "embedding": [0.0] * 64,
                     "created_at": "2026-03-06T00:00:02+00:00",
@@ -398,10 +429,13 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertIn('id="filter-item-type"', response.text)
         self.assertIn("/api/review-items", response.text)
         self.assertIn('id="refresh-calibration-status"', response.text)
+        self.assertIn('id="refresh-saturation-trends"', response.text)
+        self.assertIn('id="saturation-trends"', response.text)
         self.assertIn("Promote", response.text)
         self.assertIn('id="export-card-picker"', response.text)
         self.assertIn('<select id="export-run-id">', response.text)
         self.assertNotIn('id="review-item-detail"', response.text)
+        self.assertIn("/api/topic-runs/", response.text)
 
     def test_can_import_and_activate_calibration_set_via_api(self) -> None:
         payload = {
@@ -456,6 +490,84 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(active_response.status_code, 200, active_response.text)
         self.assertIsNotNone(active_response.json()["active_set"])
         self.assertEqual(active_response.json()["active_set"]["id"], calibration_set["id"])
+
+    def test_calibration_workflow_exposes_active_versions_and_boundary_failures(self) -> None:
+        calibration_set = self.repository.import_calibration_set(
+            name="governance-pack",
+            description="Boundary-oriented governance examples.",
+            metadata={"owner": "ops"},
+            examples=[
+                {
+                    "example_type": "positive",
+                    "topic_name": "AI literacy",
+                    "audience": "teachers",
+                    "title": "Positive Example",
+                    "source_text": "A positive calibration example with a clear teaching insight.",
+                    "evidence": [],
+                    "expected_cards": [],
+                    "expected_exclusions": [],
+                    "rationale": "",
+                    "tags": ["positive"],
+                },
+                {
+                    "example_type": "boundary",
+                    "topic_name": "AI literacy",
+                    "audience": "teachers",
+                    "title": "Boundary Example",
+                    "source_text": "A boundary calibration example that may pass or fail depending on rubric details.",
+                    "evidence": [],
+                    "expected_cards": [],
+                    "expected_exclusions": [],
+                    "rationale": "Needs careful judgment.",
+                    "tags": ["boundary", "review"],
+                },
+            ],
+        )
+        self.repository.activate_calibration_set(calibration_set["id"])
+        evaluation_run = self.repository.create_evaluation_run(
+            calibration_set=calibration_set,
+            llm_mode="disabled",
+            model_name="",
+            extraction_prompt_version=EXTRACTION_PROMPT_VERSION,
+            judgement_prompt_version=JUDGEMENT_PROMPT_VERSION,
+            rubric_version=CARD_RUBRIC_VERSION,
+        )
+        boundary_example = calibration_set["examples"][1]
+        self.repository.create_evaluation_result(
+            evaluation_run_id=evaluation_run["id"],
+            calibration_example=boundary_example,
+            extraction_output={},
+            judgement_output={},
+            expected={},
+            actual={},
+            verdict="failed",
+            regression_type="boundary_miss",
+            reason="Boundary example regressed.",
+        )
+        self.repository.finalize_evaluation_run(
+            evaluation_run["id"],
+            "completed",
+            {"passed": 0, "failed": 1},
+        )
+
+        response = self.client.get("/api/calibration/workflow")
+        self.assertEqual(response.status_code, 200, response.text)
+        workflow = response.json()
+        self.assertEqual(workflow["active_calibration_set"]["id"], calibration_set["id"])
+        self.assertEqual(workflow["example_counts"]["positive"], 1)
+        self.assertEqual(workflow["example_counts"]["boundary"], 1)
+        self.assertGreaterEqual(len(workflow["active_prompt_versions"]), 4)
+        self.assertTrue(any(item["version"] == EXTRACTION_PROMPT_VERSION for item in workflow["active_prompt_versions"]))
+        self.assertEqual(workflow["active_rubric_versions"][0]["version"], CARD_RUBRIC_VERSION)
+        self.assertEqual(len(workflow["failed_examples"]), 1)
+        self.assertEqual(workflow["failed_boundary_examples"][0]["title"], "Boundary Example")
+
+    def test_debug_state_exposes_governance_records(self) -> None:
+        response = self.client.get("/api/debug/state")
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertTrue(any(item["version"] == EXTRACTION_PROMPT_VERSION for item in payload["prompt_versions"]))
+        self.assertTrue(any(item["version"] == CARD_RUBRIC_VERSION for item in payload["rubric_versions"]))
 
     def test_calibration_import_rejects_invalid_example_type(self) -> None:
         response = self.client.post(
@@ -1120,6 +1232,273 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("does not exist", response.text)
 
+    def test_export_google_doc_uses_gws_create_mode_when_enabled(self) -> None:
+        fixture = self._create_export_card_fixture(card_id="card_gws_create", review_decision="accepted")
+        exporter = services_module.ExportService(
+            Settings(
+                data_dir=self.settings.data_dir,
+                db_path=self.settings.db_path,
+                google_docs_mode="gws",
+                llm_mode="disabled",
+            ),
+            self.repository,
+        )
+
+        calls: list[list[str]] = []
+
+        def fake_run(command: list[str], check: bool, capture_output: bool, text: bool):
+            calls.append(command)
+            if command[3] == "create":
+                return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"documentId": "doc_created"}), stderr="")
+            if command[3] == "batchUpdate":
+                return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+            raise AssertionError(f"Unexpected command: {command}")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            record = exporter.export_google_doc_package(
+                run_id=fixture["run"]["id"],
+                card_ids=[fixture["card_id"]],
+                document_title="Boss Report - Live Create",
+                existing_google_doc_id="",
+            )
+
+        self.assertEqual(record["export_status"], "exported")
+        self.assertEqual(record["export_mode"], "create")
+        self.assertEqual(record["google_doc_id"], "doc_created")
+        self.assertEqual(record["error_message"], "")
+        self.assertEqual([command[3] for command in calls], ["create", "batchUpdate"])
+
+    def test_export_google_doc_uses_append_mode_for_existing_doc(self) -> None:
+        fixture = self._create_export_card_fixture(card_id="card_gws_append", review_decision="accepted")
+        exporter = services_module.ExportService(
+            Settings(
+                data_dir=self.settings.data_dir,
+                db_path=self.settings.db_path,
+                google_docs_mode="gws",
+                llm_mode="disabled",
+            ),
+            self.repository,
+        )
+
+        batch_payloads: list[dict] = []
+
+        def fake_run(command: list[str], check: bool, capture_output: bool, text: bool):
+            if command[3] == "get":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps({"body": {"content": [{"endIndex": 1}, {"endIndex": 25}]}}),
+                    stderr="",
+                )
+            if command[3] == "batchUpdate":
+                batch_payloads.append(json.loads(command[-1]))
+                return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+            if command[3] == "create":
+                raise AssertionError("Append mode should not create a new document")
+            raise AssertionError(f"Unexpected command: {command}")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            record = exporter.export_google_doc_package(
+                run_id=fixture["run"]["id"],
+                card_ids=[fixture["card_id"]],
+                document_title="Boss Report - Live Append",
+                existing_google_doc_id="doc_existing",
+            )
+
+        self.assertEqual(record["export_status"], "exported")
+        self.assertEqual(record["export_mode"], "append")
+        self.assertEqual(record["google_doc_id"], "doc_existing")
+        self.assertEqual(len(batch_payloads), 1)
+        first_index = batch_payloads[0]["requests"][0]["insertText"]["location"]["index"]
+        self.assertGreaterEqual(first_index, 24)
+
+    def test_export_google_doc_records_gws_failure_result(self) -> None:
+        fixture = self._create_export_card_fixture(card_id="card_gws_failed", review_decision="accepted")
+        exporter = services_module.ExportService(
+            Settings(
+                data_dir=self.settings.data_dir,
+                db_path=self.settings.db_path,
+                google_docs_mode="gws",
+                llm_mode="disabled",
+            ),
+            self.repository,
+        )
+
+        def fake_run(command: list[str], check: bool, capture_output: bool, text: bool):
+            if command[3] == "create":
+                return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"documentId": "doc_failed"}), stderr="")
+            if command[3] == "batchUpdate":
+                raise subprocess.CalledProcessError(1, command, stderr="gws batch update failed")
+            raise AssertionError(f"Unexpected command: {command}")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            record = exporter.export_google_doc_package(
+                run_id=fixture["run"]["id"],
+                card_ids=[fixture["card_id"]],
+                document_title="Boss Report - Live Failure",
+                existing_google_doc_id="",
+            )
+
+        self.assertEqual(record["export_status"], "export_failed")
+        self.assertEqual(record["export_mode"], "create")
+        self.assertEqual(record["google_doc_id"], "doc_failed")
+        self.assertIn("gws batch update failed", record["error_message"])
+
+    def test_access_queue_reactivation_reprocesses_paper_into_main_pipeline(self) -> None:
+        run = self.repository.create_run("reactivation topic", {"operator": "tester"})
+        topic = self.repository.create_or_get_topic("reactivation topic")
+        topic_run = self.repository.create_topic_run(run["id"], topic["id"])
+        paper = self.repository.create_or_get_paper(
+            title="Queued Paper",
+            authors=["Ada Researcher"],
+            publication_year=2026,
+            external_id="paper::queue::1",
+            source_type="semantic_scholar",
+            local_path="",
+            original_url="https://example.com/queued-paper",
+            access_status="manual_needed",
+            ingestion_status="queued",
+            parse_status="pending",
+            artifact_path="",
+        )
+        self.repository.link_paper_to_topic(paper["id"], topic["id"], run["id"], "search")
+        self.repository.create_access_queue_item(paper["id"], run["id"], "Need full text")
+
+        queue_item = self.repository.list_access_queue(run["id"])[0]
+        source_pdf = Path(self.temp_dir.name) / "reactivation-source.pdf"
+        source_pdf.write_bytes(
+            build_minimal_pdf_bytes(
+                "Reactivated evidence body for testing. This full text is deliberately long enough to pass PDF readability validation."
+            )
+        )
+
+        response = self.client.post(
+            f"/api/access-queue/{queue_item['id']}/reactivate",
+            json={"local_path": str(source_pdf), "reviewer": "tester"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["queue_item"]["status"], "reactivated")
+        self.assertEqual(payload["paper"]["access_status"], "open_fulltext")
+        self.assertEqual(payload["paper"]["parse_status"], "parsed")
+        self.assertEqual(len(payload["topic_runs"]), 1)
+        self.assertEqual(payload["topic_runs"][0]["status"], "completed")
+        self.assertEqual(payload["topic_runs"][0]["current_stage"], "completed")
+        refreshed_queue = self.repository.get_access_queue_item(queue_item["id"])
+        self.assertEqual(refreshed_queue["status"], "reactivated")
+        refreshed_topic_run = self.repository.get_topic_run(topic_run["id"])
+        self.assertEqual(refreshed_topic_run["status"], "completed")
+        self.assertEqual(refreshed_topic_run["stats"]["queued_for_access"], 0)
+
+    def test_access_queue_reactivation_rejects_missing_local_file(self) -> None:
+        run = self.repository.create_run("reactivation topic", {"operator": "tester"})
+        topic = self.repository.create_or_get_topic("reactivation topic")
+        paper = self.repository.create_or_get_paper(
+            title="Queued Paper Missing",
+            authors=["Ada Researcher"],
+            publication_year=2026,
+            external_id="paper::queue::missing",
+            source_type="semantic_scholar",
+            local_path="",
+            original_url="https://example.com/queued-paper-missing",
+            access_status="manual_needed",
+            ingestion_status="queued",
+            parse_status="pending",
+            artifact_path="",
+        )
+        self.repository.link_paper_to_topic(paper["id"], topic["id"], run["id"], "search")
+        self.repository.create_access_queue_item(paper["id"], run["id"], "Need full text")
+        queue_item = self.repository.list_access_queue(run["id"])[0]
+
+        response = self.client.post(
+            f"/api/access-queue/{queue_item['id']}/reactivate",
+            json={"local_path": str(Path(self.temp_dir.name) / "missing-file.pdf"), "reviewer": "tester"},
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        refreshed_queue = self.repository.get_access_queue_item(queue_item["id"])
+        self.assertEqual(refreshed_queue["status"], "open")
+
+    def test_sqlite_write_waits_for_transient_lock_and_then_succeeds(self) -> None:
+        run = self.repository.create_run("Lock Topic", {"operator": "tester"})
+        topic = self.repository.create_or_get_topic("Lock Topic")
+        topic_run = self.repository.create_topic_run(run["id"], topic["id"])
+        errors: list[Exception] = []
+
+        lock_connection = get_connection(self.settings.db_path)
+        lock_connection.execute("BEGIN IMMEDIATE")
+        lock_connection.execute("UPDATE runs SET status = status WHERE id = ?", (run["id"],))
+
+        def delayed_write() -> None:
+            try:
+                self.repository.update_topic_run(topic_run["id"], "running", stats={"discovered": 1})
+            except Exception as error:  # pragma: no cover - assertion captures unexpected failure
+                errors.append(error)
+
+        worker = threading.Thread(target=delayed_write)
+        started_at = time.monotonic()
+        worker.start()
+        time.sleep(6.0)
+        lock_connection.commit()
+        lock_connection.close()
+        worker.join(timeout=10)
+
+        self.assertFalse(errors, errors[0] if errors else "")
+        self.assertFalse(worker.is_alive())
+        self.assertGreaterEqual(time.monotonic() - started_at, 6.0)
+        refreshed_topic_run = self.repository.get_topic_run(topic_run["id"])
+        self.assertEqual(refreshed_topic_run["stats"]["discovered"], 1)
+
+    def test_parse_and_store_uses_atomic_parse_persistence_path(self) -> None:
+        paper = self.repository.create_or_get_paper(
+            title="Atomic Parse Paper",
+            authors=["Ada Researcher"],
+            publication_year=2026,
+            external_id="paper::atomic::1",
+            source_type="local",
+            local_path="",
+            original_url="https://example.com/atomic-parse-paper",
+            access_status="open_fulltext",
+            ingestion_status="ready",
+            parse_status="pending",
+            artifact_path="artifact.pdf",
+        )
+        pipeline = PaperPipeline(self.settings, self.repository)
+        parsed_payload = {
+            "sections": [
+                {
+                    "id": "section_atomic_1",
+                    "section_order": 1,
+                    "section_title": "Page 1",
+                    "paragraph_text": "Atomic parsing should persist through one repository write path.",
+                    "page_number": 1,
+                    "embedding": [0.0] * 64,
+                }
+            ],
+            "figures": [
+                {
+                    "id": "figure_atomic_1",
+                    "figure_label": "Figure 1",
+                    "caption": "Atomic figure caption",
+                    "storage_path": "",
+                    "linked_section_ids": ["section_atomic_1"],
+                }
+            ],
+        }
+
+        with patch.object(pipeline.parser, "parse", return_value=parsed_payload), \
+            patch.object(self.repository, "persist_parse_result", wraps=self.repository.persist_parse_result) as persist_result, \
+            patch.object(self.repository, "replace_sections", side_effect=AssertionError("replace_sections should not be called")), \
+            patch.object(self.repository, "replace_figures", side_effect=AssertionError("replace_figures should not be called")), \
+            patch.object(self.repository, "update_paper", side_effect=AssertionError("update_paper should not be called directly")):
+            stored_count = pipeline.parse_and_store(paper)
+
+        self.assertEqual(stored_count, 1)
+        self.assertEqual(persist_result.call_count, 1)
+        refreshed_paper = self.repository.get_paper(paper["id"])
+        self.assertEqual(refreshed_paper["parse_status"], "parsed")
+        self.assertEqual(len(self.repository.get_sections(paper["id"])), 1)
+        self.assertEqual(len(self.repository.get_figures(paper["id"])), 1)
+
     def test_parser_treats_pdf_magic_signature_as_pdf_even_without_pdf_suffix(self) -> None:
         source_pdf = Path(self.temp_dir.name) / "paper.03314"
         source_pdf.write_bytes(build_minimal_pdf_bytes("We find that agent handoffs reduce response drift."))
@@ -1206,6 +1585,83 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertIn("Verifier agents reduced contradiction rate", parsed["sections"][0]["paragraph_text"])
         self.assertEqual(len(parsed["figures"]), 1)
         self.assertEqual(parsed["figures"][0]["caption"], "Agent architecture")
+
+    def test_parser_extracts_caption_only_figures_from_pdf_text(self) -> None:
+        source_pdf = Path(self.temp_dir.name) / "caption-only.pdf"
+        source_pdf.write_bytes(build_minimal_pdf_bytes("Fig. 1 Overview of the verifier coordination loop."))
+
+        parser = PdfParser(self.settings)
+        parsed = parser.parse({"artifact_path": str(source_pdf), "local_path": ""})
+
+        self.assertEqual(parsed["artifact_type"], "pdf")
+        self.assertEqual(len(parsed["figures"]), 1)
+        self.assertEqual(parsed["figures"][0]["figure_label"], "Figure 1")
+        self.assertIn("Overview of the verifier coordination loop", parsed["figures"][0]["caption"])
+        self.assertTrue(parsed["figures"][0]["linked_section_ids"])
+
+    def test_parser_materializes_html_data_uri_figure_assets(self) -> None:
+        png_bytes = build_png_bytes()
+        encoded = base64.b64encode(png_bytes).decode("ascii")
+        source_html = Path(self.temp_dir.name) / "figure-data-uri.html"
+        source_html.write_text(
+            (
+                "<html><head><meta property='og:url' content='https://example.com/paper'></head><body>"
+                "<figure><img src='data:image/png;base64,"
+                + encoded
+                + "' alt='Verifier workflow'><figcaption>Figure 1. Verifier workflow</figcaption></figure>"
+                "</body></html>"
+            ),
+            encoding="utf-8",
+        )
+
+        parser = PdfParser(self.settings)
+        parsed = parser.parse({"artifact_path": str(source_html), "local_path": ""})
+
+        self.assertEqual(parsed["artifact_type"], "html")
+        self.assertEqual(len(parsed["figures"]), 1)
+        figure = parsed["figures"][0]
+        self.assertEqual(figure["asset_status"], "validated_local_asset")
+        self.assertTrue(Path(figure["asset_local_path"]).exists())
+        self.assertEqual(figure["mime_type"], "image/png")
+        self.assertGreater(figure["byte_size"], 0)
+
+    def test_parser_extracts_validated_pdf_image_assets(self) -> None:
+        if getattr(services_module, "fitz", None) is None:
+            self.skipTest("PyMuPDF not installed")
+        source_pdf = Path(self.temp_dir.name) / "embedded-figure.pdf"
+        source_pdf.write_bytes(
+            build_pdf_with_embedded_png(
+                build_png_bytes(size=(48, 32)),
+                "Fig. 1 Embedded verifier coordination asset.",
+            )
+        )
+
+        class StubResult:
+            text_content = (
+                "# Embedded Figure\n\n"
+                "Fig. 1 Embedded verifier coordination asset.\n\n"
+                "Verifier agents reduce contradictions when they explicitly check conflicts."
+            )
+
+        class StubMarkItDown:
+            def __init__(self, enable_plugins: bool = False):
+                self.enable_plugins = enable_plugins
+
+            def convert(self, source: str) -> StubResult:
+                return StubResult()
+
+        with patch.object(services_module, "MarkItDown", StubMarkItDown):
+            parser = PdfParser(self.settings)
+            parsed = parser.parse({"artifact_path": str(source_pdf), "local_path": ""})
+
+        self.assertEqual(parsed["artifact_type"], "pdf")
+        self.assertEqual(len(parsed["figures"]), 1)
+        figure = parsed["figures"][0]
+        self.assertEqual(figure["asset_status"], "validated_local_asset")
+        self.assertTrue(Path(figure["asset_local_path"]).exists())
+        self.assertGreater(figure["width"], 0)
+        self.assertGreater(figure["height"], 0)
+        self.assertEqual(figure["asset_kind"], "pdf_embedded")
 
     def test_split_paragraphs_dehyphenates_words_and_splits_before_section_headers(self) -> None:
         text = (
@@ -1298,7 +1754,8 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 topic_name: str,
                 paper_title: str,
                 extracted_cards: list[dict],
-                calibration_examples: list[dict],
+                figures: list[dict] | None = None,
+                calibration_examples: list[dict] | None = None,
                 calibration_set_name: str = "",
             ) -> dict:
                 return {
@@ -1335,6 +1792,658 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(card_detail["teachable_one_liner"], "如果你要多智能体规划更稳，就别只分工，还要让它们彼此解释并互相检查。")
         self.assertEqual(len(card_detail["excluded_content"]), 1)
         self.assertEqual(card_detail["excluded_content"][0]["exclusion_type"], "background")
+
+    def test_section_structure_classification_marks_abstract_vs_body(self) -> None:
+        sections = services_module.enrich_sections_with_structure(
+            [
+                {
+                    "id": "sec_1",
+                    "section_order": 1,
+                    "section_title": "Abstract",
+                    "paragraph_text": "Abstract We introduce a new framework and summarize main findings.",
+                    "page_number": 1,
+                    "embedding": [0.0] * 64,
+                },
+                {
+                    "id": "sec_2",
+                    "section_order": 2,
+                    "section_title": "Results",
+                    "paragraph_text": "Results show the proposed method improves reliability by 23 percent.",
+                    "page_number": 1,
+                    "embedding": [0.0] * 64,
+                },
+            ],
+            "pdf_markitdown",
+        )
+        self.assertTrue(sections[0]["is_abstract"])
+        self.assertFalse(sections[0]["is_body"])
+        self.assertEqual(sections[1]["section_kind"], "results")
+        self.assertTrue(sections[1]["is_body"])
+
+    def test_evidence_packet_prefers_body_sections_for_primary(self) -> None:
+        pipeline = PaperPipeline(self.settings, self.repository)
+        sections = services_module.enrich_sections_with_structure(
+            [
+                {
+                    "id": "sec_abs",
+                    "section_order": 1,
+                    "section_title": "Abstract",
+                    "paragraph_text": "Abstract discusses verifier pattern at high level.",
+                    "page_number": 1,
+                    "embedding": [0.0] * 64,
+                },
+                {
+                    "id": "sec_body",
+                    "section_order": 2,
+                    "section_title": "Results",
+                    "paragraph_text": "Results: verifier checks reduce contradiction by 23 percent in agent workflows.",
+                    "page_number": 2,
+                    "embedding": [0.0] * 64,
+                },
+            ],
+            "pdf_markitdown",
+        )
+        packet = pipeline._build_evidence_packet(sections, [], "verifier workflow")
+        primary_ids = [item["id"] for item in packet["primary_candidate_sections"]]
+        self.assertIn("sec_body", primary_ids)
+        self.assertNotEqual(primary_ids[0], "sec_abs")
+
+    def test_grounding_gate_rejects_abstract_only_primary_when_body_exists(self) -> None:
+        pipeline = PaperPipeline(self.settings, self.repository)
+        sections = services_module.enrich_sections_with_structure(
+            [
+                {
+                    "id": "sec_abs",
+                    "section_order": 1,
+                    "section_title": "Abstract",
+                    "paragraph_text": "Abstract explains the motivation.",
+                    "page_number": 1,
+                    "embedding": [0.0] * 64,
+                },
+                {
+                    "id": "sec_res",
+                    "section_order": 2,
+                    "section_title": "Results",
+                    "paragraph_text": "Results show clear measured gains.",
+                    "page_number": 2,
+                    "embedding": [0.0] * 64,
+                },
+            ],
+            "pdf_markitdown",
+        )
+        kept, excluded = pipeline._gate_extracted_candidates(
+            [
+                {
+                    "title": "摘要型候选",
+                    "primary_section_ids": ["sec_abs"],
+                    "supporting_section_ids": [],
+                    "paper_specific_object": "摘要型候选",
+                    "evidence": [{"section_id": "sec_abs", "quote": "Abstract explains the motivation.", "analysis": "summary", "page_number": 1}],
+                }
+            ],
+            sections,
+        )
+        self.assertEqual(len(kept), 0)
+        self.assertEqual(len(excluded), 1)
+        self.assertIn("abstract_dominant_evidence_gate", excluded[0]["reason"])
+
+    def test_duplicate_governance_suppresses_same_evidence_variants(self) -> None:
+        pipeline = PaperPipeline(self.settings, self.repository)
+        kept, excluded = pipeline._suppress_same_paper_duplicates(
+            [
+                {
+                    "title": "候选A",
+                    "primary_section_ids": ["sec_1"],
+                    "paper_specific_object": "verifier check",
+                    "claim_type": "method",
+                    "evidence_level": "strong",
+                    "judgement": {"color": "green"},
+                    "evidence": [{"section_id": "sec_1"}],
+                },
+                {
+                    "title": "候选B",
+                    "primary_section_ids": ["sec_1"],
+                    "paper_specific_object": "verifier check",
+                    "claim_type": "method",
+                    "evidence_level": "weak",
+                    "judgement": {"color": "yellow"},
+                    "evidence": [{"section_id": "sec_1"}],
+                },
+            ]
+        )
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(len(excluded), 1)
+        self.assertEqual(kept[0]["duplicate_disposition"], "kept")
+        self.assertIn("replaced by cluster representative", excluded[0]["reason"])
+
+    def test_quality_metrics_endpoint_reports_grounding_and_duplicate_rates(self) -> None:
+        run = self.repository.create_run("quality metrics", {"operator": "tester"})
+        topic = self.repository.create_or_get_topic("quality metrics")
+        paper = self.repository.create_or_get_paper(
+            title="Quality Metrics Paper",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id="paper::quality-metrics",
+            source_type="local",
+            local_path="",
+            original_url="",
+            access_status="open_fulltext",
+            ingestion_status="ready",
+            parse_status="parsed",
+            artifact_path="",
+        )
+        self.repository.link_paper_to_topic(paper["id"], topic["id"], run["id"], "local_pdf")
+        self.repository.replace_sections(
+            paper["id"],
+            services_module.enrich_sections_with_structure(
+                [
+                    {
+                        "id": "sec_q_abs",
+                        "section_order": 1,
+                        "section_title": "Abstract",
+                        "paragraph_text": "Abstract overview.",
+                        "page_number": 1,
+                        "embedding": [0.0] * 64,
+                    },
+                    {
+                        "id": "sec_q_body",
+                        "section_order": 2,
+                        "section_title": "Results",
+                        "paragraph_text": "Measured result with concrete mechanism evidence.",
+                        "page_number": 2,
+                        "embedding": [0.0] * 64,
+                    },
+                ],
+                "pdf_markitdown",
+            ),
+        )
+        self.repository.replace_generation_outputs_for_paper_topic(
+            paper["id"],
+            topic["id"],
+            run["id"],
+            [
+                {
+                    "id": "card_quality_1",
+                    "title": "正文证据卡",
+                    "granularity_level": "detail",
+                    "course_transformation": "课程对象A",
+                    "teachable_one_liner": "一句话A",
+                    "draft_body": "说明A",
+                    "evidence": [{"section_id": "sec_q_body", "quote": "Measured result", "quote_zh": "量化结果", "page_number": 2, "analysis": "直接证据"}],
+                    "figure_ids": [],
+                    "status": "candidate",
+                    "embedding": [0.0] * 64,
+                    "primary_section_ids": ["sec_q_body"],
+                    "supporting_section_ids": ["sec_q_abs"],
+                    "paper_specific_object": "mechanism A",
+                    "claim_type": "result",
+                    "evidence_level": "strong",
+                    "body_grounding_reason": "正文结果段直接支撑",
+                    "grounding_quality": "strong",
+                    "duplicate_cluster_id": "dup_cluster_1",
+                    "duplicate_rank": 1,
+                    "duplicate_disposition": "kept",
+                    "created_at": "2026-03-07T00:00:01+00:00",
+                    "judgement": {
+                        "color": "green",
+                        "reason": "有效",
+                        "model_version": "stub",
+                        "prompt_version": JUDGEMENT_PROMPT_VERSION,
+                        "rubric_version": CARD_RUBRIC_VERSION,
+                    },
+                }
+            ],
+            [],
+        )
+        self.repository.create_review_decision("card", "card_quality_1", "tester", "accepted", "ok")
+        response = self.client.get("/api/quality/metrics", params={"run_id": run["id"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        metrics = response.json()["metrics"]
+        self.assertEqual(metrics["total_cards"], 1)
+        self.assertGreaterEqual(metrics["body_grounded_card_rate"], 1.0)
+        self.assertGreaterEqual(metrics["paper_specific_object_presence_rate"], 1.0)
+        self.assertEqual(metrics["accepted_cards"], 1)
+
+    def test_review_item_detail_includes_grounding_diagnostics(self) -> None:
+        fixture = self._create_export_card_fixture(card_id="card_diag", review_decision="accepted")
+        response = self.client.get(f"/api/review-items/card/{fixture['card_id']}")
+        self.assertEqual(response.status_code, 200, response.text)
+        item = response.json()["item"]
+        self.assertIn("grounding_diagnostics", item)
+        diagnostics = item["grounding_diagnostics"]
+        self.assertIn("section_type_mix", diagnostics)
+        self.assertIn("same_paper_siblings", diagnostics)
+
+    def test_review_item_detail_includes_linked_figures(self) -> None:
+        fixture = self._create_export_card_fixture(
+            card_id="card_fig",
+            review_decision="accepted",
+            figure_ids=["figure_demo_1"],
+        )
+        self.repository.replace_figures(
+            fixture["paper"]["id"],
+            [
+                {
+                    "id": "figure_demo_1",
+                    "figure_label": "Figure 1",
+                    "caption": "Verifier coordination loop",
+                    "storage_path": "",
+                    "linked_section_ids": [f"section_{fixture['card_id']}"],
+                }
+            ],
+        )
+        response = self.client.get(f"/api/review-items/card/{fixture['card_id']}")
+        self.assertEqual(response.status_code, 200, response.text)
+        item = response.json()["item"]
+        self.assertEqual(len(item["figures"]), 1)
+        self.assertEqual(item["figures"][0]["caption"], "Verifier coordination loop")
+
+    def test_figure_asset_endpoint_serves_validated_local_asset(self) -> None:
+        run = self.repository.create_run("figure asset", {"operator": "tester"})
+        topic = self.repository.create_or_get_topic("figure asset")
+        paper = self.repository.create_or_get_paper(
+            title="Figure Asset Paper",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id="paper::figure-asset",
+            source_type="local",
+            local_path="",
+            original_url="",
+            access_status="open_fulltext",
+            ingestion_status="ready",
+            parse_status="parsed",
+            artifact_path="",
+        )
+        self.repository.link_paper_to_topic(paper["id"], topic["id"], run["id"], "local_pdf")
+        asset_path = Path(self.temp_dir.name) / "figure-asset.png"
+        asset_path.write_bytes(build_png_bytes())
+        self.repository.replace_figures(
+            paper["id"],
+            [
+                {
+                    "id": "figure_asset_1",
+                    "figure_label": "Figure 1",
+                    "caption": "Validated verifier asset",
+                    "storage_path": str(asset_path),
+                    "asset_status": "validated_local_asset",
+                    "asset_kind": "local_copy",
+                    "asset_local_path": str(asset_path),
+                    "mime_type": "image/png",
+                    "byte_size": asset_path.stat().st_size,
+                    "width": 24,
+                    "height": 16,
+                    "linked_section_ids": [],
+                }
+            ],
+        )
+
+        response = self.client.get("/api/figures/figure_asset_1/asset")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["content-type"], "image/png")
+        self.assertGreater(len(response.content), 0)
+
+    def test_repository_persists_understanding_and_card_plan_records(self) -> None:
+        run = self.repository.create_run("understanding topic", {"operator": "tester"})
+        topic = self.repository.create_or_get_topic("understanding topic")
+        paper = self.repository.create_or_get_paper(
+            title="Understanding Test Paper",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id="paper::understanding-record",
+            source_type="local",
+            local_path="",
+            original_url="",
+            access_status="open_fulltext",
+            ingestion_status="ready",
+            parse_status="parsed",
+            artifact_path="",
+        )
+        understanding = self.repository.create_paper_understanding_record(
+            paper_id=paper["id"],
+            topic_id=topic["id"],
+            run_id=run["id"],
+            version="understanding-v1",
+            understanding={
+                "global_contribution_objects": [{"id": "obj_1", "label": "Verifier conflict resolver"}],
+                "contribution_graph": [],
+                "evidence_index": {"obj_1": {"section_ids": ["sec_1"], "figure_ids": []}},
+                "candidate_level_hints": {"obj_1": "overall"},
+            },
+        )
+        plan = self.repository.create_card_plan(
+            paper_id=paper["id"],
+            topic_id=topic["id"],
+            run_id=run["id"],
+            version="card-plan-v1",
+            plan={
+                "planned_cards": [{"id": "plan_1", "level": "overall", "target_object_id": "obj_1", "disposition": "produce"}],
+                "coverage_report": {"produce": 1, "exclude": 0},
+            },
+        )
+        latest_understanding = self.repository.get_latest_paper_understanding(paper["id"], topic["id"], run["id"])
+        latest_plan = self.repository.get_latest_card_plan(paper["id"], topic["id"], run["id"])
+
+        self.assertEqual(understanding["version"], "understanding-v1")
+        self.assertEqual(plan["version"], "card-plan-v1")
+        self.assertEqual(latest_understanding["understanding"]["global_contribution_objects"][0]["id"], "obj_1")
+        self.assertEqual(latest_plan["plan"]["planned_cards"][0]["level"], "overall")
+
+    def test_pipeline_single_paper_validation_writes_required_artifacts(self) -> None:
+        run = self.repository.create_run("single paper validation", {"operator": "tester"})
+        topic = self.repository.create_or_get_topic("single paper validation")
+        paper = self.repository.create_or_get_paper(
+            title="Single Paper Validation",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id="paper::single-validation",
+            source_type="local",
+            local_path="",
+            original_url="",
+            access_status="open_fulltext",
+            ingestion_status="ready",
+            parse_status="parsed",
+            artifact_path="",
+        )
+        self.repository.link_paper_to_topic(paper["id"], topic["id"], run["id"], "local_pdf")
+        self.repository.replace_sections(
+            paper["id"],
+            services_module.enrich_sections_with_structure(
+                [
+                    {
+                        "id": "section_sv_1",
+                        "section_order": 1,
+                        "section_title": "Abstract",
+                        "paragraph_text": "Abstract: this paper studies verifier-based workflows.",
+                        "page_number": 1,
+                        "embedding": [0.0] * 64,
+                    },
+                    {
+                        "id": "section_sv_2",
+                        "section_order": 2,
+                        "section_title": "Results",
+                        "paragraph_text": "Results: verifier checks reduce contradiction rate by 23 percent.",
+                        "page_number": 2,
+                        "embedding": [0.0] * 64,
+                    },
+                ],
+                "pdf_markitdown",
+            ),
+        )
+
+        class StubCardEngine:
+            def is_enabled(self) -> bool:
+                return True
+
+            def extract_candidates(
+                self,
+                *,
+                topic_name: str,
+                paper_title: str,
+                sections: list[dict],
+                figures: list[dict] | None = None,
+                calibration_examples: list[dict] | None = None,
+                calibration_set_name: str = "",
+            ) -> dict:
+                section_id = sections[-1]["id"]
+                return {
+                    "cards": [
+                        {
+                            "title": "验证者检查能显著降低冲突率",
+                            "primary_section_ids": [section_id],
+                            "supporting_section_ids": [],
+                            "granularity_level": "detail",
+                            "claim_type": "result",
+                            "paper_specific_object": "verifier checks",
+                            "body_grounding_reason": "结果段给出量化提升",
+                            "evidence_level": "strong",
+                            "possible_duplicate_signature": "verifier-check-result",
+                            "draft_body": "验证者检查是多智能体流程里的高收益步骤。",
+                            "evidence": [
+                                {
+                                    "section_id": section_id,
+                                    "quote": "Results: verifier checks reduce contradiction rate by 23 percent.",
+                                    "quote_zh": "",
+                                    "page_number": 2,
+                                    "analysis": "有量化结果，适合课程使用。",
+                                }
+                            ],
+                            "figure_ids": [],
+                            "status": "candidate",
+                        }
+                    ],
+                    "excluded_content": [],
+                }
+
+            def judge_candidates(
+                self,
+                *,
+                topic_name: str,
+                paper_title: str,
+                extracted_cards: list[dict],
+                figures: list[dict] | None = None,
+                calibration_examples: list[dict] | None = None,
+                calibration_set_name: str = "",
+            ) -> dict:
+                card = extracted_cards[0]
+                return {
+                    "cards": [
+                        {
+                            **card,
+                            "course_transformation": "验证者冲突检查模板：显式矛盾发现流程",
+                            "teachable_one_liner": "多智能体流程不是只分工，而是要显式做冲突检查，不然就会出错。",
+                            "judgement": {
+                                "color": "green",
+                                "reason": "具备可行动性且有量化证据。",
+                                "model_version": "stub-model",
+                                "prompt_version": JUDGEMENT_PROMPT_VERSION,
+                                "rubric_version": CARD_RUBRIC_VERSION,
+                            },
+                        }
+                    ]
+                }
+
+        pipeline = PaperPipeline(self.settings, self.repository, card_engine=StubCardEngine())
+        result = pipeline.validate_single_paper_flow(paper=paper, topic=topic, run_id=run["id"])
+
+        self.assertEqual(result["card_count"], 1)
+        self.assertEqual(result["excluded_count"], 0)
+        for key in ("paper_understanding", "card_plan", "final_cards", "excluded_content", "report"):
+            self.assertTrue(Path(result["artifacts"][key]).exists(), key)
+        card_plan = json.loads(Path(result["artifacts"]["card_plan"]).read_text(encoding="utf-8"))
+        final_cards = json.loads(Path(result["artifacts"]["final_cards"]).read_text(encoding="utf-8"))
+        produced_plan_ids = {
+            item["plan_id"]
+            for item in card_plan.get("planned_cards", [])
+            if item.get("disposition") == "produce" and item.get("plan_id")
+        }
+        for card in final_cards:
+            self.assertIn(card.get("plan_id", ""), produced_plan_ids)
+
+    def test_align_cards_to_plan_requires_must_have_evidence_overlap(self) -> None:
+        pipeline = PaperPipeline(self.settings, self.repository)
+        cards = [
+            {
+                "title": "Card A",
+                "primary_section_ids": ["section_a"],
+                "evidence": [{"section_id": "section_a"}],
+                "judgement": {"color": "green"},
+                "evidence_level": "strong",
+            },
+            {
+                "title": "Card B",
+                "primary_section_ids": ["section_b"],
+                "evidence": [{"section_id": "section_b"}],
+                "judgement": {"color": "green"},
+                "evidence_level": "strong",
+            },
+        ]
+        card_plan = {
+            "planned_cards": [
+                {
+                    "plan_id": "plan_obj_x",
+                    "level": "overall",
+                    "target_object_id": "obj_x",
+                    "target_object_label": "Object X",
+                    "must_have_evidence_ids": ["section_x"],
+                    "optional_supporting_ids": [],
+                    "disposition": "produce",
+                },
+                {
+                    "plan_id": "plan_obj_b",
+                    "level": "local",
+                    "target_object_id": "obj_b",
+                    "target_object_label": "Object B",
+                    "must_have_evidence_ids": ["section_b"],
+                    "optional_supporting_ids": [],
+                    "disposition": "produce",
+                },
+            ]
+        }
+        kept, excluded = pipeline._align_cards_to_plan(cards, card_plan)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["title"], "Card B")
+        self.assertEqual(kept[0]["plan_id"], "plan_obj_b")
+        self.assertEqual(len(excluded), 1)
+        self.assertEqual(excluded[0]["label"], "Card A")
+
+    def test_align_cards_to_plan_keeps_non_red_cards_when_planner_produces_zero_slots(self) -> None:
+        pipeline = PaperPipeline(self.settings, self.repository)
+        cards = [
+            {
+                "title": "Card A",
+                "primary_section_ids": ["section_a"],
+                "evidence": [{"section_id": "section_a"}],
+                "granularity_level": "subpattern",
+                "judgement": {"color": "green"},
+            },
+            {
+                "title": "Card B",
+                "primary_section_ids": ["section_b"],
+                "evidence": [{"section_id": "section_b"}],
+                "granularity_level": "framework",
+                "judgement": {"color": "red"},
+            },
+        ]
+        card_plan = {
+            "planned_cards": [
+                {
+                    "plan_id": "plan_obj_a",
+                    "level": "detail",
+                    "target_object_id": "obj_a",
+                    "target_object_label": "Object A",
+                    "must_have_evidence_ids": ["section_a"],
+                    "optional_supporting_ids": [],
+                    "disposition": "exclude",
+                }
+            ]
+        }
+        kept, excluded = pipeline._align_cards_to_plan(cards, card_plan)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["title"], "Card A")
+        self.assertEqual(kept[0]["plan_id"], "fallback_no_plan")
+        self.assertEqual(kept[0]["planned_level"], "local")
+        self.assertEqual(len(excluded), 1)
+        self.assertEqual(excluded[0]["label"], "Card B")
+
+    def test_concept_alignment_gate_requires_belief_gap_and_named_course_object(self) -> None:
+        pipeline = PaperPipeline(self.settings, self.repository)
+        cards = [
+            {
+                "title": "多智能体工作流框架",
+                "course_transformation": "课程摘要",
+                "teachable_one_liner": "这是一个重要框架。",
+                "primary_section_ids": ["section_a"],
+                "evidence": [{"section_id": "section_a"}],
+                "judgement": {"color": "green", "reason": "信息完整。"},
+            },
+            {
+                "title": "并行协作不是串行接力",
+                "course_transformation": "并行协作模板：Outline→Parallel Expand",
+                "teachable_one_liner": "别只让代理轮流接力，而是先统一大纲再并行扩写。",
+                "primary_section_ids": ["section_b"],
+                "evidence": [{"section_id": "section_b"}],
+                "judgement": {"color": "green", "reason": "从串行到并行是明显认知转变。"},
+            },
+        ]
+        kept, excluded = pipeline._gate_judged_cards_for_concept_alignment(cards)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["title"], "并行协作不是串行接力")
+        self.assertEqual(len(excluded), 1)
+        self.assertIn("CONCEPT alignment gate failed", excluded[0]["reason"])
+
+    def test_concept_alignment_gate_keeps_direct_transfer_cards_without_explicit_belief_gap(self) -> None:
+        pipeline = PaperPipeline(self.settings, self.repository)
+        cards = [
+            {
+                "title": "记忆写回要分开处理修改与换出",
+                "course_transformation": "记忆写回流程模板：修改与换出两步决策",
+                "teachable_one_liner": "设计记忆系统时，把写回拆成修改旧记忆和腾出空间两类动作。",
+                "paper_specific_object": "记忆写回的两步决策：修改与换出",
+                "primary_section_ids": ["section_a"],
+                "figure_ids": [],
+                "evidence": [{"section_id": "section_a"}],
+                "judgement": {"color": "yellow", "reason": "流程清楚，直接可迁移。"},
+            }
+        ]
+        kept, excluded = pipeline._gate_judged_cards_for_concept_alignment(cards)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(excluded, [])
+
+    def test_api_single_paper_validation_endpoint_returns_artifacts(self) -> None:
+        run = self.repository.create_run("api single validation", {"operator": "tester"})
+        topic = self.repository.create_or_get_topic("api single validation")
+        paper = self.repository.create_or_get_paper(
+            title="API Single Validation",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id="paper::api-single-validation",
+            source_type="local",
+            local_path="",
+            original_url="",
+            access_status="open_fulltext",
+            ingestion_status="ready",
+            parse_status="parsed",
+            artifact_path="",
+        )
+        self.repository.link_paper_to_topic(paper["id"], topic["id"], run["id"], "local_pdf")
+        self.repository.replace_sections(
+            paper["id"],
+            services_module.enrich_sections_with_structure(
+                [
+                    {
+                        "id": "section_api_sv_1",
+                        "section_order": 1,
+                        "section_title": "Results",
+                        "paragraph_text": "Results: this section contains measurable improvements.",
+                        "page_number": 1,
+                        "embedding": [0.0] * 64,
+                    }
+                ],
+                "pdf_markitdown",
+            ),
+        )
+        response = self.client.post(
+            f"/api/papers/{paper['id']}/validate-single",
+            json={"topic_id": topic["id"], "run_id": run["id"]},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()["validation"]
+        self.assertEqual(payload["paper_id"], paper["id"])
+        self.assertEqual(payload["topic_id"], topic["id"])
+        self.assertEqual(payload["run_id"], run["id"])
+        self.assertIn("artifacts", payload)
+
+        understanding_response = self.client.get(
+            f"/api/papers/{paper['id']}/understanding",
+            params={"topic_id": topic["id"], "run_id": run["id"]},
+        )
+        self.assertEqual(understanding_response.status_code, 200, understanding_response.text)
+        card_plan_response = self.client.get(
+            f"/api/papers/{paper['id']}/card-plan",
+            params={"topic_id": topic["id"], "run_id": run["id"]},
+        )
+        self.assertEqual(card_plan_response.status_code, 200, card_plan_response.text)
 
     def test_pipeline_records_llm_failure_and_creates_no_cards(self) -> None:
         run = self.repository.create_run("agentic workflow", {"operator": "tester"})
@@ -1389,7 +2498,8 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 topic_name: str,
                 paper_title: str,
                 extracted_cards: list[dict],
-                calibration_examples: list[dict],
+                figures: list[dict] | None = None,
+                calibration_examples: list[dict] | None = None,
                 calibration_set_name: str = "",
             ) -> dict:
                 raise LLMGenerationError("request to https://api.example.com/v1/chat/completions failed: boom")
@@ -1499,6 +2609,100 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         engine = LLMCardEngine(settings)
         self.assertIsInstance(engine.client, GeminiLLMClient)
 
+    def test_llm_engine_routes_to_fallback_provider_after_network_error(self) -> None:
+        settings = Settings(
+            data_dir=self.settings.data_dir,
+            db_path=self.settings.db_path,
+            max_workers=4,
+            google_docs_mode="artifact_only",
+            llm_mode="openai_compatible",
+            llm_base_url="https://primary.example.com/v1",
+            llm_api_key="primary-key",
+            llm_model="primary-model",
+            llm_providers_json=json.dumps(
+                [
+                    {
+                        "provider_id": "primary",
+                        "provider_type": "openai_compatible",
+                        "base_url": "https://primary.example.com/v1",
+                        "api_key": "primary-key",
+                        "model": "primary-model",
+                        "priority": 0,
+                    },
+                    {
+                        "provider_id": "fallback",
+                        "provider_type": "anthropic",
+                        "base_url": "https://fallback.example.com/v1",
+                        "api_key": "fallback-key",
+                        "model": "fallback-model",
+                        "priority": 1,
+                    },
+                ]
+            ),
+            llm_provider_cooldown_seconds=60,
+        )
+
+        class FailingClient:
+            model = "primary-model"
+
+            def chat_json(self, system_prompt: str, user_prompt: str) -> dict:
+                raise LLMGenerationError("request to https://primary.example.com/v1/chat/completions failed: ssl handshake")
+
+        class FallbackClient:
+            model = "fallback-model"
+
+            def chat_json(self, system_prompt: str, user_prompt: str) -> dict:
+                prompt = json.loads(user_prompt)
+                if prompt["stage"] == "candidate_extraction":
+                    return {
+                        "cards": [
+                            {
+                                "title": "验证者先找冲突再继续协作",
+                                "section_ids": ["section_demo_1", "section_demo_2"],
+                                "granularity_level": "subpattern",
+                                "draft_body": "多智能体协作里先显式找冲突，再继续汇总。",
+                                "evidence_analysis": [
+                                    {"section_id": "section_demo_1", "analysis": "第一段说明模式本体。"},
+                                    {"section_id": "section_demo_2", "analysis": "第二段给出量化结果。"},
+                                ],
+                            }
+                        ],
+                        "excluded_content": [],
+                    }
+                return {
+                    "cards": [
+                        {
+                            "candidate_index": 0,
+                            "title": "验证者先找冲突再继续协作",
+                            "course_transformation": "多智能体协作：验证者冲突检查",
+                            "teachable_one_liner": "多个执行者可能打架时，先加验证者找冲突，再进入汇总。",
+                            "draft_body": "多智能体协作里先显式找冲突，再继续汇总。",
+                            "evidence_localization": [
+                                {"section_id": "section_demo_1", "quote_zh": "当多个执行智能体可能互相矛盾时，需要单独设置一个验证者来显式检查冲突。"},
+                                {"section_id": "section_demo_2", "quote_zh": "加入验证者后，不一致率下降了 23%。"},
+                            ],
+                            "judgement": {"color": "green", "reason": "这是可直接迁移的协作模式。"},
+                        }
+                    ]
+                }
+
+        engine = LLMCardEngine(
+            settings,
+            provider_clients={
+                "primary": FailingClient(),
+                "fallback": FallbackClient(),
+            },
+        )
+
+        payload = engine.smoke_test()
+
+        self.assertEqual(payload["card_count"], 1)
+        self.assertEqual(payload["provider_route"]["selected_provider"]["provider_id"], "fallback")
+        extraction_route = payload["provider_routes"]["candidate_extraction"]
+        attempt_statuses = [attempt["status"] for attempt in extraction_route["attempts"]]
+        self.assertIn("failed", attempt_statuses)
+        self.assertIn("success", attempt_statuses)
+
     def test_openai_compatible_client_parses_chat_completion_shape(self) -> None:
         client = OpenAICompatibleLLMClient(
             base_url="https://api.example.com/v1",
@@ -1550,6 +2754,46 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 client.chat_json("system", "user")
         self.assertIn("DNS lookup failed", str(context.exception))
         self.assertIn("bad-host.invalid", str(context.exception))
+
+    def test_openai_client_retries_transient_url_error_then_succeeds(self) -> None:
+        client = OpenAICompatibleLLMClient(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="gpt-test",
+            timeout_seconds=30,
+        )
+        transient_error = urllib.error.URLError(TimeoutError("timed out"))
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=[transient_error, FakeHTTPResponse({"choices": [{"message": {"content": '{"cards":[]}'}}]})],
+        ) as mock_open, patch("app.llm.time.sleep", return_value=None) as mock_sleep:
+            payload = client.chat_json("system", "user")
+        self.assertEqual(payload, {"cards": []})
+        self.assertEqual(mock_open.call_count, 2)
+        self.assertEqual(mock_sleep.call_count, 1)
+
+    def test_openai_client_retries_429_then_succeeds(self) -> None:
+        client = OpenAICompatibleLLMClient(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="gpt-test",
+            timeout_seconds=30,
+        )
+        throttled = urllib.error.HTTPError(
+            url="https://api.example.com/v1/chat/completions",
+            code=429,
+            msg="Too Many Requests",
+            hdrs={"Retry-After": "0"},
+            fp=None,
+        )
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=[throttled, FakeHTTPResponse({"choices": [{"message": {"content": '{"cards":[]}'}}]})],
+        ) as mock_open, patch("app.llm.time.sleep", return_value=None) as mock_sleep:
+            payload = client.chat_json("system", "user")
+        self.assertEqual(payload, {"cards": []})
+        self.assertEqual(mock_open.call_count, 2)
+        self.assertEqual(mock_sleep.call_count, 1)
 
     def test_llm_smoke_test_returns_normalized_cards_with_stub_client(self) -> None:
         class StubClient:
@@ -1751,12 +2995,14 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 topic_name: str,
                 paper_title: str,
                 extracted_cards: list[dict],
-                calibration_examples: list[dict],
+                figures: list[dict] | None = None,
+                calibration_examples: list[dict] | None = None,
                 calibration_set_name: str = "",
             ) -> dict:
                 self.judgement_inputs = {
                     "topic_name": topic_name,
                     "paper_title": paper_title,
+                    "figures": figures or [],
                     "calibration_examples": calibration_examples,
                     "calibration_set_name": calibration_set_name,
                 }
@@ -1809,6 +3055,9 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                     test_case.assertEqual(payload["output_language"], "zh-CN")
                     test_case.assertEqual(payload["figures"][0]["caption"], "Legacy migration curve")
                     test_case.assertEqual(payload["calibration_examples"][0]["source_text"], "Old standards can outlive their replacements in practice.")
+                    test_case.assertIn("shared_policy", payload)
+                    test_case.assertIn("stage_spec", payload)
+                    test_case.assertIn("stage_examples", payload)
                     return {
                         "cards": [
                             {
@@ -1890,17 +3139,26 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(client.calls[1]["stage"], "candidate_judgement")
         self.assertEqual(client.calls[1]["active_calibration_set"], "context-engineering-v1")
         self.assertEqual(client.calls[1]["calibration_examples"][0]["title"], "Legacy standard inertia")
+        self.assertIn("shared_policy", client.calls[1])
+        self.assertIn("stage_spec", client.calls[1])
+        self.assertIn("stage_examples", client.calls[1])
         self.assertIn(
             "complete Simplified Chinese translation",
             client.calls[1]["judgement_rules"]["evidence_translation_rules"][0],
         )
 
-    def test_discovery_service_deduplicates_cross_provider_candidates(self) -> None:
-        self.discovery_patcher.stop()
-        self.addCleanup(self.discovery_patcher.start)
+    def test_prompt_version_records_include_understanding_and_planning_stages(self) -> None:
+        records = get_prompt_version_records()
+        stages = {record["stage"] for record in records}
 
+        self.assertIn("paper_understanding", stages)
+        self.assertIn("card_planning", stages)
+        extraction_record = next(record for record in records if record["stage"] == "candidate_extraction")
+        self.assertEqual(extraction_record["details"]["shared_policy_version"], "llm-shared-policy-v1-direct-transfer")
+
+    def test_discovery_service_deduplicates_cross_provider_candidates(self) -> None:
         class OpenAlexProvider:
-            def discover(self, topic: str) -> list[dict]:
+            def discover(self, topic: str, strategy: dict | None = None) -> list[dict]:
                 return [
                     {
                         "provider": "openalex",
@@ -1919,7 +3177,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 ]
 
         class SemanticScholarProvider:
-            def discover(self, topic: str) -> list[dict]:
+            def discover(self, topic: str, strategy: dict | None = None) -> list[dict]:
                 return [
                     {
                         "provider": "semantic_scholar",
@@ -1938,13 +3196,58 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 ]
 
         service = services_module.DiscoveryService(providers=[OpenAlexProvider(), SemanticScholarProvider()])
-        results = service.discover("verifier feedback")
+        results = ORIGINAL_DISCOVERY_DISCOVER(service, "verifier feedback")
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["external_id"], "doi::10.1234/verifier")
         self.assertEqual(results[0]["provider"], "semantic_scholar")
         self.assertEqual(results[0]["asset_url"], "https://example.com/verifier.pdf")
-        self.assertEqual(len(results[0]["discovery_sources"]), 2)
+        self.assertEqual(len(results[0]["discovery_sources"]), 8)
+        self.assertTrue(all(source["strategy_order"] >= 1 for source in results[0]["discovery_sources"]))
+
+    def test_topic_search_strategy_matrix_contains_ordered_families(self) -> None:
+        strategies = services_module.build_topic_search_strategies("verifier feedback", current_year=2026)
+        self.assertEqual([item["strategy_order"] for item in strategies], [1, 2, 3, 4])
+        self.assertEqual([item["strategy_family"] for item in strategies], ["core", "mechanism", "application", "recency"])
+        self.assertEqual(strategies[-1]["params"]["year_from"], 2023)
+
+    def test_discovery_service_passes_strategy_context_to_provider(self) -> None:
+        captured_calls: list[tuple[str, str, int]] = []
+
+        class RecordingProvider:
+            def discover(self, topic: str, strategy: dict | None = None) -> list[dict]:
+                strategy = strategy or {}
+                captured_calls.append((topic, str(strategy.get("strategy_type", "")), int(strategy.get("strategy_order", 0))))
+                if int(strategy.get("strategy_order", 0)) != 1:
+                    return []
+                return [
+                    {
+                        "provider": "recording",
+                        "strategy_family": strategy.get("strategy_family", "core"),
+                        "strategy_type": strategy.get("strategy_type", "topic_query"),
+                        "strategy_order": int(strategy.get("strategy_order", 0)),
+                        "query_text": strategy.get("query_text", topic),
+                        "title": "Verifier Feedback Loops",
+                        "authors": ["Ada Researcher"],
+                        "publication_year": 2026,
+                        "source_external_id": "recording::1",
+                        "original_url": "https://example.com/recording/1",
+                        "asset_url": "",
+                        "confidence": 0.5,
+                        "strategy_params": strategy.get("params", {}),
+                        "ids": {"doi": "10.1234/verifier"},
+                        "metadata": {"source": "recording"},
+                    }
+                ]
+
+        service = services_module.DiscoveryService(providers=[RecordingProvider()])
+        results = ORIGINAL_DISCOVERY_DISCOVER(service, "verifier feedback")
+
+        self.assertEqual(len(results), 1)
+        self.assertGreaterEqual(len(captured_calls), 4)
+        self.assertEqual(captured_calls[0], ("verifier feedback", "topic_query", 1))
+        self.assertEqual(results[0]["discovery_sources"][0]["strategy_type"], "topic_query")
+        self.assertEqual(results[0]["discovery_sources"][0]["strategy_order"], 1)
 
     def test_run_records_discovery_strategies_and_deduped_results(self) -> None:
         discovery_payload = [
@@ -1962,7 +3265,9 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 "discovery_sources": [
                     {
                         "provider": "semantic_scholar",
+                        "strategy_family": "core",
                         "strategy_type": "topic_query",
+                        "strategy_order": 1,
                         "query_text": "verifier feedback",
                         "source_external_id": "S2-123",
                         "original_url": "https://www.semanticscholar.org/paper/S2-123",
@@ -1973,7 +3278,9 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                     },
                     {
                         "provider": "crossref",
+                        "strategy_family": "core",
                         "strategy_type": "topic_query",
+                        "strategy_order": 1,
                         "query_text": "verifier feedback",
                         "source_external_id": "10.1234/verifier",
                         "original_url": "https://doi.org/10.1234/verifier",
@@ -2011,14 +3318,329 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(payload["run"]["status"], "completed")
         self.assertEqual(len(payload["discovery_strategies"]), 2)
         self.assertEqual(len(payload["discovery_results"]), 2)
+        self.assertIn("progress_summary", payload["run"])
+        self.assertGreaterEqual(payload["run"]["progress_summary"]["discovered"], 1)
         self.assertEqual(payload["topic_runs"][0]["stats"]["discovered_raw"], 2)
         self.assertEqual(payload["topic_runs"][0]["stats"]["deduped_candidates"], 1)
         self.assertEqual(payload["topic_runs"][0]["stats"]["duplicate_candidates_collapsed"], 1)
         self.assertEqual(payload["topic_runs"][0]["stats"]["queued_for_access"], 1)
+        self.assertEqual(payload["topic_runs"][0]["current_stage"], "completed")
+        self.assertEqual(payload["topic_runs"][0]["derived_status"], "completed")
+        self.assertGreaterEqual(payload["topic_runs"][0]["elapsed_seconds"], 0)
         self.assertEqual(len(payload["access_queue"]), 1)
         papers = self.repository._fetchall("SELECT * FROM papers")
         self.assertEqual(len(papers), 1)
         self.assertEqual({item["dedupe_status"] for item in payload["discovery_results"]}, {"canonical", "duplicate_source"})
+        saturation_response = self.client.get("/api/saturation/topics", params={"topic": "verifier feedback", "history_limit": 5})
+        self.assertEqual(saturation_response.status_code, 200, saturation_response.text)
+        saturation_payload = saturation_response.json()
+        self.assertGreaterEqual(len(saturation_payload["snapshots"]), 1)
+        self.assertGreaterEqual(len(saturation_payload["trends"]), 1)
+        self.assertEqual(saturation_payload["trends"][0]["topic_name"].lower(), "verifier feedback")
+        self.assertIn("latest_likely_flattening", saturation_payload["trends"][0])
+
+    def test_run_keeps_topic_completed_when_asset_acquire_times_out(self) -> None:
+        discovery_payload = [
+            {
+                "provider": "semantic_scholar",
+                "title": "Verifier Feedback Loops",
+                "authors": ["Ada Researcher"],
+                "publication_year": 2026,
+                "external_id": "doi::10.1234/verifier-timeout",
+                "source_external_id": "S2-timeout",
+                "original_url": "https://www.semanticscholar.org/paper/S2-timeout",
+                "asset_url": "https://example.com/timeout.pdf",
+                "confidence": 0.9,
+                "metadata": {"identifiers": {"doi": "10.1234/verifier-timeout"}, "primary_provider": "semantic_scholar"},
+                "discovery_sources": [
+                    {
+                        "provider": "semantic_scholar",
+                        "strategy_family": "core",
+                        "strategy_type": "topic_query",
+                        "strategy_order": 1,
+                        "query_text": "verifier timeout",
+                        "source_external_id": "S2-timeout",
+                        "original_url": "https://www.semanticscholar.org/paper/S2-timeout",
+                        "asset_url": "https://example.com/timeout.pdf",
+                        "confidence": 0.9,
+                        "ids": {"doi": "10.1234/verifier-timeout", "semantic_scholar": "S2-timeout"},
+                        "metadata": {"source": "semantic_scholar"},
+                    }
+                ],
+            }
+        ]
+
+        with patch.object(services_module.DiscoveryService, "discover", return_value=discovery_payload), patch.object(
+            services_module.PaperPipeline, "acquire_remote_asset", side_effect=TimeoutError("The read operation timed out")
+        ):
+            create_response = self.client.post(
+                "/api/runs",
+                json={"topics_text": "verifier timeout", "metadata": {}, "local_pdfs": []},
+            )
+            self.assertEqual(create_response.status_code, 200, create_response.text)
+            run_id = create_response.json()["run"]["id"]
+
+            for _ in range(30):
+                run_response = self.client.get(f"/api/runs/{run_id}")
+                self.assertEqual(run_response.status_code, 200, run_response.text)
+                if run_response.json()["run"]["status"] in {"completed", "partial_failed", "failed"}:
+                    break
+                time.sleep(0.2)
+
+        payload = run_response.json()
+        self.assertEqual(payload["run"]["status"], "completed")
+        topic_stats = payload["topic_runs"][0]["stats"]
+        self.assertEqual(payload["topic_runs"][0]["status"], "completed")
+        self.assertEqual(topic_stats["queued_for_access"], 1)
+        self.assertGreaterEqual(topic_stats["acquisition_errors"], 1)
+        self.assertIn("saturation_metrics", topic_stats)
+        self.assertIn("flattening_signal", topic_stats["saturation_metrics"])
+        self.assertNotIn("error", topic_stats)
+
+    def test_topic_runs_derive_waiting_for_access_and_stalled_statuses(self) -> None:
+        run = self.repository.create_run("observable topic", {"operator": "tester"})
+        topic_waiting = self.repository.create_or_get_topic("observable topic waiting")
+        topic_stalled = self.repository.create_or_get_topic("observable topic stalled")
+        waiting_run = self.repository.create_topic_run(run["id"], topic_waiting["id"])
+        stalled_run = self.repository.create_topic_run(run["id"], topic_stalled["id"])
+
+        waiting_stats = services_module.initial_topic_run_stats()
+        waiting_stats["current_stage"] = "acquisition"
+        waiting_stats["queued_for_access"] = 2
+        waiting_stats["accessible"] = 0
+        waiting_stats["stage_started_at"] = "2026-03-07T00:00:00+00:00"
+        waiting_stats["last_progress_at"] = services_module.utc_now()
+        self.repository.update_topic_run(waiting_run["id"], "running", stats=waiting_stats, started=True)
+
+        stalled_stats = services_module.initial_topic_run_stats()
+        stalled_stats["current_stage"] = "parsing"
+        stalled_stats["accessible"] = 3
+        stalled_stats["last_progress_at"] = "2026-03-07T00:00:00+00:00"
+        stalled_stats["stage_started_at"] = "2026-03-07T00:00:00+00:00"
+        self.repository.update_topic_run(stalled_run["id"], "running", stats=stalled_stats, started=True)
+
+        waiting_payload = self.client.get(f"/api/runs/{run['id']}").json()["topic_runs"]
+        derived = {item["topic_name"]: item["derived_status"] for item in waiting_payload}
+        self.assertEqual(derived["observable topic waiting"], "waiting_for_access")
+        self.assertEqual(derived["observable topic stalled"], "stalled")
+
+    def test_discovery_timeout_budget_marks_topic_failed_predictably(self) -> None:
+        self.discovery_patcher.stop()
+        self.addCleanup(self.discovery_patcher.start)
+        timeout_settings = Settings(
+            data_dir=self.settings.data_dir,
+            db_path=self.settings.db_path,
+            max_workers=2,
+            discovery_timeout_seconds=1,
+            google_docs_mode="artifact_only",
+            llm_mode="disabled",
+        )
+
+        def slow_discover(_self, topic: str) -> list[dict]:
+            time.sleep(1.5)
+            return []
+
+        with patch.object(services_module.DiscoveryService, "discover", new=slow_discover):
+            timeout_client = TestClient(create_app(timeout_settings))
+            create_response = timeout_client.post("/api/runs", json={"topics_text": "slow topic", "metadata": {}, "local_pdfs": []})
+            self.assertEqual(create_response.status_code, 200, create_response.text)
+            run_id = create_response.json()["run"]["id"]
+
+            for _ in range(20):
+                run_response = timeout_client.get(f"/api/runs/{run_id}")
+                self.assertEqual(run_response.status_code, 200, run_response.text)
+                if run_response.json()["run"]["status"] in {"completed", "partial_failed", "failed"}:
+                    break
+                time.sleep(0.2)
+
+        payload = run_response.json()
+        self.assertEqual(payload["run"]["status"], "failed")
+        self.assertEqual(payload["topic_runs"][0]["status"], "failed")
+        self.assertEqual(payload["topic_runs"][0]["current_stage"], "failed")
+        self.assertTrue(payload["topic_runs"][0]["latest_failures"])
+        self.assertIn("timed out", payload["topic_runs"][0]["latest_failures"][-1]["message"])
+
+    def test_concurrent_runs_complete_with_small_topic_pool(self) -> None:
+        self.discovery_patcher.stop()
+        self.addCleanup(self.discovery_patcher.start)
+        concurrent_dir = Path(self.temp_dir.name) / "concurrent"
+        concurrent_settings = Settings(
+            data_dir=concurrent_dir / "data",
+            db_path=concurrent_dir / "data" / "paper2bullet.sqlite3",
+            max_workers=2,
+            google_docs_mode="artifact_only",
+            llm_mode="disabled",
+        )
+        concurrent_settings.data_dir.mkdir(parents=True, exist_ok=True)
+        init_db(concurrent_settings.db_path)
+        concurrent_client = TestClient(create_app(concurrent_settings))
+
+        artifact_path = concurrent_settings.artifacts_dir / "concurrent.pdf"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(build_minimal_pdf_bytes("Concurrent run paper body."))
+
+        def discover_side_effect(_discovery_self, topic: str) -> list[dict]:
+            slug = topic.strip().lower().replace(" ", "-")
+            return [
+                {
+                    "provider": "semantic_scholar",
+                    "title": f"{topic} Paper",
+                    "authors": ["Ada Researcher"],
+                    "publication_year": 2026,
+                    "external_id": f"doi::10.1234/{slug}",
+                    "source_external_id": f"S2-{slug}",
+                    "original_url": f"https://example.com/{slug}",
+                    "asset_url": f"https://example.com/{slug}.pdf",
+                    "confidence": 0.9,
+                    "metadata": {"identifiers": {"doi": f"10.1234/{slug}"}},
+                    "discovery_sources": [
+                        {
+                            "provider": "semantic_scholar",
+                            "strategy_family": "core",
+                            "strategy_type": "topic_query",
+                            "strategy_order": 1,
+                            "query_text": topic,
+                            "source_external_id": f"S2-{slug}",
+                            "original_url": f"https://example.com/{slug}",
+                            "asset_url": f"https://example.com/{slug}.pdf",
+                            "confidence": 0.9,
+                            "ids": {"doi": f"10.1234/{slug}", "semantic_scholar": f"S2-{slug}"},
+                            "metadata": {"source": "semantic_scholar"},
+                        }
+                    ],
+                }
+            ]
+
+        def parse_paper_side_effect(_coordinator_self, paper: dict) -> tuple[str, bool]:
+            time.sleep(0.2)
+            return paper["id"], False
+
+        with patch.object(
+            services_module.DiscoveryService, "discover", new=discover_side_effect
+        ), patch.object(
+            services_module.PaperPipeline, "acquire_remote_asset", return_value=str(artifact_path)
+        ), patch.object(
+            services_module.RunCoordinator, "_parse_paper", autospec=True, side_effect=parse_paper_side_effect
+        ):
+            run_ids = []
+            for topic_name in ["concurrency topic one", "concurrency topic two"]:
+                create_response = concurrent_client.post(
+                    "/api/runs",
+                    json={"topics_text": topic_name, "metadata": {}, "local_pdfs": []},
+                )
+                self.assertEqual(create_response.status_code, 200, create_response.text)
+                run_ids.append(create_response.json()["run"]["id"])
+
+            final_statuses: dict[str, str] = {}
+            for _ in range(40):
+                all_done = True
+                for run_id in run_ids:
+                    run_response = concurrent_client.get(f"/api/runs/{run_id}")
+                    self.assertEqual(run_response.status_code, 200, run_response.text)
+                    status = run_response.json()["run"]["status"]
+                    final_statuses[run_id] = status
+                    if status not in {"completed", "partial_failed", "failed"}:
+                        all_done = False
+                if all_done:
+                    break
+                time.sleep(0.2)
+
+        self.assertTrue(all(status == "completed" for status in final_statuses.values()), final_statuses)
+
+    def test_saturation_trends_compare_latest_and_previous_snapshots(self) -> None:
+        run1 = self.repository.create_run("trend topic", {"operator": "tester"})
+        run2 = self.repository.create_run("trend topic", {"operator": "tester"})
+        topic = self.repository.create_or_get_topic("trend topic")
+        topic_run1 = self.repository.create_topic_run(run1["id"], topic["id"])
+        topic_run2 = self.repository.create_topic_run(run2["id"], topic["id"])
+        self.repository.create_topic_saturation_snapshot(
+            run_id=run1["id"],
+            topic_run_id=topic_run1["id"],
+            topic_id=topic["id"],
+            saturation_metrics={
+                "card_count": 6,
+                "near_duplicate_cards": 5,
+                "same_pattern_cards": 0,
+                "novel_cards": 1,
+                "semantic_duplication_ratio": 0.8,
+                "search_strategy_comparison": [],
+                "flattening_signal": {"tail_size": 3, "tail_incremental_new_cards": [2, 1, 0], "likely_flattening": False},
+                "stop_decision": {
+                    "decision": "continue_search",
+                    "reason": "flattening signal not met",
+                    "policy": services_module.default_saturation_stop_policy(),
+                },
+            },
+        )
+        self.repository.create_topic_saturation_snapshot(
+            run_id=run2["id"],
+            topic_run_id=topic_run2["id"],
+            topic_id=topic["id"],
+            saturation_metrics={
+                "card_count": 6,
+                "near_duplicate_cards": 6,
+                "same_pattern_cards": 0,
+                "novel_cards": 0,
+                "semantic_duplication_ratio": 1.0,
+                "search_strategy_comparison": [],
+                "flattening_signal": {"tail_size": 3, "tail_incremental_new_cards": [0, 0, 0], "likely_flattening": True},
+                "stop_decision": {
+                    "decision": "candidate_stop",
+                    "reason": "Recent strategies yielded no new cards while duplication stayed high and stable.",
+                    "policy": services_module.default_saturation_stop_policy(),
+                },
+            },
+        )
+
+        response = self.client.get("/api/saturation/topics", params={"topic": "trend topic", "history_limit": 5})
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(len(payload["trends"]), 1)
+        trend = payload["trends"][0]
+        self.assertEqual(trend["topic_name"], "trend topic")
+        self.assertTrue(trend["latest_likely_flattening"])
+        self.assertAlmostEqual(trend["latest_duplication_ratio"], 1.0, places=4)
+        self.assertAlmostEqual(trend["previous_duplication_ratio"], 0.8, places=4)
+        self.assertGreater(trend["duplication_ratio_delta"], 0)
+        self.assertEqual(trend["latest_stop_decision"], "candidate_stop")
+        self.assertIn("duplication stayed high", trend["latest_stop_reason"])
+
+    def test_saturation_stop_evaluator_requires_history_before_candidate_stop(self) -> None:
+        metrics = {
+            "semantic_duplication_ratio": 0.95,
+            "flattening_signal": {
+                "tail_size": 3,
+                "tail_incremental_new_cards": [0, 0, 0],
+                "likely_flattening": True,
+            },
+        }
+        decision = services_module.evaluate_saturation_stop(
+            current_metrics=metrics,
+            previous_snapshots=[],
+            policy=services_module.default_saturation_stop_policy(),
+        )
+        self.assertEqual(decision["decision"], "insufficient_history")
+        self.assertIn("Need at least", decision["reason"])
+
+    def test_saturation_stop_evaluator_marks_candidate_stop_when_tail_and_duplication_converge(self) -> None:
+        metrics = {
+            "semantic_duplication_ratio": 0.9,
+            "flattening_signal": {
+                "tail_size": 3,
+                "tail_incremental_new_cards": [0, 0, 0],
+                "likely_flattening": True,
+            },
+        }
+        previous_snapshots = [{"semantic_duplication_ratio": 0.86}]
+        decision = services_module.evaluate_saturation_stop(
+            current_metrics=metrics,
+            previous_snapshots=previous_snapshots,
+            policy=services_module.default_saturation_stop_policy(),
+        )
+        self.assertEqual(decision["decision"], "candidate_stop")
+        self.assertTrue(decision["checks"]["flattening_met"])
+        self.assertTrue(decision["checks"]["duplication_met"])
+        self.assertEqual(metrics["stop_decision"]["decision"], "candidate_stop")
 
     def test_card_detail_exposes_structured_dedupe_assistance(self) -> None:
         run = self.repository.create_run("Verifier Topic", {"operator": "tester"})
@@ -2126,7 +3748,9 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 topic_run_id=topic_run["id"],
                 topic_id=topic["id"],
                 provider=provider,
+                strategy_family="core",
                 strategy_type="topic_query",
+                strategy_order=1,
                 query_text="verifier topic",
                 result_count=1,
                 metadata={},
@@ -2207,6 +3831,12 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertGreater(metrics["semantic_duplication_ratio"], 0.9)
         self.assertEqual(len(metrics["search_strategy_comparison"]), 2)
         self.assertEqual({item["yielded_cards"] for item in metrics["search_strategy_comparison"]}, {1})
+        self.assertEqual({item["incremental_new_cards"] for item in metrics["search_strategy_comparison"]}, {1})
+        self.assertEqual({item["strategy_order"] for item in metrics["search_strategy_comparison"]}, {1})
+        self.assertFalse(metrics["flattening_signal"]["likely_flattening"])
+        stats = coordinator._attach_topic_stop_decision(topic, stats)
+        self.assertIn("saturation_stop", stats)
+        self.assertEqual(stats["saturation_stop"]["decision"], "insufficient_history")
 
     def test_llm_engine_rejects_summary_like_evidence_translation(self) -> None:
         class StubClient:
@@ -2278,6 +3908,149 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
 
         self.assertEqual(outputs["cards"], [])
         self.assertEqual(len(outputs["cards"]), 0)
+
+    def test_llm_engine_keeps_supporting_evidence_without_analysis_text(self) -> None:
+        class StubClient:
+            model = "stub-missing-support-analysis-model"
+
+            def chat_json(self, system_prompt: str, user_prompt: str) -> dict:
+                payload = json.loads(user_prompt)
+                if payload["stage"] == "candidate_extraction":
+                    return {
+                        "cards": [
+                            {
+                                "title": "先统一骨架，再并行展开",
+                                "primary_section_ids": ["section_demo_1"],
+                                "supporting_section_ids": ["section_demo_2"],
+                                "section_ids": ["section_demo_1", "section_demo_2"],
+                                "granularity_level": "subpattern",
+                                "claim_type": "method",
+                                "draft_body": "先给多个代理统一一个骨架，再分别并行展开，能减少相互冲突。",
+                                "evidence_analysis": [
+                                    {
+                                        "section_id": "section_demo_1",
+                                        "analysis": "主证据明确描述了先骨架后并行扩写的流程。",
+                                    }
+                                ],
+                            }
+                        ],
+                        "excluded_content": [],
+                    }
+                return {
+                    "cards": [
+                        {
+                            "candidate_index": 0,
+                            "title": "先统一骨架，再并行展开",
+                            "course_transformation": "并行扩写流程模板",
+                            "teachable_one_liner": "先统一框架，再让多个代理并行填充细节。",
+                            "draft_body": "先给多个代理统一一个骨架，再分别并行展开，能减少相互冲突。",
+                            "evidence_localization": [
+                                {"section_id": "section_demo_1", "quote_zh": "先产出骨架，再并行扩写。"}
+                            ],
+                            "judgement": {
+                                "color": "green",
+                                "reason": "这是可直接迁移的工作流模式。",
+                            },
+                        }
+                    ]
+                }
+
+        engine = LLMCardEngine(self.settings, client=StubClient())
+        outputs = engine.extract_candidates(
+            topic_name="Agentic workflow",
+            paper_title="Workflow Skeleton",
+            sections=[
+                {
+                    "id": "section_demo_1",
+                    "page_number": 1,
+                    "paragraph_text": "The workflow first creates an outline and then expands each point in parallel.",
+                },
+                {
+                    "id": "section_demo_2",
+                    "page_number": 1,
+                    "paragraph_text": "Agents share structure information while expanding their assigned points.",
+                },
+            ],
+            calibration_examples=[],
+            figures=[],
+            calibration_set_name="",
+        )
+
+        self.assertEqual(len(outputs["cards"]), 1)
+        self.assertEqual(outputs["cards"][0]["title"], "先统一骨架，再并行展开")
+
+    def test_llm_engine_keeps_supporting_evidence_without_localized_quote(self) -> None:
+        class StubClient:
+            model = "stub-missing-support-quote-model"
+
+            def chat_json(self, system_prompt: str, user_prompt: str) -> dict:
+                payload = json.loads(user_prompt)
+                if payload["stage"] == "candidate_extraction":
+                    return {
+                        "cards": [
+                            {
+                                "title": "先统一骨架，再并行展开",
+                                "primary_section_ids": ["section_demo_1"],
+                                "supporting_section_ids": ["section_demo_2"],
+                                "section_ids": ["section_demo_1", "section_demo_2"],
+                                "granularity_level": "subpattern",
+                                "claim_type": "method",
+                                "draft_body": "先给多个代理统一一个骨架，再分别并行展开，能减少相互冲突。",
+                                "evidence_analysis": [
+                                    {
+                                        "section_id": "section_demo_1",
+                                        "analysis": "主证据明确描述了先骨架后并行扩写的流程。",
+                                    }
+                                ],
+                            }
+                        ],
+                        "excluded_content": [],
+                    }
+                return {
+                    "cards": [
+                        {
+                            "candidate_index": 0,
+                            "title": "先统一骨架，再并行展开",
+                            "course_transformation": "并行扩写流程模板",
+                            "teachable_one_liner": "先统一框架，再让多个代理并行填充细节。",
+                            "draft_body": "先给多个代理统一一个骨架，再分别并行展开，能减少相互冲突。",
+                            "evidence_localization": [
+                                {
+                                    "section_id": "section_demo_1",
+                                    "quote_zh": "工作流先生成一个骨架，然后把每个要点并行展开。",
+                                }
+                            ],
+                            "judgement": {
+                                "color": "green",
+                                "reason": "这是可直接迁移的工作流模式。",
+                            },
+                        }
+                    ]
+                }
+
+        engine = LLMCardEngine(self.settings, client=StubClient())
+        outputs = engine.generate_outputs(
+            topic_name="Agentic workflow",
+            paper_title="Workflow Skeleton",
+            sections=[
+                {
+                    "id": "section_demo_1",
+                    "page_number": 1,
+                    "paragraph_text": "The workflow first creates an outline and then expands each point in parallel.",
+                },
+                {
+                    "id": "section_demo_2",
+                    "page_number": 1,
+                    "paragraph_text": "Agents share structure information while expanding their assigned points.",
+                },
+            ],
+            calibration_examples=[],
+            figures=[],
+            calibration_set_name="",
+        )
+
+        self.assertEqual(len(outputs["cards"]), 1)
+        self.assertEqual(outputs["cards"][0]["judgement"]["color"], "green")
 
     def test_import_calibration_examples_script_persists_set(self) -> None:
         source_json = Path(self.temp_dir.name) / "calibration-set.json"

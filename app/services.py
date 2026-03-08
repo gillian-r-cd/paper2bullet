@@ -5,9 +5,11 @@ Data structures: runs, topic jobs, papers, sections, candidate cards, judgements
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
+import mimetypes
 import re
 import shutil
 import subprocess
@@ -16,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
@@ -26,16 +28,34 @@ from .config import Settings
 from .db import db_cursor
 from .llm import (
     CARD_RUBRIC_VERSION,
+    CARD_PLAN_PROMPT_VERSION,
     EXTRACTION_PROMPT_VERSION,
     JUDGEMENT_PROMPT_VERSION,
     LLMCardEngine,
     LLMGenerationError,
+    get_prompt_version_records,
+    get_rubric_version_records,
 )
 
 try:
     from markitdown import MarkItDown
 except ImportError:  # pragma: no cover - optional dependency
     MarkItDown = None
+
+try:
+    import fitz  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    fitz = None
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:  # pragma: no cover - optional dependency
+    BeautifulSoup = None
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover - optional dependency
+    Image = None
 
 
 def utc_now() -> str:
@@ -71,6 +91,140 @@ def normalize_title_key(title: str) -> str:
     return re.sub(r"\s+", " ", lowered).strip()
 
 
+def has_concept_belief_gap_signal(*texts: str) -> bool:
+    combined = " ".join(str(text or "").lower() for text in texts if str(text or "").strip())
+    if not combined:
+        return False
+    direct_markers = [
+        "不是",
+        "而是",
+        "不代表",
+        "误以为",
+        "以为",
+        "但",
+        "却",
+        "反而",
+        "别只",
+        "instead",
+        "rather than",
+        "not ",
+        "but ",
+        "however",
+    ]
+    if any(marker in combined for marker in direct_markers):
+        return True
+    if re.search(r"从.+到.+", combined):
+        return True
+    return False
+
+
+def _normalized_signal_text(*texts: str) -> str:
+    combined = " ".join(str(text or "") for text in texts if str(text or "").strip())
+    combined = combined.lower()
+    combined = re.sub(r"\s+", "", combined)
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", combined)
+
+
+def _signal_ngrams(text: str) -> set[str]:
+    cleaned = _normalized_signal_text(text)
+    grams: set[str] = set()
+    for token in re.findall(r"[a-z0-9]{3,}", cleaned):
+        grams.add(token)
+    cjk_runs = re.findall(r"[\u4e00-\u9fff]{2,}", cleaned)
+    for run in cjk_runs:
+        max_size = min(4, len(run))
+        for size in range(2, max_size + 1):
+            for index in range(0, len(run) - size + 1):
+                grams.add(run[index : index + size])
+    return grams
+
+
+def has_direct_transfer_signal(*texts: str) -> bool:
+    combined = " ".join(str(text or "").lower() for text in texts if str(text or "").strip())
+    if not combined:
+        return False
+    direct_markers = [
+        "流程",
+        "步骤",
+        "闭环",
+        "回路",
+        "工作流",
+        "模板",
+        "检查表",
+        "决策树",
+        "打分",
+        "排序",
+        "分工",
+        "并行",
+        "写回",
+        "检索",
+        "对比",
+        "失败模式",
+        "接口",
+        "playbook",
+        "workflow",
+        "pipeline",
+        "loop",
+        "checklist",
+        "decision",
+        "scoring",
+        "ranking",
+        "retrieval",
+        "write-back",
+    ]
+    if any(marker in combined for marker in direct_markers):
+        return True
+    return bool(re.search(r"(→|->|=>|vs\.?|versus|从.+到.+)", combined))
+
+
+def has_source_object_fidelity_signal(
+    course_transformation: str,
+    title: str,
+    paper_specific_object: str,
+) -> bool:
+    source_grams = _signal_ngrams(f"{title} {paper_specific_object}")
+    course_grams = _signal_ngrams(course_transformation)
+    if not source_grams or not course_grams:
+        return False
+    shared = source_grams.intersection(course_grams)
+    strong_shared = {token for token in shared if len(token) >= 3}
+    if len(strong_shared) >= 2:
+        return True
+    if any(re.fullmatch(r"[a-z0-9-]{4,}", token) for token in shared):
+        return True
+    return False
+
+
+def has_named_course_object_signal(course_transformation: str) -> bool:
+    text = str(course_transformation or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(token in lowered for token in ["摘要", "概述", "背景", "综述", "taxonomy recap", "summary only"]):
+        return False
+    if "：" in text or ":" in text:
+        return True
+    object_tokens = [
+        "框架",
+        "模式",
+        "方法",
+        "模板",
+        "检查表",
+        "决策树",
+        "清单",
+        "机制",
+        "策略",
+        "流程",
+        "模型",
+        "回路",
+        "闭环",
+        "打分器",
+        "对比讲解",
+        "story",
+    ]
+    return any(token in lowered for token in object_tokens)
+
+
 def build_discovery_identity(title: str, publication_year: Optional[int], authors: list[str], ids: dict[str, str]) -> str:
     doi = normalize_identifier(ids.get("doi", ""))
     if doi:
@@ -94,13 +248,177 @@ def initial_topic_run_stats() -> dict[str, Any]:
         "discovered": 0,
         "accessible": 0,
         "cards": 0,
+        "parsed_papers": 0,
+        "card_generation_attempts": 0,
         "discovered_raw": 0,
         "deduped_candidates": 0,
         "duplicate_candidates_collapsed": 0,
         "discovery_strategy_count": 0,
         "queued_for_access": 0,
         "provider_summary": {},
+        "acquisition_errors": 0,
+        "paper_processing_errors": 0,
+        "processing_warnings": [],
+        "failure_log": [],
+        "current_stage": "pending",
+        "stage_started_at": "",
+        "last_progress_at": "",
     }
+
+
+def parse_iso_datetime(value: str) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def seconds_since(value: str) -> Optional[int]:
+    parsed = parse_iso_datetime(value)
+    if not parsed:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - parsed).total_seconds()))
+
+
+def append_failure_log(stats: dict[str, Any], *, stage: str, code: str, message: str, retryable: bool = True) -> None:
+    stats.setdefault("failure_log", []).append(
+        {
+            "created_at": utc_now(),
+            "stage": stage,
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+        }
+    )
+
+
+def summarize_latest_failures(stats: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
+    failures = stats.get("failure_log", []) if isinstance(stats, dict) else []
+    if not isinstance(failures, list):
+        return []
+    return failures[-limit:]
+
+
+def default_saturation_stop_policy() -> dict[str, Any]:
+    return {
+        "policy_version": "saturation-stop-v1",
+        "minimum_snapshot_count": 2,
+        "minimum_duplication_ratio": 0.5,
+        "maximum_duplication_ratio_drop": 0.05,
+        "require_flattening_signal": True,
+        "require_zero_tail": True,
+    }
+
+
+def evaluate_saturation_stop(
+    *,
+    current_metrics: dict[str, Any],
+    previous_snapshots: list[dict[str, Any]],
+    policy: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    resolved_policy = policy or default_saturation_stop_policy()
+    flattening = current_metrics.get("flattening_signal", {}) if isinstance(current_metrics, dict) else {}
+    tail = flattening.get("tail_incremental_new_cards", []) if isinstance(flattening, dict) else []
+    latest_duplication_ratio = float(current_metrics.get("semantic_duplication_ratio", 0.0) or 0.0)
+    previous_snapshot = previous_snapshots[0] if previous_snapshots else {}
+    previous_duplication_ratio = float(previous_snapshot.get("semantic_duplication_ratio", 0.0) or 0.0)
+    duplication_ratio_delta = round(latest_duplication_ratio - previous_duplication_ratio, 4) if previous_snapshots else 0.0
+    snapshot_count = len(previous_snapshots) + 1
+    enough_history = snapshot_count >= int(resolved_policy.get("minimum_snapshot_count", 2))
+    flattening_met = bool(flattening.get("likely_flattening", False))
+    duplication_met = latest_duplication_ratio >= float(resolved_policy.get("minimum_duplication_ratio", 0.5))
+    zero_tail_met = bool(tail) and all(int(value) == 0 for value in tail)
+    allowed_drop = float(resolved_policy.get("maximum_duplication_ratio_drop", 0.05))
+    stable_duplication_met = (not previous_snapshots) or duplication_ratio_delta >= (-1 * allowed_drop)
+
+    checks = {
+        "snapshot_count": snapshot_count,
+        "enough_history": enough_history,
+        "flattening_met": flattening_met,
+        "duplication_met": duplication_met,
+        "zero_tail_met": zero_tail_met,
+        "stable_duplication_met": stable_duplication_met,
+        "latest_duplication_ratio": latest_duplication_ratio,
+        "previous_duplication_ratio": previous_duplication_ratio,
+        "duplication_ratio_delta": duplication_ratio_delta,
+        "tail_incremental_new_cards": tail,
+    }
+    current_metrics["stop_policy"] = resolved_policy
+    current_metrics["stop_checks"] = checks
+
+    if not enough_history:
+        decision = "insufficient_history"
+        reason = f"Need at least {resolved_policy['minimum_snapshot_count']} snapshots before recommending a stop."
+    elif (
+        (not resolved_policy.get("require_flattening_signal", True) or flattening_met)
+        and duplication_met
+        and (not resolved_policy.get("require_zero_tail", True) or zero_tail_met)
+        and stable_duplication_met
+    ):
+        decision = "candidate_stop"
+        reason = "Recent strategies yielded no new cards while duplication stayed high and stable."
+    else:
+        decision = "continue_search"
+        blockers = []
+        if resolved_policy.get("require_flattening_signal", True) and not flattening_met:
+            blockers.append("flattening signal not met")
+        if not duplication_met:
+            blockers.append("duplication ratio still below threshold")
+        if resolved_policy.get("require_zero_tail", True) and not zero_tail_met:
+            blockers.append("recent tail still produced new cards")
+        if not stable_duplication_met:
+            blockers.append("duplication ratio dropped too much versus previous run")
+        reason = "; ".join(blockers) if blockers else "Signals still suggest further retrieval may pay off."
+
+    decision_payload = {
+        "decision": decision,
+        "reason": reason,
+        "policy": resolved_policy,
+        "checks": checks,
+    }
+    current_metrics["stop_decision"] = decision_payload
+    return decision_payload
+
+
+def build_topic_search_strategies(topic: str, *, current_year: Optional[int] = None) -> list[dict[str, Any]]:
+    normalized_topic = str(topic or "").strip()
+    if not normalized_topic:
+        return []
+    year = current_year or datetime.now(timezone.utc).year
+    recent_year_from = max(1900, year - 3)
+    return [
+        {
+            "strategy_family": "core",
+            "strategy_type": "topic_query",
+            "strategy_order": 1,
+            "query_text": normalized_topic,
+            "params": {},
+        },
+        {
+            "strategy_family": "mechanism",
+            "strategy_type": "mechanism_focus",
+            "strategy_order": 2,
+            "query_text": f"{normalized_topic} mechanism evidence",
+            "params": {},
+        },
+        {
+            "strategy_family": "application",
+            "strategy_type": "application_focus",
+            "strategy_order": 3,
+            "query_text": f"{normalized_topic} case study",
+            "params": {},
+        },
+        {
+            "strategy_family": "recency",
+            "strategy_type": "recent_window",
+            "strategy_order": 4,
+            "query_text": normalized_topic,
+            "params": {"year_from": recent_year_from},
+        },
+    ]
 
 
 def classify_neighbor_relationship(similarity: float) -> str:
@@ -192,6 +510,97 @@ def split_paragraphs(text: str) -> list[str]:
     return paragraphs
 
 
+def classify_section_metadata(
+    *,
+    section_title: str,
+    paragraph_text: str,
+    section_order: int,
+    total_sections: int,
+    source_format: str,
+) -> dict[str, Any]:
+    title = str(section_title or "").strip()
+    text = str(paragraph_text or "").strip()
+    lowered_title = title.lower()
+    lowered_text = text.lower()
+    snippet = f"{lowered_title}\n{lowered_text[:320]}"
+
+    section_kind = "other"
+    body_role = ""
+    if "abstract" in lowered_title or lowered_text.startswith("abstract "):
+        section_kind = "abstract"
+    elif any(token in lowered_title for token in ("keyword", "ccs concepts", "index terms")):
+        section_kind = "keywords"
+    elif any(token in lowered_title for token in ("author", "affiliation", "corresponding")):
+        section_kind = "author_affiliation"
+    elif any(token in lowered_title for token in ("reference", "bibliography")):
+        section_kind = "references"
+    elif any(token in lowered_title for token in ("appendix", "supplementary")):
+        section_kind = "appendix"
+    elif "introduction" in lowered_title:
+        section_kind = "introduction"
+        body_role = "introduction"
+    elif any(token in lowered_title for token in ("method", "approach", "experimental setup", "materials and methods")):
+        section_kind = "methods"
+        body_role = "methods"
+    elif any(token in lowered_title for token in ("result", "finding", "evaluation", "experiment")):
+        section_kind = "results"
+        body_role = "results"
+    elif any(token in lowered_title for token in ("discussion", "analysis")):
+        section_kind = "discussion"
+        body_role = "discussion"
+    elif any(token in lowered_title for token in ("conclusion", "limitations", "future work")):
+        section_kind = "conclusion"
+        body_role = "conclusion"
+
+    if section_kind == "other":
+        if any(token in snippet for token in ("we propose", "our method", "architecture", "algorithm", "pipeline")):
+            section_kind = "methods"
+            body_role = "methods"
+        elif any(token in snippet for token in ("experiment", "ablation", "improves by", "outperforms", "accuracy")):
+            section_kind = "results"
+            body_role = "results"
+        elif any(token in snippet for token in ("in summary", "we conclude", "this work shows")):
+            section_kind = "conclusion"
+            body_role = "conclusion"
+
+    is_abstract = section_kind == "abstract"
+    is_front_matter = section_kind in {"author_affiliation", "keywords"} or (section_order <= 2 and not body_role and not is_abstract)
+    is_body = bool(body_role) or section_kind in {"methods", "results", "discussion", "conclusion", "introduction"}
+    has_figure_reference = bool(re.search(r"\b(fig(?:ure)?\.?\s*\d+|table\s*\d+)\b", snippet))
+
+    if section_order == 1 and not is_abstract and not is_body and source_format in {"pdf_markitdown", "pdf_fallback", "html"}:
+        section_kind = "title_block"
+        is_front_matter = True
+
+    section_label = title or text[:64]
+    return {
+        "section_kind": section_kind,
+        "section_label": section_label,
+        "is_front_matter": is_front_matter,
+        "is_abstract": is_abstract,
+        "is_body": is_body,
+        "body_role": body_role,
+        "has_figure_reference": has_figure_reference,
+        "source_format": source_format,
+    }
+
+
+def enrich_sections_with_structure(sections: list[dict], source_format: str) -> list[dict]:
+    total_sections = len(sections)
+    for section in sections:
+        metadata = classify_section_metadata(
+            section_title=section.get("section_title", ""),
+            paragraph_text=section.get("paragraph_text", ""),
+            section_order=int(section.get("section_order", 0) or 0),
+            total_sections=total_sections,
+            source_format=source_format,
+        )
+        section.update(metadata)
+        section.setdefault("selection_score", 0.0)
+        section.setdefault("selection_reason", {})
+    return sections
+
+
 def embedding_for_text(text: str, dimensions: int = 64) -> list[float]:
     vector = [0.0] * dimensions
     tokens = re.findall(r"[A-Za-z0-9]+", text.lower())
@@ -262,8 +671,19 @@ class Repository:
         row["evidence"] = self._hydrate_evidence(json.loads(row["evidence_json"]))
         row["figure_ids"] = json.loads(row["figure_ids_json"])
         row["embedding"] = json.loads(row["embedding_json"])
+        row["primary_section_ids"] = json.loads(row.get("primary_section_ids_json", "[]") or "[]")
+        row["supporting_section_ids"] = json.loads(row.get("supporting_section_ids_json", "[]") or "[]")
         row["paper_url"] = row.get("paper_url", "")
         row["source_excluded_content_id"] = row.get("source_excluded_content_id")
+        return row
+
+    def _hydrate_figure_row(self, row: dict) -> dict:
+        row["linked_section_ids"] = json.loads(row.get("linked_section_ids_json", "[]") or "[]")
+        row["page_number"] = row.get("page_number")
+        row["byte_size"] = int(row.get("byte_size", 0) or 0)
+        row["width"] = int(row["width"]) if row.get("width") is not None else None
+        row["height"] = int(row["height"]) if row.get("height") is not None else None
+        row["has_validated_asset"] = str(row.get("asset_status", "")).strip() == "validated_local_asset"
         return row
 
     def _hydrate_excluded_row(self, row: dict) -> dict:
@@ -277,8 +697,10 @@ class Repository:
             INSERT INTO candidate_cards(
                 id, paper_id, topic_id, run_id, title, granularity_level, course_transformation,
                 teachable_one_liner, draft_body, evidence_json, figure_ids_json, status, embedding_json,
-                source_excluded_content_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                source_excluded_content_id, primary_section_ids_json, supporting_section_ids_json,
+                paper_specific_object, claim_type, evidence_level, body_grounding_reason, grounding_quality,
+                duplicate_cluster_id, duplicate_rank, duplicate_disposition, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 card["id"],
@@ -295,6 +717,16 @@ class Repository:
                 card["status"],
                 json.dumps(card["embedding"]),
                 source_excluded_content_id,
+                json.dumps(card.get("primary_section_ids", []), ensure_ascii=False),
+                json.dumps(card.get("supporting_section_ids", []), ensure_ascii=False),
+                card.get("paper_specific_object", ""),
+                card.get("claim_type", ""),
+                card.get("evidence_level", ""),
+                card.get("body_grounding_reason", ""),
+                card.get("grounding_quality", ""),
+                card.get("duplicate_cluster_id", ""),
+                int(card.get("duplicate_rank", 0) or 0),
+                card.get("duplicate_disposition", ""),
                 card["created_at"],
             ),
         )
@@ -339,6 +771,171 @@ class Repository:
 
     def get_paper(self, paper_id: str) -> Optional[dict]:
         return self._fetchone("SELECT * FROM papers WHERE id = ?", (paper_id,))
+
+    def sync_governance_records(self) -> None:
+        self.sync_prompt_versions(get_prompt_version_records())
+        self.sync_rubric_versions(get_rubric_version_records())
+
+    def sync_prompt_versions(self, records: list[dict[str, Any]]) -> None:
+        if not records:
+            return
+        active_versions = {record["version"] for record in records}
+        now = utc_now()
+        with db_cursor(self.settings.db_path) as connection:
+            for record in records:
+                existing = connection.execute(
+                    "SELECT * FROM prompt_versions WHERE version = ?",
+                    (record["version"],),
+                ).fetchone()
+                if existing:
+                    connection.execute(
+                        """
+                        UPDATE prompt_versions
+                        SET prompt_stage = ?, summary = ?, details_json = ?, status = ?, activated_at = ?
+                        WHERE version = ?
+                        """,
+                        (
+                            record["stage"],
+                            record["summary"],
+                            json.dumps(record["details"], ensure_ascii=False),
+                            "active",
+                            now,
+                            record["version"],
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO prompt_versions(id, prompt_stage, version, summary, details_json, status, created_at, activated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            new_id("pver"),
+                            record["stage"],
+                            record["version"],
+                            record["summary"],
+                            json.dumps(record["details"], ensure_ascii=False),
+                            "active",
+                            now,
+                            now,
+                        ),
+                    )
+            placeholders = ",".join("?" for _ in active_versions)
+            if placeholders:
+                connection.execute(
+                    f"UPDATE prompt_versions SET status = 'archived' WHERE version NOT IN ({placeholders})",
+                    tuple(active_versions),
+                )
+
+    def sync_rubric_versions(self, records: list[dict[str, Any]]) -> None:
+        if not records:
+            return
+        active_versions = {record["version"] for record in records}
+        now = utc_now()
+        with db_cursor(self.settings.db_path) as connection:
+            for record in records:
+                existing = connection.execute(
+                    "SELECT * FROM rubric_versions WHERE version = ?",
+                    (record["version"],),
+                ).fetchone()
+                if existing:
+                    connection.execute(
+                        """
+                        UPDATE rubric_versions
+                        SET rubric_name = ?, summary = ?, details_json = ?, status = ?, activated_at = ?
+                        WHERE version = ?
+                        """,
+                        (
+                            record["name"],
+                            record["summary"],
+                            json.dumps(record["details"], ensure_ascii=False),
+                            "active",
+                            now,
+                            record["version"],
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO rubric_versions(id, rubric_name, version, summary, details_json, status, created_at, activated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            new_id("rver"),
+                            record["name"],
+                            record["version"],
+                            record["summary"],
+                            json.dumps(record["details"], ensure_ascii=False),
+                            "active",
+                            now,
+                            now,
+                        ),
+                    )
+            placeholders = ",".join("?" for _ in active_versions)
+            if placeholders:
+                connection.execute(
+                    f"UPDATE rubric_versions SET status = 'archived' WHERE version NOT IN ({placeholders})",
+                    tuple(active_versions),
+                )
+
+    def list_prompt_versions(self, status: str = "") -> list[dict]:
+        if status:
+            rows = self._fetchall(
+                "SELECT * FROM prompt_versions WHERE status = ? ORDER BY activated_at DESC, created_at DESC",
+                (status,),
+            )
+        else:
+            rows = self._fetchall("SELECT * FROM prompt_versions ORDER BY activated_at DESC, created_at DESC")
+        for row in rows:
+            row["details"] = json.loads(row["details_json"])
+        return rows
+
+    def list_rubric_versions(self, status: str = "") -> list[dict]:
+        if status:
+            rows = self._fetchall(
+                "SELECT * FROM rubric_versions WHERE status = ? ORDER BY activated_at DESC, created_at DESC",
+                (status,),
+            )
+        else:
+            rows = self._fetchall("SELECT * FROM rubric_versions ORDER BY activated_at DESC, created_at DESC")
+        for row in rows:
+            row["details"] = json.loads(row["details_json"])
+        return rows
+
+    def get_calibration_workflow_status(self) -> dict[str, Any]:
+        active_set = self.get_active_calibration_set()
+        latest_evaluation = self.get_latest_evaluation_run()
+        failed_results = []
+        failed_boundary_results = []
+        if latest_evaluation:
+            failed_results = [item for item in latest_evaluation.get("results", []) if item.get("verdict") != "passed"]
+            failed_boundary_results = [item for item in failed_results if item.get("example_type") == "boundary"]
+        example_counts = {"positive": 0, "negative": 0, "boundary": 0}
+        boundary_examples = []
+        if active_set:
+            for example in active_set.get("examples", []):
+                example_type = str(example.get("example_type", "")).strip().lower()
+                if example_type in example_counts:
+                    example_counts[example_type] += 1
+                if example_type == "boundary":
+                    boundary_examples.append(
+                        {
+                            "id": example["id"],
+                            "title": example["title"],
+                            "tags": example.get("tags", []),
+                            "rationale": example.get("rationale", ""),
+                        }
+                    )
+        return {
+            "active_calibration_set": active_set,
+            "example_counts": example_counts,
+            "boundary_examples": boundary_examples,
+            "active_prompt_versions": self.list_prompt_versions(status="active"),
+            "active_rubric_versions": self.list_rubric_versions(status="active"),
+            "latest_evaluation_run": latest_evaluation,
+            "failed_examples": failed_results,
+            "failed_boundary_examples": failed_boundary_results,
+        }
 
     def import_calibration_set(self, name: str, description: str, metadata: dict, examples: list[dict]) -> dict:
         normalized_name = name.strip()
@@ -428,10 +1025,23 @@ class Repository:
         rows = self._fetchall("SELECT * FROM calibration_sets ORDER BY created_at DESC")
         for row in rows:
             row["metadata"] = json.loads(row["metadata_json"])
-            row["example_count"] = self._fetchone(
-                "SELECT COUNT(*) AS count FROM calibration_examples WHERE calibration_set_id = ?",
+            counts = {"positive": 0, "negative": 0, "boundary": 0}
+            example_rows = self._fetchall(
+                """
+                SELECT example_type, COUNT(*) AS count
+                FROM calibration_examples
+                WHERE calibration_set_id = ?
+                GROUP BY example_type
+                """,
                 (row["id"],),
-            )["count"]
+            )
+            row["example_count"] = 0
+            for item in example_rows:
+                row["example_count"] += item["count"]
+                example_type = str(item["example_type"]).strip().lower()
+                if example_type in counts:
+                    counts[example_type] = item["count"]
+            row["example_type_counts"] = counts
         return rows
 
     def get_calibration_set(self, calibration_set_id: str) -> Optional[dict]:
@@ -595,6 +1205,124 @@ class Repository:
             return None
         return self.get_evaluation_run(row["id"])
 
+    def create_paper_understanding_record(
+        self,
+        *,
+        paper_id: str,
+        topic_id: str,
+        run_id: str,
+        version: str,
+        understanding: dict[str, Any],
+    ) -> dict:
+        record = {
+            "id": new_id("understanding"),
+            "paper_id": paper_id,
+            "topic_id": topic_id,
+            "run_id": run_id,
+            "version": version,
+            "understanding_json": json.dumps(understanding, ensure_ascii=False),
+            "created_at": utc_now(),
+        }
+        with db_cursor(self.settings.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO paper_understanding_records(
+                    id, paper_id, topic_id, run_id, version, understanding_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record["id"],
+                    record["paper_id"],
+                    record["topic_id"],
+                    record["run_id"],
+                    record["version"],
+                    record["understanding_json"],
+                    record["created_at"],
+                ),
+            )
+        return self.get_paper_understanding_record(record["id"]) or record
+
+    def get_paper_understanding_record(self, understanding_record_id: str) -> Optional[dict]:
+        row = self._fetchone("SELECT * FROM paper_understanding_records WHERE id = ?", (understanding_record_id,))
+        if not row:
+            return None
+        row["understanding"] = json.loads(row["understanding_json"])
+        return row
+
+    def get_latest_paper_understanding(self, paper_id: str, topic_id: str, run_id: str) -> Optional[dict]:
+        row = self._fetchone(
+            """
+            SELECT * FROM paper_understanding_records
+            WHERE paper_id = ? AND topic_id = ? AND run_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (paper_id, topic_id, run_id),
+        )
+        if not row:
+            return None
+        row["understanding"] = json.loads(row["understanding_json"])
+        return row
+
+    def create_card_plan(
+        self,
+        *,
+        paper_id: str,
+        topic_id: str,
+        run_id: str,
+        version: str,
+        plan: dict[str, Any],
+    ) -> dict:
+        record = {
+            "id": new_id("cardplan"),
+            "paper_id": paper_id,
+            "topic_id": topic_id,
+            "run_id": run_id,
+            "version": version,
+            "plan_json": json.dumps(plan, ensure_ascii=False),
+            "created_at": utc_now(),
+        }
+        with db_cursor(self.settings.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO card_plans(
+                    id, paper_id, topic_id, run_id, version, plan_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record["id"],
+                    record["paper_id"],
+                    record["topic_id"],
+                    record["run_id"],
+                    record["version"],
+                    record["plan_json"],
+                    record["created_at"],
+                ),
+            )
+        return self.get_card_plan(record["id"]) or record
+
+    def get_card_plan(self, card_plan_id: str) -> Optional[dict]:
+        row = self._fetchone("SELECT * FROM card_plans WHERE id = ?", (card_plan_id,))
+        if not row:
+            return None
+        row["plan"] = json.loads(row["plan_json"])
+        return row
+
+    def get_latest_card_plan(self, paper_id: str, topic_id: str, run_id: str) -> Optional[dict]:
+        row = self._fetchone(
+            """
+            SELECT * FROM card_plans
+            WHERE paper_id = ? AND topic_id = ? AND run_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (paper_id, topic_id, run_id),
+        )
+        if not row:
+            return None
+        row["plan"] = json.loads(row["plan_json"])
+        return row
+
     def list_evaluation_results(self, evaluation_run_id: str) -> list[dict]:
         rows = self._fetchall(
             """
@@ -708,7 +1436,9 @@ class Repository:
         topic_run_id: str,
         topic_id: str,
         provider: str,
+        strategy_family: str,
         strategy_type: str,
+        strategy_order: int,
         query_text: str,
         result_count: int,
         metadata: dict,
@@ -719,7 +1449,9 @@ class Repository:
             "topic_run_id": topic_run_id,
             "topic_id": topic_id,
             "provider": provider,
+            "strategy_family": strategy_family,
             "strategy_type": strategy_type,
+            "strategy_order": strategy_order,
             "query_text": query_text,
             "status": "completed",
             "result_count": result_count,
@@ -730,9 +1462,9 @@ class Repository:
             connection.execute(
                 """
                 INSERT INTO discovery_strategies(
-                    id, run_id, topic_run_id, topic_id, provider, strategy_type, query_text,
-                    status, result_count, metadata_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, run_id, topic_run_id, topic_id, provider, strategy_family, strategy_type,
+                    strategy_order, query_text, status, result_count, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["id"],
@@ -740,7 +1472,9 @@ class Repository:
                     record["topic_run_id"],
                     record["topic_id"],
                     record["provider"],
+                    record["strategy_family"],
                     record["strategy_type"],
+                    record["strategy_order"],
                     record["query_text"],
                     record["status"],
                     record["result_count"],
@@ -838,7 +1572,7 @@ class Repository:
             FROM discovery_strategies
             JOIN topics ON topics.id = discovery_strategies.topic_id
             {where_clause}
-            ORDER BY discovery_strategies.created_at ASC, discovery_strategies.id ASC
+            ORDER BY discovery_strategies.strategy_order ASC, discovery_strategies.created_at ASC, discovery_strategies.id ASC
             """,
             tuple(params),
         )
@@ -858,11 +1592,12 @@ class Repository:
         where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._fetchall(
             f"""
-            SELECT discovery_results.*, discovery_strategies.query_text, discovery_strategies.strategy_type
+            SELECT discovery_results.*, discovery_strategies.query_text, discovery_strategies.strategy_type,
+                   discovery_strategies.strategy_family, discovery_strategies.strategy_order
             FROM discovery_results
             JOIN discovery_strategies ON discovery_strategies.id = discovery_results.strategy_id
             {where_clause}
-            ORDER BY discovery_results.created_at ASC, discovery_results.id ASC
+            ORDER BY discovery_strategies.strategy_order ASC, discovery_results.created_at ASC, discovery_results.id ASC
             """,
             tuple(params),
         )
@@ -870,6 +1605,132 @@ class Repository:
             row["authors"] = json.loads(row["authors_json"])
             row["metadata"] = json.loads(row["metadata_json"])
         return rows
+
+    def create_topic_saturation_snapshot(
+        self,
+        *,
+        run_id: str,
+        topic_run_id: str,
+        topic_id: str,
+        saturation_metrics: dict[str, Any],
+    ) -> dict:
+        flattening = saturation_metrics.get("flattening_signal", {}) if isinstance(saturation_metrics, dict) else {}
+        search_strategy_comparison = saturation_metrics.get("search_strategy_comparison", []) if isinstance(saturation_metrics, dict) else []
+        stop_decision = saturation_metrics.get("stop_decision", {}) if isinstance(saturation_metrics, dict) else {}
+        record = {
+            "id": new_id("tsnap"),
+            "run_id": run_id,
+            "topic_run_id": topic_run_id,
+            "topic_id": topic_id,
+            "card_count": int(saturation_metrics.get("card_count", 0)) if isinstance(saturation_metrics, dict) else 0,
+            "near_duplicate_cards": int(saturation_metrics.get("near_duplicate_cards", 0)) if isinstance(saturation_metrics, dict) else 0,
+            "same_pattern_cards": int(saturation_metrics.get("same_pattern_cards", 0)) if isinstance(saturation_metrics, dict) else 0,
+            "novel_cards": int(saturation_metrics.get("novel_cards", 0)) if isinstance(saturation_metrics, dict) else 0,
+            "semantic_duplication_ratio": float(saturation_metrics.get("semantic_duplication_ratio", 0.0)) if isinstance(saturation_metrics, dict) else 0.0,
+            "likely_flattening": 1 if flattening.get("likely_flattening") else 0,
+            "stop_decision": str(stop_decision.get("decision", "insufficient_history")).strip() or "insufficient_history",
+            "stop_reason": str(stop_decision.get("reason", "")).strip(),
+            "stop_policy_json": json.dumps(stop_decision.get("policy", {}), ensure_ascii=False),
+            "tail_incremental_new_cards_json": json.dumps(flattening.get("tail_incremental_new_cards", []), ensure_ascii=False),
+            "search_strategy_comparison_json": json.dumps(search_strategy_comparison, ensure_ascii=False),
+            "saturation_metrics_json": json.dumps(saturation_metrics if isinstance(saturation_metrics, dict) else {}, ensure_ascii=False),
+            "created_at": utc_now(),
+        }
+        with db_cursor(self.settings.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO topic_saturation_snapshots(
+                    id, run_id, topic_run_id, topic_id, card_count, near_duplicate_cards, same_pattern_cards, novel_cards,
+                    semantic_duplication_ratio, likely_flattening, stop_decision, stop_reason, stop_policy_json,
+                    tail_incremental_new_cards_json, search_strategy_comparison_json, saturation_metrics_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record["id"],
+                    record["run_id"],
+                    record["topic_run_id"],
+                    record["topic_id"],
+                    record["card_count"],
+                    record["near_duplicate_cards"],
+                    record["same_pattern_cards"],
+                    record["novel_cards"],
+                    record["semantic_duplication_ratio"],
+                    record["likely_flattening"],
+                    record["stop_decision"],
+                    record["stop_reason"],
+                    record["stop_policy_json"],
+                    record["tail_incremental_new_cards_json"],
+                    record["search_strategy_comparison_json"],
+                    record["saturation_metrics_json"],
+                    record["created_at"],
+                ),
+            )
+        record["tail_incremental_new_cards"] = json.loads(record["tail_incremental_new_cards_json"])
+        record["stop_policy"] = json.loads(record["stop_policy_json"])
+        record["search_strategy_comparison"] = json.loads(record["search_strategy_comparison_json"])
+        record["saturation_metrics"] = json.loads(record["saturation_metrics_json"])
+        return record
+
+    def list_topic_saturation_snapshots(self, topic: str = "", limit: int = 50) -> list[dict]:
+        params: list[Any] = []
+        where = ""
+        topic_filter = topic.strip()
+        if topic_filter:
+            where = "WHERE LOWER(topics.name) = LOWER(?)"
+            params.append(topic_filter)
+        params.append(limit)
+        rows = self._fetchall(
+            f"""
+            SELECT topic_saturation_snapshots.*, topics.name AS topic_name
+            FROM topic_saturation_snapshots
+            JOIN topics ON topics.id = topic_saturation_snapshots.topic_id
+            {where}
+            ORDER BY topic_saturation_snapshots.created_at DESC, topic_saturation_snapshots.id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        for row in rows:
+            row["tail_incremental_new_cards"] = json.loads(row["tail_incremental_new_cards_json"])
+            row["stop_policy"] = json.loads(row["stop_policy_json"])
+            row["search_strategy_comparison"] = json.loads(row["search_strategy_comparison_json"])
+            row["saturation_metrics"] = json.loads(row["saturation_metrics_json"])
+            row["likely_flattening"] = bool(row["likely_flattening"])
+        return rows
+
+    def list_topic_saturation_trends(self, topic: str = "", history_limit: int = 5) -> list[dict]:
+        snapshots = self.list_topic_saturation_snapshots(topic=topic, limit=200)
+        grouped: dict[str, list[dict]] = {}
+        for snapshot in snapshots:
+            grouped.setdefault(snapshot["topic_name"], []).append(snapshot)
+        trends = []
+        for topic_name, topic_snapshots in grouped.items():
+            ordered = sorted(topic_snapshots, key=lambda item: item["created_at"], reverse=True)
+            history = ordered[:history_limit]
+            latest = history[0]
+            previous = history[1] if len(history) > 1 else None
+            latest_ratio = float(latest.get("semantic_duplication_ratio", 0.0))
+            previous_ratio = float(previous.get("semantic_duplication_ratio", latest_ratio)) if previous else latest_ratio
+            trends.append(
+                {
+                    "topic_name": topic_name,
+                    "latest_run_id": latest["run_id"],
+                    "latest_topic_run_id": latest["topic_run_id"],
+                    "latest_created_at": latest["created_at"],
+                    "latest_card_count": latest.get("card_count", 0),
+                    "latest_duplication_ratio": latest_ratio,
+                    "previous_duplication_ratio": previous_ratio,
+                    "duplication_ratio_delta": round(latest_ratio - previous_ratio, 4),
+                    "latest_likely_flattening": bool(latest.get("likely_flattening", False)),
+                    "latest_stop_decision": latest.get("stop_decision", "insufficient_history"),
+                    "latest_stop_reason": latest.get("stop_reason", ""),
+                    "latest_stop_policy": latest.get("stop_policy", {}),
+                    "latest_tail_incremental_new_cards": latest.get("tail_incremental_new_cards", []),
+                    "history": history,
+                }
+            )
+        trends.sort(key=lambda item: item["latest_created_at"], reverse=True)
+        return trends
 
     def create_or_get_paper(
         self,
@@ -978,45 +1839,153 @@ class Repository:
                 (new_id("aq"), paper_id, run_id, reason, priority, "", "open", utc_now()),
             )
 
+    def get_access_queue_item(self, queue_item_id: str) -> Optional[dict]:
+        return self._fetchone(
+            """
+            SELECT access_queue.*, papers.title AS paper_title, papers.original_url, papers.access_status, papers.parse_status
+            FROM access_queue
+            JOIN papers ON papers.id = access_queue.paper_id
+            WHERE access_queue.id = ?
+            """,
+            (queue_item_id,),
+        )
+
+    def update_access_queue_item(self, queue_item_id: str, *, status: str, owner: str = "") -> Optional[dict]:
+        with db_cursor(self.settings.db_path) as connection:
+            connection.execute(
+                "UPDATE access_queue SET status = ?, owner = ? WHERE id = ?",
+                (status, owner, queue_item_id),
+            )
+        return self.get_access_queue_item(queue_item_id)
+
+    def list_topic_runs_for_paper_run(self, paper_id: str, run_id: str) -> list[dict]:
+        rows = self._fetchall(
+            """
+            SELECT topic_runs.*, topics.name AS topic_name
+            FROM topic_runs
+            JOIN topics ON topics.id = topic_runs.topic_id
+            JOIN paper_topics ON paper_topics.topic_id = topic_runs.topic_id AND paper_topics.run_id = topic_runs.run_id
+            WHERE paper_topics.paper_id = ? AND topic_runs.run_id = ?
+            ORDER BY topic_runs.started_at DESC, topic_runs.id DESC
+            """,
+            (paper_id, run_id),
+        )
+        for row in rows:
+            self._decorate_topic_run(row)
+        return rows
+
+    def count_open_access_queue_for_topic(self, run_id: str, topic_id: str) -> int:
+        return self._fetchone(
+            """
+            SELECT COUNT(*) AS count
+            FROM access_queue
+            JOIN paper_topics ON paper_topics.paper_id = access_queue.paper_id AND paper_topics.run_id = access_queue.run_id
+            WHERE access_queue.run_id = ? AND paper_topics.topic_id = ? AND access_queue.status = 'open'
+            """,
+            (run_id, topic_id),
+        )["count"]
+
+    def _replace_sections_in_connection(self, connection: Any, paper_id: str, sections: list[dict]) -> None:
+        connection.execute("DELETE FROM paper_sections WHERE paper_id = ?", (paper_id,))
+        for section in sections:
+            connection.execute(
+                """
+                INSERT INTO paper_sections(
+                    id, paper_id, section_order, section_title, paragraph_text, page_number,
+                    section_kind, section_label, is_front_matter, is_abstract, is_body, body_role,
+                    has_figure_reference, source_format, selection_score, selection_reason_json, embedding_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    section["id"],
+                    paper_id,
+                    section["section_order"],
+                    section["section_title"],
+                    section["paragraph_text"],
+                    section["page_number"],
+                    section.get("section_kind", "other"),
+                    section.get("section_label", ""),
+                    int(section.get("is_front_matter", False)),
+                    int(section.get("is_abstract", False)),
+                    int(section.get("is_body", False)),
+                    section.get("body_role", ""),
+                    int(section.get("has_figure_reference", False)),
+                    section.get("source_format", ""),
+                    float(section.get("selection_score", 0.0) or 0.0),
+                    json.dumps(section.get("selection_reason", {}), ensure_ascii=False),
+                    json.dumps(section["embedding"]),
+                ),
+            )
+
+    def _replace_figures_in_connection(self, connection: Any, paper_id: str, figures: list[dict]) -> None:
+        connection.execute("DELETE FROM figures WHERE paper_id = ?", (paper_id,))
+        for figure in figures:
+            connection.execute(
+                """
+                INSERT INTO figures(
+                    id, paper_id, figure_label, caption, page_number, storage_path, asset_status,
+                    asset_kind, asset_local_path, asset_source_url, mime_type, byte_size,
+                    sha256, width, height, validation_error, linked_section_ids_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    figure["id"],
+                    paper_id,
+                    figure["figure_label"],
+                    figure["caption"],
+                    figure.get("page_number"),
+                    figure["storage_path"],
+                    figure.get("asset_status", "metadata_only"),
+                    figure.get("asset_kind", ""),
+                    figure.get("asset_local_path", ""),
+                    figure.get("asset_source_url", ""),
+                    figure.get("mime_type", ""),
+                    int(figure.get("byte_size", 0) or 0),
+                    figure.get("sha256", ""),
+                    figure.get("width"),
+                    figure.get("height"),
+                    figure.get("validation_error", ""),
+                    json.dumps(figure["linked_section_ids"]),
+                ),
+            )
+
     def replace_sections(self, paper_id: str, sections: list[dict]) -> None:
         with db_cursor(self.settings.db_path) as connection:
-            connection.execute("DELETE FROM paper_sections WHERE paper_id = ?", (paper_id,))
-            for section in sections:
-                connection.execute(
-                    """
-                    INSERT INTO paper_sections(
-                        id, paper_id, section_order, section_title, paragraph_text, page_number, embedding_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        section["id"],
-                        paper_id,
-                        section["section_order"],
-                        section["section_title"],
-                        section["paragraph_text"],
-                        section["page_number"],
-                        json.dumps(section["embedding"]),
-                    ),
-                )
+            self._replace_sections_in_connection(connection, paper_id, sections)
 
     def replace_figures(self, paper_id: str, figures: list[dict]) -> None:
         with db_cursor(self.settings.db_path) as connection:
-            connection.execute("DELETE FROM figures WHERE paper_id = ?", (paper_id,))
-            for figure in figures:
-                connection.execute(
-                    """
-                    INSERT INTO figures(id, paper_id, figure_label, caption, storage_path, linked_section_ids_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        figure["id"],
-                        paper_id,
-                        figure["figure_label"],
-                        figure["caption"],
-                        figure["storage_path"],
-                        json.dumps(figure["linked_section_ids"]),
-                    ),
-                )
+            self._replace_figures_in_connection(connection, paper_id, figures)
+
+    def persist_parse_result(
+        self,
+        *,
+        paper_id: str,
+        sections: list[dict],
+        figures: list[dict],
+        parse_status: str,
+        ingestion_status: str,
+        parse_failure_reason: str,
+        card_generation_status: str,
+        card_generation_failure_reason: str,
+        artifact_path: str = "",
+    ) -> None:
+        with db_cursor(self.settings.db_path) as connection:
+            self._replace_sections_in_connection(connection, paper_id, sections)
+            self._replace_figures_in_connection(connection, paper_id, figures)
+            assignments = [
+                ("parse_status", parse_status),
+                ("ingestion_status", ingestion_status),
+                ("parse_failure_reason", parse_failure_reason),
+                ("card_generation_status", card_generation_status),
+                ("card_generation_failure_reason", card_generation_failure_reason),
+            ]
+            if artifact_path:
+                assignments.append(("artifact_path", artifact_path))
+            sql = ", ".join(f"{name} = ?" for name, _ in assignments)
+            values = [value for _, value in assignments] + [paper_id]
+            connection.execute(f"UPDATE papers SET {sql} WHERE id = ?", values)
 
     def replace_generation_outputs_for_paper_topic(
         self,
@@ -1135,13 +2104,25 @@ class Repository:
             "created_at": row["created_at"],
         }
 
-    def create_export(self, run_id: str, destination_type: str, google_doc_id: str, export_status: str, artifact_path: str, request_payload: dict) -> dict:
+    def create_export(
+        self,
+        run_id: str,
+        destination_type: str,
+        export_mode: str,
+        google_doc_id: str,
+        export_status: str,
+        error_message: str,
+        artifact_path: str,
+        request_payload: dict,
+    ) -> dict:
         record = {
             "id": new_id("export"),
             "run_id": run_id,
             "destination_type": destination_type,
+            "export_mode": export_mode,
             "google_doc_id": google_doc_id,
             "export_status": export_status,
+            "error_message": error_message,
             "artifact_path": artifact_path,
             "request_json": json.dumps(request_payload, ensure_ascii=False),
             "created_at": utc_now(),
@@ -1150,15 +2131,17 @@ class Repository:
         with db_cursor(self.settings.db_path) as connection:
             connection.execute(
                 """
-                INSERT INTO exports(id, run_id, destination_type, google_doc_id, export_status, artifact_path, request_json, created_at, completed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO exports(id, run_id, destination_type, export_mode, google_doc_id, export_status, error_message, artifact_path, request_json, created_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["id"],
                     record["run_id"],
                     record["destination_type"],
+                    record["export_mode"],
                     record["google_doc_id"],
                     record["export_status"],
+                    record["error_message"],
                     record["artifact_path"],
                     record["request_json"],
                     record["created_at"],
@@ -1167,11 +2150,103 @@ class Repository:
             )
         return record
 
+    def get_run_progress_summary(self, run_id: str) -> dict[str, Any]:
+        paper_rows = self._fetchall(
+            """
+            SELECT papers.*
+            FROM papers
+            JOIN paper_topics ON paper_topics.paper_id = papers.id
+            WHERE paper_topics.run_id = ?
+            """,
+            (run_id,),
+        )
+        card_rows = self._fetchall("SELECT id FROM candidate_cards WHERE run_id = ?", (run_id,))
+        judged_count = self._fetchone(
+            """
+            SELECT COUNT(DISTINCT judgements.card_id) AS count
+            FROM judgements
+            JOIN candidate_cards ON candidate_cards.id = judgements.card_id
+            WHERE candidate_cards.run_id = ?
+            """,
+            (run_id,),
+        )["count"]
+        reviewed_count = self._fetchone(
+            """
+            SELECT COUNT(DISTINCT review_decisions.target_id) AS count
+            FROM review_decisions
+            JOIN candidate_cards ON candidate_cards.id = review_decisions.target_id
+            WHERE review_decisions.target_type = 'card' AND candidate_cards.run_id = ?
+            """,
+            (run_id,),
+        )["count"]
+        export_rows = self._fetchall("SELECT request_json FROM exports WHERE run_id = ?", (run_id,))
+        exported_card_ids: set[str] = set()
+        for row in export_rows:
+            try:
+                request_payload = json.loads(row["request_json"] or "{}")
+            except json.JSONDecodeError:
+                continue
+            for card_id in request_payload.get("resolved_card_ids", []):
+                if card_id:
+                    exported_card_ids.add(str(card_id))
+        topic_runs = self.list_topic_runs(run_id)
+        return {
+            "topic_total": len(topic_runs),
+            "topic_completed": sum(1 for item in topic_runs if item["status"] == "completed"),
+            "topic_failed": sum(1 for item in topic_runs if item["status"] == "failed"),
+            "topic_active": sum(1 for item in topic_runs if item["status"] == "running"),
+            "discovered": len({row["id"] for row in paper_rows}),
+            "accessible": sum(1 for row in paper_rows if row["access_status"] == "open_fulltext"),
+            "parsed": sum(1 for row in paper_rows if row["parse_status"] == "parsed"),
+            "carded": len(card_rows),
+            "judged": int(judged_count),
+            "reviewed": int(reviewed_count),
+            "exported": len(exported_card_ids),
+        }
+
+    def _decorate_run(self, row: dict) -> dict:
+        row["progress_summary"] = self.get_run_progress_summary(row["id"])
+        return row
+
+    def _decorate_topic_run(self, row: dict) -> dict:
+        stats = json.loads(row["stats_json"])
+        elapsed_seconds = seconds_since(row.get("started_at", ""))
+        stage_elapsed_seconds = seconds_since(stats.get("stage_started_at", ""))
+        last_progress_seconds_ago = seconds_since(stats.get("last_progress_at", ""))
+        derived_status = row["status"]
+        if row["status"] == "running":
+            waiting_for_access = (
+                stats.get("current_stage") == "acquisition"
+                and int(stats.get("queued_for_access", 0) or 0) > 0
+                and int(stats.get("accessible", 0) or 0) == 0
+            )
+            if waiting_for_access:
+                derived_status = "waiting_for_access"
+            elif (
+                last_progress_seconds_ago is not None
+                and last_progress_seconds_ago >= self.settings.stalled_after_seconds
+            ):
+                derived_status = "stalled"
+        row["stats"] = stats
+        row["current_stage"] = stats.get("current_stage", "")
+        row["elapsed_seconds"] = elapsed_seconds or 0
+        row["stage_elapsed_seconds"] = stage_elapsed_seconds or 0
+        row["last_progress_seconds_ago"] = last_progress_seconds_ago
+        row["derived_status"] = derived_status
+        row["latest_failures"] = summarize_latest_failures(stats)
+        return row
+
     def get_run(self, run_id: str) -> Optional[dict]:
-        return self._fetchone("SELECT * FROM runs WHERE id = ?", (run_id,))
+        row = self._fetchone("SELECT * FROM runs WHERE id = ?", (run_id,))
+        if not row:
+            return None
+        return self._decorate_run(row)
 
     def list_runs(self) -> list[dict]:
-        return self._fetchall("SELECT * FROM runs ORDER BY created_at DESC")
+        rows = self._fetchall("SELECT * FROM runs ORDER BY created_at DESC")
+        for row in rows:
+            self._decorate_run(row)
+        return rows
 
     def list_topic_runs(self, run_id: Optional[str] = None) -> list[dict]:
         if run_id:
@@ -1195,7 +2270,7 @@ class Repository:
                 """
             )
         for row in rows:
-            row["stats"] = json.loads(row["stats_json"])
+            self._decorate_topic_run(row)
         return rows
 
     def get_topic_run(self, topic_run_id: str) -> Optional[dict]:
@@ -1209,7 +2284,7 @@ class Repository:
             (topic_run_id,),
         )
         if row:
-            row["stats"] = json.loads(row["stats_json"])
+            self._decorate_topic_run(row)
         return row
 
     def list_papers_for_topic_run(self, run_id: str, topic_id: str) -> list[dict]:
@@ -1224,6 +2299,18 @@ class Repository:
             (run_id, topic_id),
         )
 
+    def list_local_papers_for_topic_run(self, run_id: str, topic_id: str) -> list[dict]:
+        return self._fetchall(
+            """
+            SELECT papers.*
+            FROM papers
+            JOIN paper_topics ON paper_topics.paper_id = papers.id
+            WHERE paper_topics.run_id = ? AND paper_topics.topic_id = ? AND paper_topics.source_kind = 'local_pdf'
+            ORDER BY papers.created_at DESC
+            """,
+            (run_id, topic_id),
+        )
+
     def get_sections(self, paper_id: str) -> list[dict]:
         rows = self._fetchall(
             "SELECT * FROM paper_sections WHERE paper_id = ? ORDER BY section_order ASC",
@@ -1231,7 +2318,31 @@ class Repository:
         )
         for row in rows:
             row["embedding"] = json.loads(row["embedding_json"])
+            row["selection_reason"] = json.loads(row.get("selection_reason_json", "{}") or "{}")
+            row["is_front_matter"] = bool(row.get("is_front_matter", 0))
+            row["is_abstract"] = bool(row.get("is_abstract", 0))
+            row["is_body"] = bool(row.get("is_body", 0))
+            row["has_figure_reference"] = bool(row.get("has_figure_reference", 0))
         return rows
+
+    def update_section_selection_diagnostics(self, paper_id: str, diagnostics_by_section_id: dict[str, dict[str, Any]]) -> None:
+        if not diagnostics_by_section_id:
+            return
+        with db_cursor(self.settings.db_path) as connection:
+            for section_id, diagnostics in diagnostics_by_section_id.items():
+                connection.execute(
+                    """
+                    UPDATE paper_sections
+                    SET selection_score = ?, selection_reason_json = ?
+                    WHERE paper_id = ? AND id = ?
+                    """,
+                    (
+                        float(diagnostics.get("score", 0.0) or 0.0),
+                        json.dumps(diagnostics, ensure_ascii=False),
+                        paper_id,
+                        section_id,
+                    ),
+                )
 
     def get_figures(self, paper_id: str) -> list[dict]:
         rows = self._fetchall(
@@ -1239,8 +2350,28 @@ class Repository:
             (paper_id,),
         )
         for row in rows:
-            row["linked_section_ids"] = json.loads(row["linked_section_ids_json"])
+            self._hydrate_figure_row(row)
         return rows
+
+    def get_figure(self, figure_id: str) -> Optional[dict]:
+        row = self._fetchone("SELECT * FROM figures WHERE id = ?", (figure_id,))
+        if not row:
+            return None
+        return self._hydrate_figure_row(row)
+
+    def get_figures_by_ids(self, paper_id: str, figure_ids: list[str]) -> list[dict]:
+        if not figure_ids:
+            return []
+        placeholders = ",".join("?" for _ in figure_ids)
+        rows = self._fetchall(
+            f"SELECT * FROM figures WHERE paper_id = ? AND id IN ({placeholders}) ORDER BY id ASC",
+            tuple([paper_id] + figure_ids),
+        )
+        row_map: dict[str, dict] = {}
+        for row in rows:
+            hydrated = self._hydrate_figure_row(row)
+            row_map[hydrated["id"]] = hydrated
+        return [row_map[figure_id] for figure_id in figure_ids if figure_id in row_map]
 
     def get_card(self, card_id: str) -> Optional[dict]:
         row = self._fetchone(
@@ -1266,7 +2397,59 @@ class Repository:
             topic_id=row["topic_id"],
             run_id=row["run_id"],
         )
+        row["figures"] = self.get_figures_by_ids(row["paper_id"], row.get("figure_ids", []))
+        row["grounding_diagnostics"] = self._build_card_grounding_diagnostics(row)
         return row
+
+    def _build_card_grounding_diagnostics(self, card: dict) -> dict[str, Any]:
+        evidence_section_ids = [item.get("section_id") for item in card.get("evidence", []) if item.get("section_id")]
+        if evidence_section_ids:
+            placeholders = ",".join("?" for _ in evidence_section_ids)
+            section_rows = self._fetchall(
+                f"""
+                SELECT id, section_kind, is_front_matter, is_abstract, is_body, body_role
+                FROM paper_sections
+                WHERE paper_id = ? AND id IN ({placeholders})
+                """,
+                tuple([card["paper_id"]] + evidence_section_ids),
+            )
+        else:
+            section_rows = []
+        section_type_mix = {
+            "front_matter": 0,
+            "abstract": 0,
+            "body": 0,
+        }
+        for section in section_rows:
+            if section.get("is_front_matter"):
+                section_type_mix["front_matter"] += 1
+            if section.get("is_abstract"):
+                section_type_mix["abstract"] += 1
+            if section.get("is_body"):
+                section_type_mix["body"] += 1
+        sibling_rows = self._fetchall(
+            """
+            SELECT id, title, duplicate_cluster_id, duplicate_rank, duplicate_disposition
+            FROM candidate_cards
+            WHERE run_id = ? AND paper_id = ? AND topic_id = ? AND id != ?
+            ORDER BY created_at DESC
+            """,
+            (card["run_id"], card["paper_id"], card["topic_id"], card["id"]),
+        )
+        return {
+            "section_type_mix": section_type_mix,
+            "primary_section_ids": card.get("primary_section_ids", []),
+            "supporting_section_ids": card.get("supporting_section_ids", []),
+            "paper_specific_object": card.get("paper_specific_object", ""),
+            "claim_type": card.get("claim_type", ""),
+            "evidence_level": card.get("evidence_level", ""),
+            "body_grounding_reason": card.get("body_grounding_reason", ""),
+            "grounding_quality": card.get("grounding_quality", ""),
+            "duplicate_cluster_id": card.get("duplicate_cluster_id", ""),
+            "duplicate_rank": card.get("duplicate_rank", 0),
+            "duplicate_disposition": card.get("duplicate_disposition", ""),
+            "same_paper_siblings": sibling_rows,
+        }
 
     def list_cards(self, run_id: Optional[str] = None, topic: str = "") -> list[dict]:
         params: list[str] = []
@@ -1307,6 +2490,70 @@ class Repository:
         for row in rows:
             self._hydrate_card_row(row)
         return rows
+
+    def get_quality_metrics(self, run_id: Optional[str] = None) -> dict[str, Any]:
+        cards = self.list_cards(run_id=run_id)
+        total_cards = len(cards)
+        if total_cards == 0:
+            return {
+                "run_id": run_id or "",
+                "total_cards": 0,
+                "abstract_backed_card_rate": 0.0,
+                "front_matter_primary_rate": 0.0,
+                "body_grounded_card_rate": 0.0,
+                "same_evidence_duplicate_escape_rate": 0.0,
+                "paper_specific_object_presence_rate": 0.0,
+                "accepted_card_body_grounding_rate": 0.0,
+                "accepted_card_duplicate_conflict_rate": 0.0,
+            }
+        abstract_backed = 0
+        front_primary = 0
+        body_grounded = 0
+        duplicate_escape = 0
+        object_present = 0
+        accepted_cards = 0
+        accepted_body_grounded = 0
+        accepted_duplicate_conflicts = 0
+        for card in cards:
+            diagnostics = self._build_card_grounding_diagnostics(card)
+            section_mix = diagnostics["section_type_mix"]
+            if section_mix["abstract"] > 0:
+                abstract_backed += 1
+            primary_ids = diagnostics["primary_section_ids"] or []
+            if primary_ids:
+                placeholders = ",".join("?" for _ in primary_ids)
+                primary_sections = self._fetchall(
+                    f"SELECT is_front_matter, is_abstract, is_body FROM paper_sections WHERE paper_id = ? AND id IN ({placeholders})",
+                    tuple([card["paper_id"]] + primary_ids),
+                )
+            else:
+                primary_sections = []
+            if primary_sections and all(item.get("is_front_matter") or item.get("is_abstract") for item in primary_sections):
+                front_primary += 1
+            if section_mix["body"] > 0:
+                body_grounded += 1
+            if str(card.get("paper_specific_object", "")).strip():
+                object_present += 1
+            if card.get("duplicate_disposition", "") not in {"", "kept"}:
+                duplicate_escape += 1
+            if (card.get("review_decision") or "") == "accepted":
+                accepted_cards += 1
+                if section_mix["body"] > 0:
+                    accepted_body_grounded += 1
+                if card.get("duplicate_disposition", "") not in {"", "kept"}:
+                    accepted_duplicate_conflicts += 1
+        return {
+            "run_id": run_id or "",
+            "total_cards": total_cards,
+            "abstract_backed_card_rate": round(abstract_backed / total_cards, 4),
+            "front_matter_primary_rate": round(front_primary / total_cards, 4),
+            "body_grounded_card_rate": round(body_grounded / total_cards, 4),
+            "same_evidence_duplicate_escape_rate": round(duplicate_escape / total_cards, 4),
+            "paper_specific_object_presence_rate": round(object_present / total_cards, 4),
+            "accepted_card_body_grounding_rate": round(accepted_body_grounded / max(accepted_cards, 1), 4),
+            "accepted_card_duplicate_conflict_rate": round(accepted_duplicate_conflicts / max(accepted_cards, 1), 4),
+            "accepted_cards": accepted_cards,
+        }
 
     def get_excluded_content_summary(self, excluded_content_id: str) -> Optional[dict]:
         row = self._fetchone(
@@ -1545,18 +2792,25 @@ class Repository:
 
 
 class DiscoveryService:
-    def __init__(self, providers: Optional[list[Any]] = None):
+    def __init__(
+        self,
+        providers: Optional[list[Any]] = None,
+        strategy_builder: Optional[Any] = None,
+    ):
         self.providers = providers or [
             OpenAlexDiscoveryProvider(),
             ArxivDiscoveryProvider(),
             CrossrefDiscoveryProvider(),
             SemanticScholarDiscoveryProvider(),
         ]
+        self.strategy_builder = strategy_builder or build_topic_search_strategies
 
     def discover(self, topic: str) -> list[dict]:
         raw_results = []
-        for provider in self.providers:
-            raw_results.extend(provider.discover(topic))
+        strategies = self.strategy_builder(topic)
+        for strategy in strategies:
+            for provider in self.providers:
+                raw_results.extend(self._discover_with_provider(provider, topic, strategy))
         deduped: dict[str, dict] = {}
         for result in raw_results:
             dedupe_key = build_discovery_identity(
@@ -1567,7 +2821,9 @@ class DiscoveryService:
             )
             source = {
                 "provider": result["provider"],
+                "strategy_family": result.get("strategy_family", "core"),
                 "strategy_type": result.get("strategy_type", "topic_query"),
+                "strategy_order": int(result.get("strategy_order", 0)),
                 "query_text": result.get("query_text", topic),
                 "source_external_id": result.get("source_external_id", ""),
                 "original_url": result.get("original_url", ""),
@@ -1575,6 +2831,7 @@ class DiscoveryService:
                 "confidence": result.get("confidence", 0.0),
                 "metadata": result.get("metadata", {}),
                 "ids": result.get("ids", {}),
+                "strategy_params": result.get("strategy_params", {}),
             }
             current = deduped.get(dedupe_key)
             if not current:
@@ -1622,6 +2879,26 @@ class DiscoveryService:
             ),
         )
 
+    def _discover_with_provider(self, provider: Any, topic: str, strategy: dict[str, Any]) -> list[dict]:
+        try:
+            results = provider.discover(topic, strategy)
+        except TypeError:
+            results = provider.discover(topic)
+        normalized = []
+        for result in results or []:
+            if not isinstance(result, dict):
+                continue
+            normalized_result = {
+                **result,
+                "strategy_family": result.get("strategy_family", strategy.get("strategy_family", "core")),
+                "strategy_type": result.get("strategy_type", strategy.get("strategy_type", "topic_query")),
+                "strategy_order": int(result.get("strategy_order", strategy.get("strategy_order", 0))),
+                "query_text": result.get("query_text", strategy.get("query_text", topic)),
+                "strategy_params": result.get("strategy_params", strategy.get("params", {})),
+            }
+            normalized.append(normalized_result)
+        return normalized
+
     def _prefer_source(self, current: dict, candidate: dict) -> bool:
         current_score = (
             1 if current.get("asset_url") else 0,
@@ -1639,9 +2916,15 @@ class DiscoveryService:
 class OpenAlexDiscoveryProvider:
     provider_name = "openalex"
 
-    def discover(self, topic: str) -> list[dict]:
-        query = urllib.parse.quote(topic)
+    def discover(self, topic: str, strategy: Optional[dict[str, Any]] = None) -> list[dict]:
+        strategy = strategy or {}
+        query_text = str(strategy.get("query_text", topic)).strip() or topic
+        query = urllib.parse.quote(query_text)
         url = f"https://api.openalex.org/works?search={query}&per-page=5"
+        year_from = (strategy.get("params") or {}).get("year_from")
+        if isinstance(year_from, int):
+            filter_param = urllib.parse.quote(f"from_publication_date:{year_from}-01-01")
+            url += f"&filter={filter_param}"
         try:
             with urllib.request.urlopen(url, timeout=8) as response:
                 payload = json.loads(response.read().decode("utf-8"))
@@ -1658,8 +2941,10 @@ class OpenAlexDiscoveryProvider:
             records.append(
                 {
                     "provider": "openalex",
-                    "strategy_type": "topic_query",
-                    "query_text": topic,
+                    "strategy_family": strategy.get("strategy_family", "core"),
+                    "strategy_type": strategy.get("strategy_type", "topic_query"),
+                    "strategy_order": int(strategy.get("strategy_order", 0)),
+                    "query_text": query_text,
                     "title": item.get("display_name", "Untitled"),
                     "authors": [author["author"]["display_name"] for author in item.get("authorships", [])[:5] if author.get("author")],
                     "publication_year": item.get("publication_year"),
@@ -1667,6 +2952,7 @@ class OpenAlexDiscoveryProvider:
                     "original_url": landing_url,
                     "asset_url": pdf_url,
                     "confidence": 0.7,
+                    "strategy_params": strategy.get("params", {}),
                     "ids": {
                         "doi": item.get("doi", ""),
                         "openalex": item.get("id", ""),
@@ -1680,9 +2966,14 @@ class OpenAlexDiscoveryProvider:
 class ArxivDiscoveryProvider:
     provider_name = "arxiv"
 
-    def discover(self, topic: str) -> list[dict]:
-        query = urllib.parse.quote(topic)
-        url = f"http://export.arxiv.org/api/query?search_query=all:{query}&start=0&max_results=5"
+    def discover(self, topic: str, strategy: Optional[dict[str, Any]] = None) -> list[dict]:
+        strategy = strategy or {}
+        query_text = str(strategy.get("query_text", topic)).strip() or topic
+        query = urllib.parse.quote(query_text)
+        sort_params = ""
+        if str(strategy.get("strategy_type", "")) == "recent_window":
+            sort_params = "&sortBy=submittedDate&sortOrder=descending"
+        url = f"http://export.arxiv.org/api/query?search_query=all:{query}&start=0&max_results=5{sort_params}"
         try:
             with urllib.request.urlopen(url, timeout=8) as response:
                 feed = ET.fromstring(response.read().decode("utf-8"))
@@ -1700,8 +2991,10 @@ class ArxivDiscoveryProvider:
             records.append(
                 {
                     "provider": "arxiv",
-                    "strategy_type": "topic_query",
-                    "query_text": topic,
+                    "strategy_family": strategy.get("strategy_family", "core"),
+                    "strategy_type": strategy.get("strategy_type", "topic_query"),
+                    "strategy_order": int(strategy.get("strategy_order", 0)),
+                    "query_text": query_text,
                     "title": entry.findtext("atom:title", default="Untitled", namespaces=namespace).strip(),
                     "authors": [author.findtext("atom:name", default="", namespaces=namespace) for author in entry.findall("atom:author", namespace)],
                     "publication_year": int(entry.findtext("atom:published", default="1900", namespaces=namespace)[:4]),
@@ -1709,6 +3002,7 @@ class ArxivDiscoveryProvider:
                     "original_url": arxiv_id,
                     "asset_url": pdf_url,
                     "confidence": 0.8,
+                    "strategy_params": strategy.get("params", {}),
                     "ids": {"arxiv": arxiv_id},
                     "metadata": {"summary": entry.findtext("atom:summary", default="", namespaces=namespace)},
                 }
@@ -1719,9 +3013,14 @@ class ArxivDiscoveryProvider:
 class CrossrefDiscoveryProvider:
     provider_name = "crossref"
 
-    def discover(self, topic: str) -> list[dict]:
-        query = urllib.parse.quote(topic)
+    def discover(self, topic: str, strategy: Optional[dict[str, Any]] = None) -> list[dict]:
+        strategy = strategy or {}
+        query_text = str(strategy.get("query_text", topic)).strip() or topic
+        query = urllib.parse.quote(query_text)
         url = f"https://api.crossref.org/works?query={query}&rows=5"
+        year_from = (strategy.get("params") or {}).get("year_from")
+        if isinstance(year_from, int):
+            url += f"&filter={urllib.parse.quote(f'from-pub-date:{year_from}-01-01')}"
         try:
             with urllib.request.urlopen(url, timeout=8) as response:
                 payload = json.loads(response.read().decode("utf-8"))
@@ -1743,8 +3042,10 @@ class CrossrefDiscoveryProvider:
             records.append(
                 {
                     "provider": "crossref",
-                    "strategy_type": "topic_query",
-                    "query_text": topic,
+                    "strategy_family": strategy.get("strategy_family", "core"),
+                    "strategy_type": strategy.get("strategy_type", "topic_query"),
+                    "strategy_order": int(strategy.get("strategy_order", 0)),
+                    "query_text": query_text,
                     "title": title,
                     "authors": authors,
                     "publication_year": publication_year,
@@ -1752,6 +3053,7 @@ class CrossrefDiscoveryProvider:
                     "original_url": item.get("URL", ""),
                     "asset_url": "",
                     "confidence": 0.55,
+                    "strategy_params": strategy.get("params", {}),
                     "ids": {"doi": doi},
                     "metadata": item,
                 }
@@ -1762,8 +3064,10 @@ class CrossrefDiscoveryProvider:
 class SemanticScholarDiscoveryProvider:
     provider_name = "semantic_scholar"
 
-    def discover(self, topic: str) -> list[dict]:
-        query = urllib.parse.quote(topic)
+    def discover(self, topic: str, strategy: Optional[dict[str, Any]] = None) -> list[dict]:
+        strategy = strategy or {}
+        query_text = str(strategy.get("query_text", topic)).strip() or topic
+        query = urllib.parse.quote(query_text)
         fields = urllib.parse.quote("title,year,authors,url,openAccessPdf,externalIds,abstract")
         url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={query}&limit=5&fields={fields}"
         request = urllib.request.Request(url, headers={"User-Agent": "paper2bullet/1.0"})
@@ -1778,8 +3082,10 @@ class SemanticScholarDiscoveryProvider:
             records.append(
                 {
                     "provider": "semantic_scholar",
-                    "strategy_type": "topic_query",
-                    "query_text": topic,
+                    "strategy_family": strategy.get("strategy_family", "core"),
+                    "strategy_type": strategy.get("strategy_type", "topic_query"),
+                    "strategy_order": int(strategy.get("strategy_order", 0)),
+                    "query_text": query_text,
                     "title": item.get("title", "Untitled"),
                     "authors": [author.get("name", "") for author in item.get("authors", [])[:5] if author.get("name")],
                     "publication_year": item.get("year"),
@@ -1787,6 +3093,7 @@ class SemanticScholarDiscoveryProvider:
                     "original_url": item.get("url", ""),
                     "asset_url": (item.get("openAccessPdf") or {}).get("url", ""),
                     "confidence": 0.65,
+                    "strategy_params": strategy.get("params", {}),
                     "ids": {
                         "doi": external_ids.get("DOI", ""),
                         "arxiv": external_ids.get("ArXiv", ""),
@@ -1866,24 +3173,535 @@ class PdfParser:
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
+    def _figure_asset_dir(self, source_path: Path) -> Path:
+        target = self.settings.figure_assets_dir / source_path.stem
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _build_figure_record(
+        self,
+        *,
+        figure_label: str,
+        caption: str,
+        page_number: Optional[int] = None,
+        linked_section_ids: Optional[list[str]] = None,
+        asset_status: str = "metadata_only",
+        asset_kind: str = "",
+        asset_local_path: str = "",
+        asset_source_url: str = "",
+        mime_type: str = "",
+        byte_size: int = 0,
+        sha256: str = "",
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        validation_error: str = "",
+    ) -> dict[str, Any]:
+        storage_path = asset_local_path or asset_source_url
+        return {
+            "id": new_id("figure"),
+            "figure_label": figure_label,
+            "caption": caption,
+            "page_number": page_number,
+            "storage_path": storage_path,
+            "asset_status": asset_status,
+            "asset_kind": asset_kind,
+            "asset_local_path": asset_local_path,
+            "asset_source_url": asset_source_url,
+            "mime_type": mime_type,
+            "byte_size": int(byte_size or 0),
+            "sha256": sha256,
+            "width": width,
+            "height": height,
+            "validation_error": validation_error,
+            "linked_section_ids": list(linked_section_ids or []),
+        }
+
+    def _infer_html_base_url(self, html_text: str) -> str:
+        patterns = [
+            r"<base\b[^>]*href=['\"]([^'\"]+)['\"]",
+            r"<link\b[^>]*rel=['\"]canonical['\"][^>]*href=['\"]([^'\"]+)['\"]",
+            r"<meta\b[^>]*name=['\"]citation_fulltext_html_url['\"][^>]*content=['\"]([^'\"]+)['\"]",
+            r"<meta\b[^>]*property=['\"]og:url['\"][^>]*content=['\"]([^'\"]+)['\"]",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html_text, flags=re.I)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    def _write_figure_asset_bytes(
+        self,
+        *,
+        source_path: Path,
+        asset_bytes: bytes,
+        target_name_hint: str,
+        suffix: str,
+    ) -> str:
+        suffix = suffix if suffix.startswith(".") else f".{suffix.lstrip('.')}" if suffix else ".bin"
+        target_hash = stable_hash(target_name_hint)[:16]
+        destination = self._figure_asset_dir(source_path) / f"{slugify(target_name_hint)}-{target_hash}{suffix.lower()}"
+        destination.write_bytes(asset_bytes)
+        return str(destination)
+
+    def _validate_local_image_asset(self, asset_path: Path) -> dict[str, Any]:
+        if not asset_path.exists():
+            return {"asset_status": "metadata_only", "validation_error": "asset file does not exist"}
+        byte_size = asset_path.stat().st_size
+        if byte_size <= 0:
+            return {"asset_status": "metadata_only", "validation_error": "asset file is empty"}
+        mime_type = mimetypes.guess_type(asset_path.name)[0] or ""
+        width = None
+        height = None
+        if Image is not None:
+            try:
+                with Image.open(asset_path) as image:
+                    width, height = image.size
+                    mime_type = Image.MIME.get(image.format, mime_type) or mime_type
+            except Exception as error:
+                return {"asset_status": "metadata_only", "validation_error": f"image validation failed: {error}"}
+        if width is not None and width <= 0:
+            return {"asset_status": "metadata_only", "validation_error": "image width is invalid"}
+        if height is not None and height <= 0:
+            return {"asset_status": "metadata_only", "validation_error": "image height is invalid"}
+        sha256 = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+        return {
+            "asset_status": "validated_local_asset",
+            "asset_local_path": str(asset_path),
+            "mime_type": mime_type,
+            "byte_size": byte_size,
+            "sha256": sha256,
+            "width": width,
+            "height": height,
+            "validation_error": "",
+        }
+
+    def _pick_best_src_candidate(self, raw_src: str, raw_srcset: str) -> str:
+        srcset = str(raw_srcset or "").strip()
+        if srcset:
+            candidates = []
+            for item in srcset.split(","):
+                token = item.strip().split()[0] if item.strip() else ""
+                if token:
+                    candidates.append(token)
+            if candidates:
+                return candidates[-1]
+        return str(raw_src or "").strip()
+
+    def _resolve_html_figure_target(self, target: str, source_path: Path, base_url: str) -> tuple[str, str]:
+        target = str(target or "").strip()
+        if not target:
+            return "", ""
+        if target.startswith("data:"):
+            return target, "data_uri"
+        if target.startswith("//"):
+            return "https:" + target, "remote"
+        if target.startswith(("http://", "https://")):
+            return target, "remote"
+        if target.startswith("/"):
+            if base_url:
+                return urllib.parse.urljoin(base_url, target), "remote"
+            return target, "unresolved"
+        candidate_path = (source_path.parent / urllib.parse.unquote(target)).resolve()
+        if candidate_path.exists():
+            return str(candidate_path), "local"
+        if base_url:
+            return urllib.parse.urljoin(base_url, target), "remote"
+        return "", "unresolved"
+
+    def _materialize_figure_asset(
+        self,
+        *,
+        source_path: Path,
+        raw_target: str,
+        figure_label: str,
+        base_url: str = "",
+        asset_kind_hint: str = "",
+    ) -> dict[str, Any]:
+        resolved_target, target_kind = self._resolve_html_figure_target(raw_target, source_path, base_url)
+        if target_kind == "data_uri" and resolved_target.startswith("data:"):
+            header, encoded = resolved_target.split(",", 1)
+            try:
+                asset_bytes = base64.b64decode(encoded, validate=False)
+            except Exception as error:
+                return {
+                    "asset_status": "metadata_only",
+                    "asset_kind": "data_uri",
+                    "asset_source_url": resolved_target[:80],
+                    "validation_error": f"data URI decode failed: {error}",
+                }
+            mime_match = re.match(r"data:([^;]+)", header, flags=re.I)
+            mime_type = mime_match.group(1).strip().lower() if mime_match else ""
+            suffix = mimetypes.guess_extension(mime_type) or ".bin"
+            asset_path = Path(
+                self._write_figure_asset_bytes(
+                    source_path=source_path,
+                    asset_bytes=asset_bytes,
+                    target_name_hint=f"{figure_label}-{mime_type or 'data-uri'}",
+                    suffix=suffix,
+                )
+            )
+            validated = self._validate_local_image_asset(asset_path)
+            validated.update({"asset_kind": "data_uri", "asset_source_url": resolved_target[:80]})
+            return validated
+        if target_kind == "local" and resolved_target:
+            original = Path(resolved_target)
+            suffix = original.suffix or ".bin"
+            copied_path = Path(
+                self._write_figure_asset_bytes(
+                    source_path=source_path,
+                    asset_bytes=original.read_bytes(),
+                    target_name_hint=f"{figure_label}-{original.name}",
+                    suffix=suffix,
+                )
+            )
+            validated = self._validate_local_image_asset(copied_path)
+            validated.update({"asset_kind": "local_copy", "asset_source_url": ""})
+            return validated
+        if target_kind == "remote" and resolved_target.startswith(("http://", "https://")):
+            request = urllib.request.Request(
+                resolved_target,
+                headers={"User-Agent": "paper2bullet/1.0"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.settings.remote_asset_timeout_seconds) as response:
+                    asset_bytes = response.read()
+                    content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].strip()
+            except (urllib.error.URLError, TimeoutError, ValueError, OSError) as error:
+                return {
+                    "asset_status": "external_reference_only",
+                    "asset_kind": asset_kind_hint or "remote_download",
+                    "asset_source_url": resolved_target,
+                    "validation_error": f"remote asset download failed: {error}",
+                }
+            suffix = Path(urllib.parse.urlparse(resolved_target).path).suffix or mimetypes.guess_extension(content_type) or ".bin"
+            downloaded_path = Path(
+                self._write_figure_asset_bytes(
+                    source_path=source_path,
+                    asset_bytes=asset_bytes,
+                    target_name_hint=f"{figure_label}-{Path(urllib.parse.urlparse(resolved_target).path).name or 'remote'}",
+                    suffix=suffix,
+                )
+            )
+            validated = self._validate_local_image_asset(downloaded_path)
+            validated.update(
+                {
+                    "asset_kind": asset_kind_hint or "remote_download",
+                    "asset_source_url": resolved_target,
+                    "mime_type": validated.get("mime_type") or content_type,
+                }
+            )
+            return validated
+        if resolved_target:
+            return {
+                "asset_status": "external_reference_only",
+                "asset_kind": asset_kind_hint or "external_reference",
+                "asset_source_url": resolved_target,
+                "validation_error": "asset could not be materialized locally",
+            }
+        return {
+            "asset_status": "metadata_only",
+            "asset_kind": asset_kind_hint,
+            "validation_error": "no resolvable asset target",
+        }
+
+    def _extract_caption_only_figures_from_sections(self, sections: list[dict]) -> list[dict]:
+        figures = []
+        seen_labels: set[str] = set()
+        pattern = re.compile(r"^\s*(fig(?:ure)?|table)\s*\.?\s*(\d+[A-Za-z]?)\s*[:.\-]?\s*(.+)$", flags=re.I | re.S)
+        inline_pattern = re.compile(r"(fig(?:ure)?|table)\s*\.?\s*(\d+[A-Za-z]?)\s*[:.\-]?\s*", flags=re.I)
+        for section in sections:
+            paragraph = str(section.get("paragraph_text", "")).strip()
+            match = pattern.match(paragraph)
+            extracted_matches = [match] if match else []
+            if not extracted_matches:
+                extracted_matches = list(inline_pattern.finditer(paragraph))
+            for extracted in extracted_matches:
+                prefix = "Figure" if extracted.group(1).lower().startswith("fig") else "Table"
+                label = f"{prefix} {extracted.group(2)}"
+                normalized_label = label.lower()
+                if normalized_label in seen_labels:
+                    continue
+                if hasattr(extracted, "group") and extracted.re is inline_pattern:
+                    raw_caption = paragraph[extracted.end():].strip()
+                    if len(raw_caption) < 20:
+                        continue
+                    raw_caption = raw_caption[:260]
+                    split_match = re.search(r"(?<=[.?!])\s+(?=[A-Z][a-z]+,)", raw_caption)
+                    if split_match and split_match.start() >= 24:
+                        raw_caption = raw_caption[: split_match.start()]
+                    caption = re.sub(r"\s+", " ", raw_caption).strip()
+                else:
+                    caption = re.sub(r"\s+", " ", extracted.group(3)).strip()
+                if len(caption) < 12:
+                    continue
+                seen_labels.add(normalized_label)
+                figures.append(
+                    self._build_figure_record(
+                        figure_label=label,
+                        caption=caption or label,
+                        page_number=section.get("page_number"),
+                        linked_section_ids=[section["id"]],
+                        asset_status="metadata_only",
+                        asset_kind="caption_only",
+                    )
+                )
+        return figures
+
+    def _extract_figures_from_html(self, html_text: str, source_path: Path) -> list[dict]:
+        base_url = self._infer_html_base_url(html_text)
+        if BeautifulSoup is None:
+            figures = []
+            for index, block in enumerate(re.finditer(r"<figure\b.*?>.*?</figure>", html_text, flags=re.I | re.S), start=1):
+                snippet = block.group(0)
+                img_match = re.search(r"<img\b[^>]*src=['\"]([^'\"]+)['\"]", snippet, flags=re.I)
+                if not img_match:
+                    continue
+                figcaption_match = re.search(r"<figcaption\b[^>]*>(.*?)</figcaption>", snippet, flags=re.I | re.S)
+                alt_match = re.search(r"<img\b[^>]*alt=['\"]([^'\"]*)['\"]", snippet, flags=re.I)
+                caption_html = (figcaption_match.group(1) if figcaption_match else "") or (alt_match.group(1) if alt_match else "")
+                caption = re.sub(r"<[^>]+>", " ", caption_html)
+                caption = re.sub(r"\s+", " ", caption).strip() or f"Figure {index}"
+                asset = self._materialize_figure_asset(
+                    source_path=source_path,
+                    raw_target=img_match.group(1),
+                    figure_label=f"Figure {index}",
+                    base_url=base_url,
+                    asset_kind_hint="html_image",
+                )
+                figures.append(
+                    self._build_figure_record(
+                        figure_label=f"Figure {index}",
+                        caption=caption,
+                        linked_section_ids=[],
+                        **asset,
+                    )
+                )
+            return figures
+        figures = []
+        soup = BeautifulSoup(html_text, "html.parser")
+        image_index = 0
+        for image in soup.find_all("img"):
+            parent_figure = image.find_parent("figure")
+            metadata_blob = " ".join(
+                [
+                    " ".join(parent_figure.get("class", [])) if parent_figure else "",
+                    str(parent_figure.get("id", "")) if parent_figure else "",
+                    str(image.get("alt", "")),
+                    str(image.get("title", "")),
+                    str(image.get("src", "")),
+                    str(image.get("srcset", "")),
+                ]
+            ).lower()
+            if not parent_figure and not any(token in metadata_blob for token in ["fig", "figure"]):
+                continue
+            image_index += 1
+            raw_target = self._pick_best_src_candidate(image.get("src", ""), image.get("srcset", ""))
+            if not raw_target:
+                continue
+            caption_text = ""
+            label = f"Figure {image_index}"
+            if parent_figure:
+                caption_node = parent_figure.find("figcaption")
+                if caption_node:
+                    caption_text = caption_node.get_text(" ", strip=True)
+                    label_match = re.search(r"(fig(?:ure)?\.?\s*\d+[A-Za-z]?)", caption_text, flags=re.I)
+                    if label_match:
+                        normalized = re.sub(r"\s+", " ", label_match.group(1)).replace("Fig.", "Figure").replace("Fig", "Figure")
+                        label = normalized.strip().rstrip(".")
+            caption = caption_text or str(image.get("alt", "")).strip() or str(image.get("title", "")).strip() or label
+            caption = re.sub(r"^\s*fig(?:ure)?\.?\s*\d+[A-Za-z]?\s*[:.\-]?\s*", "", caption, flags=re.I).strip() or label
+            asset = self._materialize_figure_asset(
+                source_path=source_path,
+                raw_target=raw_target,
+                figure_label=label,
+                base_url=base_url,
+                asset_kind_hint="html_image",
+            )
+            figures.append(
+                self._build_figure_record(
+                    figure_label=label,
+                    caption=caption,
+                    linked_section_ids=[],
+                    **asset,
+                )
+            )
+        return figures
+
+    def _dedupe_figures(self, figures: list[dict]) -> list[dict]:
+        deduped: list[dict] = []
+        by_key: dict[tuple[str, str], dict] = {}
+        for figure in figures:
+            label = str(figure.get("figure_label", "")).strip()
+            caption = str(figure.get("caption", "")).strip()
+            key = (
+                re.sub(r"\s+", " ", label).lower(),
+                re.sub(r"\s+", " ", caption).lower(),
+            )
+            existing = by_key.get(key)
+            if not existing:
+                figure["linked_section_ids"] = list(dict.fromkeys(figure.get("linked_section_ids", [])))
+                deduped.append(figure)
+                by_key[key] = figure
+                continue
+            existing_rank = {"validated_local_asset": 3, "external_reference_only": 2, "metadata_only": 1}.get(
+                existing.get("asset_status", "metadata_only"),
+                0,
+            )
+            new_rank = {"validated_local_asset": 3, "external_reference_only": 2, "metadata_only": 1}.get(
+                figure.get("asset_status", "metadata_only"),
+                0,
+            )
+            if new_rank > existing_rank:
+                for field_name in [
+                    "storage_path",
+                    "asset_status",
+                    "asset_kind",
+                    "asset_local_path",
+                    "asset_source_url",
+                    "mime_type",
+                    "byte_size",
+                    "sha256",
+                    "width",
+                    "height",
+                    "validation_error",
+                    "page_number",
+                ]:
+                    existing[field_name] = figure.get(field_name, existing.get(field_name))
+            existing["linked_section_ids"] = list(
+                dict.fromkeys((existing.get("linked_section_ids", []) or []) + (figure.get("linked_section_ids", []) or []))
+            )
+        return deduped
+
+    def _link_figures_to_sections(self, figures: list[dict], sections: list[dict]) -> list[dict]:
+        for figure in figures:
+            linked_ids = list(dict.fromkeys(figure.get("linked_section_ids", []) or []))
+            label = str(figure.get("figure_label", "")).strip()
+            caption = str(figure.get("caption", "")).strip()
+            caption_excerpt = caption[:120]
+            label_variants = {
+                label.lower(),
+                label.lower().replace("figure", "fig."),
+                label.lower().replace("figure", "fig"),
+                label.lower().replace(" ", ""),
+            }
+            for section in sections:
+                paragraph = str(section.get("paragraph_text", "")).strip().lower()
+                if not paragraph:
+                    continue
+                if any(variant and variant in paragraph for variant in label_variants):
+                    linked_ids.append(section["id"])
+                    continue
+                if caption_excerpt and caption_excerpt.lower() in paragraph:
+                    linked_ids.append(section["id"])
+            figure["linked_section_ids"] = list(dict.fromkeys(linked_ids))
+        return figures
+
     def _extract_figures_from_markdown(self, markdown_text: str, source_path: Path) -> list[dict]:
         figures = []
         for index, match in enumerate(re.finditer(r"!\[([^\]]*)\]\(([^)]+)\)", markdown_text), start=1):
             caption = match.group(1).strip() or Path(match.group(2).strip()).name or f"Figure {index}"
             target = match.group(2).strip()
-            storage_path = ""
-            candidate_path = (source_path.parent / target).resolve()
-            if target and not target.startswith(("http://", "https://", "data:")) and candidate_path.exists():
-                storage_path = str(candidate_path)
-            figures.append(
-                {
-                    "id": new_id("figure"),
-                    "figure_label": f"Figure {index}",
-                    "caption": caption,
-                    "storage_path": storage_path,
-                    "linked_section_ids": [],
-                }
+            asset = self._materialize_figure_asset(
+                source_path=source_path,
+                raw_target=target,
+                figure_label=f"Figure {index}",
+                asset_kind_hint="markdown_image",
             )
+            figures.append(
+                self._build_figure_record(
+                    figure_label=f"Figure {index}",
+                    caption=caption,
+                    linked_section_ids=[],
+                    **asset,
+                )
+            )
+        return figures
+
+    def _extract_pdf_image_assets(self, source_path: Path) -> list[dict[str, Any]]:
+        if fitz is None:
+            return []
+        try:
+            document = fitz.open(source_path)
+        except Exception:
+            return []
+        assets: list[dict[str, Any]] = []
+        seen_xrefs: set[tuple[int, int]] = set()
+        try:
+            for page_index in range(document.page_count):
+                page = document.load_page(page_index)
+                for image_index, image_info in enumerate(page.get_images(full=True), start=1):
+                    xref = int(image_info[0] or 0)
+                    if xref <= 0 or (page_index, xref) in seen_xrefs:
+                        continue
+                    seen_xrefs.add((page_index, xref))
+                    try:
+                        extracted = document.extract_image(xref)
+                    except Exception:
+                        continue
+                    image_bytes = extracted.get("image")
+                    if not image_bytes:
+                        continue
+                    ext = str(extracted.get("ext") or "bin").strip().lower() or "bin"
+                    asset_path = Path(
+                        self._write_figure_asset_bytes(
+                            source_path=source_path,
+                            asset_bytes=image_bytes,
+                            target_name_hint=f"pdf-page-{page_index + 1}-image-{image_index}",
+                            suffix=f".{ext}",
+                        )
+                    )
+                    validated = self._validate_local_image_asset(asset_path)
+                    validated.update(
+                        {
+                            "asset_kind": "pdf_embedded",
+                            "asset_source_url": f"pdf://{source_path.name}#page={page_index + 1}&xref={xref}",
+                            "page_number": page_index + 1,
+                        }
+                    )
+                    assets.append(validated)
+        finally:
+            document.close()
+        return assets
+
+    def _attach_pdf_assets_to_figures(self, figures: list[dict], source_path: Path) -> list[dict]:
+        assets = self._extract_pdf_image_assets(source_path)
+        if not assets:
+            return figures
+        assets_by_page: dict[int, list[dict[str, Any]]] = {}
+        for asset in assets:
+            page_number = int(asset.get("page_number") or 0)
+            if page_number > 0:
+                assets_by_page.setdefault(page_number, []).append(asset)
+        unused_assets = list(assets)
+        for figure in figures:
+            if figure.get("asset_status") == "validated_local_asset":
+                continue
+            selected_asset = None
+            page_number = int(figure.get("page_number") or 0)
+            if page_number > 0:
+                page_assets = assets_by_page.get(page_number, [])
+                if page_assets:
+                    selected_asset = page_assets.pop(0)
+            if selected_asset is None and unused_assets:
+                selected_asset = unused_assets.pop(0)
+            elif selected_asset in unused_assets:
+                unused_assets.remove(selected_asset)
+            if not selected_asset:
+                continue
+            for field_name in [
+                "asset_status",
+                "asset_kind",
+                "asset_local_path",
+                "asset_source_url",
+                "mime_type",
+                "byte_size",
+                "sha256",
+                "width",
+                "height",
+                "validation_error",
+            ]:
+                figure[field_name] = selected_asset.get(field_name, figure.get(field_name))
+            figure["storage_path"] = figure.get("asset_local_path") or figure.get("asset_source_url", "")
         return figures
 
     def _parse_pdf_with_markitdown(self, source_path: Path) -> Optional[dict]:
@@ -1918,11 +3736,13 @@ class PdfParser:
             }
             for index, paragraph in enumerate(paragraphs, start=1)
         ]
-        figures = self._extract_figures_from_markdown(markdown_text, source_path)
-        if sections:
-            linked_ids = [section["id"] for section in sections]
-            for figure in figures:
-                figure["linked_section_ids"] = linked_ids
+        sections = enrich_sections_with_structure(sections, "pdf_markitdown")
+        figures = self._dedupe_figures(
+            self._extract_figures_from_markdown(markdown_text, source_path)
+            + self._extract_caption_only_figures_from_sections(sections)
+        )
+        figures = self._link_figures_to_sections(figures, sections)
+        figures = self._attach_pdf_assets_to_figures(figures, source_path)
         return {"sections": sections, "figures": figures, "artifact_type": "pdf"}
 
     def _is_probably_readable_pdf_fragment(self, text: str) -> bool:
@@ -2007,10 +3827,14 @@ class PdfParser:
                         "embedding": embedding_for_text(paragraph),
                     }
                 )
-        return {"sections": sections, "figures": [], "artifact_type": "pdf"}
+        sections = enrich_sections_with_structure(sections, "pdf_fallback")
+        figures = self._link_figures_to_sections(self._extract_caption_only_figures_from_sections(sections), sections)
+        figures = self._attach_pdf_assets_to_figures(figures, source_path)
+        return {"sections": sections, "figures": figures, "artifact_type": "pdf"}
 
     def _parse_html(self, source_path: Path) -> dict:
         text = source_path.read_text(encoding="utf-8", errors="ignore")
+        figures = self._extract_figures_from_html(text, source_path)
         text = re.sub(r"<script.*?</script>", " ", text, flags=re.S | re.I)
         text = re.sub(r"<style.*?</style>", " ", text, flags=re.S | re.I)
         text = re.sub(r"<[^>]+>", " ", text)
@@ -2027,10 +3851,47 @@ class PdfParser:
             for index, paragraph in enumerate(paragraphs, start=1)
         ]
         if not sections:
+            sections = [
+                {
+                    "id": new_id("section"),
+                    "section_order": index,
+                    "section_title": "HTML Figure Caption",
+                    "paragraph_text": figure.get("caption", "") or figure.get("figure_label", "Figure"),
+                    "page_number": None,
+                    "embedding": embedding_for_text(figure.get("caption", "") or figure.get("figure_label", "Figure")),
+                }
+                for index, figure in enumerate(figures, start=1)
+                if str(figure.get("caption", "") or figure.get("figure_label", "")).strip()
+            ]
+        if not sections:
             raise ParseFailure("parse_failed", f"Could not extract readable HTML text from {source_path.name}")
-        return {"sections": sections, "figures": [], "artifact_type": "html"}
+        sections = enrich_sections_with_structure(sections, "html")
+        figures = self._dedupe_figures(figures + self._extract_caption_only_figures_from_sections(sections))
+        figures = self._link_figures_to_sections(figures, sections)
+        return {"sections": sections, "figures": figures, "artifact_type": "html"}
 
     def _extract_pdf_pages(self, source_path: Path) -> list[str]:
+        if fitz is not None:
+            try:
+                document = fitz.open(source_path)
+            except Exception:
+                document = None
+            if document is not None:
+                try:
+                    pages = []
+                    for page_index in range(document.page_count):
+                        page = document.load_page(page_index)
+                        page_text = page.get_text("text")
+                        page_text = re.sub(r"\s+\n", "\n", page_text)
+                        page_text = re.sub(r"\n{3,}", "\n\n", page_text).strip()
+                        if page_text:
+                            pages.append(page_text)
+                    if pages:
+                        combined = "\n\n".join(pages)
+                        self._validate_pdf_text(combined, source_path)
+                        return pages
+                finally:
+                    document.close()
         raw_text = source_path.read_bytes().decode("latin-1", errors="ignore")
         fragments = []
 
@@ -2073,7 +3934,7 @@ class PaperPipeline:
         destination_base = self.settings.artifacts_dir / paper["id"]
         temporary_path = destination_base.with_suffix(".download")
         try:
-            with urllib.request.urlopen(asset_url, timeout=15) as response, temporary_path.open("wb") as handle:
+            with urllib.request.urlopen(asset_url, timeout=self.settings.remote_asset_timeout_seconds) as response, temporary_path.open("wb") as handle:
                 shutil.copyfileobj(response, handle)
             suffix = self._infer_downloaded_asset_suffix(temporary_path, parsed.path)
             destination = destination_base.with_suffix(suffix)
@@ -2114,10 +3975,10 @@ class PaperPipeline:
         try:
             parsed = self.parser.parse(paper)
         except ParseFailure as error:
-            self.repository.replace_sections(paper["id"], [])
-            self.repository.replace_figures(paper["id"], [])
-            self.repository.update_paper(
-                paper["id"],
+            self.repository.persist_parse_result(
+                paper_id=paper["id"],
+                sections=[],
+                figures=[],
                 parse_status=error.status,
                 ingestion_status="parse_failed",
                 parse_failure_reason=error.reason,
@@ -2127,10 +3988,10 @@ class PaperPipeline:
             return 0
         parsed_snapshot_path = self.settings.parsed_dir / f"{paper['id']}.json"
         parsed_snapshot_path.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.repository.replace_sections(paper["id"], parsed["sections"])
-        self.repository.replace_figures(paper["id"], parsed["figures"])
-        self.repository.update_paper(
-            paper["id"],
+        self.repository.persist_parse_result(
+            paper_id=paper["id"],
+            sections=parsed["sections"],
+            figures=parsed["figures"],
             parse_status="parsed",
             ingestion_status="ready",
             parse_failure_reason="",
@@ -2151,7 +4012,7 @@ class PaperPipeline:
             )
             return 0
         try:
-            generation_output = self.generate_outputs_for_sections(sections, topic, paper)
+            generation_output = self.generate_outputs_for_sections(sections, topic, paper, run_id=run_id)
         except LLMGenerationError as error:
             self.repository.replace_generation_outputs_for_paper_topic(paper["id"], topic["id"], run_id, [], [])
             self.repository.update_paper(
@@ -2190,32 +4051,724 @@ class PaperPipeline:
         )
         return len(cards)
 
-    def generate_outputs_for_sections(self, sections: list[dict], topic: dict, paper: dict) -> dict:
-        return self._build_cards_with_llm(sections, topic, paper)
+    def generate_outputs_for_sections(self, sections: list[dict], topic: dict, paper: dict, run_id: str = "") -> dict:
+        return self._build_cards_with_llm(sections, topic, paper, run_id=run_id)
 
-    def _build_cards_with_llm(self, sections: list[dict], topic: dict, paper: dict) -> dict:
+    def _build_paper_understanding(
+        self,
+        *,
+        sections: list[dict],
+        figures: list[dict],
+        topic_name: str,
+        paper_title: str,
+    ) -> dict[str, Any]:
+        packet = self._build_evidence_packet(sections, figures, topic_name)
+        body_candidates = [item for item in sections if item.get("is_body")]
+        body_candidates.sort(key=lambda item: float(item.get("selection_score", 0.0)), reverse=True)
+        if not body_candidates:
+            body_candidates = sorted(sections, key=lambda item: float(item.get("selection_score", 0.0)), reverse=True)
+        understanding_sections = body_candidates[:28]
+        intro_context = [item for item in sections if item.get("body_role") == "introduction"][:6]
+        abstract_context = [item for item in sections if item.get("is_abstract")][:4]
+        merged_sections = []
+        seen_ids: set[str] = set()
+        for section in intro_context + abstract_context + understanding_sections:
+            if section["id"] in seen_ids:
+                continue
+            merged_sections.append(section)
+            seen_ids.add(section["id"])
+        if self.card_engine.is_enabled() and hasattr(self.card_engine, "build_paper_understanding"):
+            try:
+                llm_understanding = self.card_engine.build_paper_understanding(
+                    topic_name=topic_name,
+                    paper_title=paper_title,
+                    sections=merged_sections,
+                    figures=figures,
+                )
+                if llm_understanding and llm_understanding.get("global_contribution_objects"):
+                    llm_understanding["version"] = "understanding-v2-llm"
+                    llm_understanding["topic_name"] = topic_name
+                    llm_understanding["paper_title"] = paper_title
+                    llm_understanding["selection_overview"] = self._build_selection_overview(packet["selection_diagnostics"])
+                    for item in llm_understanding["global_contribution_objects"]:
+                        item["label"] = self._normalize_object_label(item.get("label", ""), merged_sections, item.get("evidence_section_ids", []))
+                    return llm_understanding
+            except Exception:
+                pass
+        objects = []
+        for index, section in enumerate(body_candidates[:5], start=1):
+            object_id = f"obj_{index}"
+            role = str(section.get("body_role", "")).lower()
+            if index == 1:
+                level_hint = "overall"
+            elif role in {"methods", "discussion", "introduction"}:
+                level_hint = "local"
+            else:
+                level_hint = "detail"
+            linked_figures = [
+                figure["id"]
+                for figure in figures
+                if section["id"] in set(figure.get("linked_section_ids", []))
+            ]
+            objects.append(
+                {
+                    "id": object_id,
+                    "label": self._normalize_object_label(
+                        section.get("section_label") or section.get("section_title") or section.get("paragraph_text", "")[:80],
+                        sections,
+                        [section["id"]],
+                    ),
+                    "object_type": section.get("section_kind", "other"),
+                    "level_hint": level_hint,
+                    "evidence_section_ids": [section["id"]],
+                    "evidence_figure_ids": linked_figures,
+                    "summary": section.get("paragraph_text", "")[:220],
+                    "importance_score": round(float(section.get("selection_score", 0.0)), 4),
+                }
+            )
+        if not objects:
+            return {
+                "version": "understanding-v1",
+                "topic_name": topic_name,
+                "paper_title": paper_title,
+                "global_contribution_objects": [],
+                "contribution_graph": [],
+                "evidence_index": {},
+                "candidate_level_hints": {},
+                "selection_overview": self._build_selection_overview(packet["selection_diagnostics"]),
+            }
+        graph = []
+        for item in objects[1:]:
+            graph.append({"from": objects[0]["id"], "to": item["id"], "relation": "supports"})
+        evidence_index = {
+            item["id"]: {
+                "section_ids": item["evidence_section_ids"],
+                "figure_ids": item["evidence_figure_ids"],
+            }
+            for item in objects
+        }
+        level_hints = {item["id"]: item["level_hint"] for item in objects}
+        return {
+            "version": "understanding-v1",
+            "topic_name": topic_name,
+            "paper_title": paper_title,
+            "global_contribution_objects": objects,
+            "contribution_graph": graph,
+            "evidence_index": evidence_index,
+            "candidate_level_hints": level_hints,
+            "selection_overview": self._build_selection_overview(packet["selection_diagnostics"]),
+        }
+
+    def _build_card_plan(
+        self,
+        *,
+        understanding: dict[str, Any],
+        topic_name: str,
+    ) -> dict[str, Any]:
+        if self.card_engine.is_enabled() and hasattr(self.card_engine, "build_card_plan"):
+            try:
+                active_calibration_set = self.repository.get_active_calibration_set()
+                llm_plan = self.card_engine.build_card_plan(
+                    topic_name=topic_name,
+                    paper_title=understanding.get("paper_title", ""),
+                    understanding=understanding,
+                    max_cards=3,
+                    calibration_examples=(active_calibration_set or {}).get("examples", []),
+                    calibration_set_name=(active_calibration_set or {}).get("name", ""),
+                )
+                if llm_plan and llm_plan.get("planned_cards"):
+                    llm_plan["version"] = CARD_PLAN_PROMPT_VERSION
+                    llm_plan["topic_name"] = topic_name
+                    return llm_plan
+            except Exception:
+                pass
+        objects = list(understanding.get("global_contribution_objects", []))
+        objects.sort(key=lambda item: float(item.get("importance_score", 0.0)), reverse=True)
+        planned_cards = []
+        for obj in objects:
+            evidence_ids = list((understanding.get("evidence_index", {}).get(obj["id"], {}) or {}).get("section_ids", []))
+            level = str((understanding.get("candidate_level_hints", {}) or {}).get(obj["id"], obj.get("level_hint", "detail"))).strip().lower()
+            if level not in {"overall", "local", "detail"}:
+                level = "detail"
+            disposition = "produce" if evidence_ids else "exclude"
+            planned_cards.append(
+                {
+                    "plan_id": f"plan_{obj['id']}",
+                    "level": level,
+                    "target_object_id": obj["id"],
+                    "target_object_label": obj.get("label", ""),
+                    "why_valuable_for_course": f"{topic_name} 课程中可讲的对象：{obj.get('label', '')}",
+                    "must_have_evidence_ids": evidence_ids[:2],
+                    "optional_supporting_ids": evidence_ids[2:4],
+                    "disposition": disposition,
+                    "disposition_reason": "" if disposition == "produce" else "Missing evidence anchor.",
+                }
+            )
+        return {
+            "version": "card-plan-v1",
+            "topic_name": topic_name,
+            "planned_cards": planned_cards,
+            "coverage_report": {
+                "produce": sum(1 for item in planned_cards if item["disposition"] == "produce"),
+                "exclude": sum(1 for item in planned_cards if item["disposition"] != "produce"),
+                "overall": sum(1 for item in planned_cards if item["level"] == "overall"),
+                "local": sum(1 for item in planned_cards if item["level"] == "local"),
+                "detail": sum(1 for item in planned_cards if item["level"] == "detail"),
+            },
+        }
+
+    def _build_selection_overview(self, diagnostics_by_section_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        ranked = sorted(
+            diagnostics_by_section_id.items(),
+            key=lambda item: float((item[1] or {}).get("score", 0.0)),
+            reverse=True,
+        )
+        top_sections = []
+        for section_id, item in ranked[:20]:
+            top_sections.append(
+                {
+                    "section_id": section_id,
+                    "score": round(float((item or {}).get("score", 0.0)), 4),
+                    "section_kind": (item or {}).get("section_kind", "other"),
+                    "body_role": (item or {}).get("body_role", ""),
+                    "matched_topic_tokens": (item or {}).get("matched_topic_tokens", []),
+                }
+            )
+        return {
+            "total_scored_sections": len(diagnostics_by_section_id),
+            "top_sections": top_sections,
+        }
+
+    def _normalize_object_label(self, label: str, sections: list[dict], evidence_section_ids: list[str]) -> str:
+        candidate = str(label or "").strip()
+        if candidate and candidate.lower() not in {"markdown extraction", "html snapshot"} and not re.fullmatch(r"page\s+\d+", candidate.lower()):
+            return candidate
+        section_map = {section["id"]: section for section in sections}
+        for section_id in evidence_section_ids:
+            section = section_map.get(section_id)
+            if not section:
+                continue
+            text = str(section.get("paragraph_text", "")).strip()
+            if not text:
+                continue
+            snippet = re.split(r"[.;:!?]", text)[0].strip()
+            snippet = re.sub(r"\s+", " ", snippet)
+            if len(snippet) > 96:
+                snippet = snippet[:96].rstrip() + "..."
+            if snippet:
+                return snippet
+        return candidate or "Unnamed contribution object"
+
+    def _assemble_plan_driven_packet(
+        self,
+        *,
+        sections: list[dict],
+        figures: list[dict],
+        topic_name: str,
+        card_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        base_packet = self._build_evidence_packet(sections, figures, topic_name)
+        section_map = {section["id"]: section for section in sections}
+        figure_map = {figure["id"]: figure for figure in figures}
+        planned_ids = []
+        planned_figure_ids = []
+        for item in card_plan.get("planned_cards", []):
+            if item.get("disposition") != "produce":
+                continue
+            for section_id in item.get("must_have_evidence_ids", []) + item.get("optional_supporting_ids", []):
+                if section_id in section_map and section_id not in planned_ids:
+                    planned_ids.append(section_id)
+            for figure_id in item.get("must_have_figure_ids", []) + item.get("optional_supporting_figure_ids", []):
+                if figure_id in figure_map and figure_id not in planned_figure_ids:
+                    planned_figure_ids.append(figure_id)
+        if not planned_ids:
+            if planned_figure_ids:
+                base_packet["figure_candidates"] = [figure_map[figure_id] for figure_id in planned_figure_ids]
+            return base_packet
+        planned_sections = [section_map[section_id] for section_id in planned_ids]
+        for section in planned_sections:
+            section["role_hint"] = "primary"
+        context_sections = [item for item in sections if item.get("is_abstract")][:2]
+        prompt_sections = context_sections + [item for item in planned_sections if item["id"] not in {ctx["id"] for ctx in context_sections}]
+        selected_ids = {item["id"] for item in prompt_sections}
+        figure_candidates = [
+            figure for figure in figures
+            if set(figure.get("linked_section_ids", [])).intersection(selected_ids)
+        ]
+        for figure_id in planned_figure_ids:
+            figure = figure_map.get(figure_id)
+            if figure and figure not in figure_candidates:
+                figure_candidates.append(figure)
+        if not figure_candidates:
+            figure_candidates = [figure_map[figure_id] for figure_id in planned_figure_ids] or figures[:4]
+        base_packet["prompt_sections"] = prompt_sections
+        base_packet["figure_candidates"] = figure_candidates
+        return base_packet
+
+    def _recover_candidates_with_expanded_context(
+        self,
+        *,
+        topic_name: str,
+        paper_title: str,
+        sections: list[dict],
+        figures: list[dict],
+        calibration_examples: list[dict],
+        calibration_set_name: str,
+    ) -> dict[str, Any]:
+        body_sections = [section for section in sections if section.get("is_body")]
+        body_sections.sort(key=lambda item: float(item.get("selection_score", 0.0)), reverse=True)
+        expanded_sections = (body_sections[:10] or sections[:10]) + [item for item in sections if item.get("is_abstract")][:2]
+        deduped = []
+        seen: set[str] = set()
+        for section in expanded_sections:
+            if section["id"] in seen:
+                continue
+            deduped.append(section)
+            seen.add(section["id"])
+        return self.card_engine.extract_candidates(
+            topic_name=topic_name,
+            paper_title=paper_title,
+            sections=deduped,
+            figures=figures,
+            calibration_examples=calibration_examples,
+            calibration_set_name=calibration_set_name,
+        )
+
+    def _align_cards_to_plan(self, cards: list[dict], card_plan: dict[str, Any]) -> tuple[list[dict], list[dict]]:
+        planned_produce = [item for item in card_plan.get("planned_cards", []) if item.get("disposition") == "produce"]
+        if not planned_produce:
+            kept: list[dict] = []
+            excluded: list[dict] = []
+            for card in cards:
+                color = (card.get("judgement") or {}).get("color", "yellow")
+                if color == "red":
+                    excluded.append(
+                        {
+                            "label": card.get("title", "未命中计划的候选"),
+                            "exclusion_type": "other",
+                            "reason": "Card plan produced zero slots and this card was already judged red.",
+                            "section_ids": card.get("primary_section_ids", []) or [item.get("section_id") for item in card.get("evidence", []) if item.get("section_id")],
+                        }
+                    )
+                    continue
+                granularity = str(card.get("granularity_level", "")).strip().lower()
+                fallback_level = {"framework": "overall", "subpattern": "local", "detail": "detail"}.get(granularity, granularity)
+                card["planned_level"] = fallback_level
+                card["plan_id"] = "fallback_no_plan"
+                card["plan_target_object_id"] = ""
+                card["plan_target_object_label"] = "Fallback from judged cards because planner produced zero slots."
+                kept.append(card)
+            return kept, excluded
+        remaining = sorted(
+            cards,
+            key=lambda item: (
+                {"green": 3, "yellow": 2, "red": 1}.get((item.get("judgement") or {}).get("color", "yellow"), 2),
+                {"strong": 3, "medium": 2, "weak": 1}.get(item.get("evidence_level", "medium"), 2),
+                len(item.get("primary_section_ids", [])),
+            ),
+            reverse=True,
+        )
+        kept: list[dict] = []
+        used_ids: set[str] = set()
+        for plan_item in planned_produce:
+            must_have = set(plan_item.get("must_have_evidence_ids", []))
+            must_have_figures = set(plan_item.get("must_have_figure_ids", []))
+            best_card = None
+            best_score = -1.0
+            for card in remaining:
+                if card.get("title") in used_ids:
+                    continue
+                card_primary = set(
+                    card.get("primary_section_ids")
+                    or [item.get("section_id") for item in card.get("evidence", []) if item.get("section_id")]
+                )
+                card_figures = set(card.get("figure_ids", []))
+                overlap = len(must_have.intersection(card_primary))
+                figure_overlap = len(must_have_figures.intersection(card_figures))
+                if must_have and overlap == 0 and not (must_have_figures and figure_overlap > 0):
+                    continue
+                if must_have_figures and figure_overlap == 0 and not must_have:
+                    continue
+                score = overlap * 10
+                score += figure_overlap * 8
+                score += {"green": 3, "yellow": 2, "red": 1}.get((card.get("judgement") or {}).get("color", "yellow"), 2)
+                score += {"strong": 3, "medium": 2, "weak": 1}.get(card.get("evidence_level", "medium"), 2)
+                if score > best_score:
+                    best_score = score
+                    best_card = card
+            if best_card:
+                if must_have_figures and not best_card.get("figure_ids"):
+                    best_card["figure_ids"] = list(sorted(must_have_figures))
+                best_card["planned_level"] = plan_item.get("level", "")
+                best_card["plan_id"] = plan_item.get("plan_id", "")
+                best_card["plan_target_object_id"] = plan_item.get("target_object_id", "")
+                best_card["plan_target_object_label"] = plan_item.get("target_object_label", "")
+                kept.append(best_card)
+                used_ids.add(best_card.get("title", ""))
+        excluded = []
+        for card in remaining:
+            if card.get("title", "") in used_ids:
+                continue
+            excluded.append(
+                {
+                    "label": card.get("title", "计划外候选"),
+                    "exclusion_type": "replaced_by_stronger_card",
+                    "reason": "Card plan alignment selected stronger matches for planned objects.",
+                    "section_ids": card.get("primary_section_ids", []) or [item.get("section_id") for item in card.get("evidence", []) if item.get("section_id")],
+                }
+            )
+        return kept, excluded
+
+    def _build_evidence_packet(self, sections: list[dict], figures: list[dict], topic_name: str) -> dict[str, Any]:
+        topic_tokens = {
+            token
+            for token in re.findall(r"[a-z0-9]+", topic_name.lower())
+            if len(token) >= 3
+        }
+        diagnostics_by_section_id: dict[str, dict[str, Any]] = {}
+        scored_sections = []
+        for section in sections:
+            if not section.get("section_kind"):
+                section.update(
+                    classify_section_metadata(
+                        section_title=section.get("section_title", ""),
+                        paragraph_text=section.get("paragraph_text", ""),
+                        section_order=int(section.get("section_order", 0) or 0),
+                        total_sections=len(sections),
+                        source_format=section.get("source_format", "legacy"),
+                    )
+                )
+            text = str(section.get("paragraph_text", "")).lower()
+            title = str(section.get("section_title", "")).lower()
+            matched_tokens = sorted(token for token in topic_tokens if token in text or token in title)
+            topic_relevance = min(1.0, len(matched_tokens) / max(len(topic_tokens), 1))
+            body_weight = 1.0 if section.get("is_body") else (0.45 if section.get("is_abstract") else 0.2)
+            role_weight = {
+                "results": 1.0,
+                "methods": 0.92,
+                "discussion": 0.82,
+                "conclusion": 0.7,
+                "introduction": 0.65,
+            }.get(str(section.get("body_role", "")).lower(), 0.45)
+            evidence_density = min(1.0, len(text) / 900.0)
+            figure_bonus = 0.2 if section.get("has_figure_reference") else 0.0
+            mechanism_bonus = 0.2 if re.search(r"\b(model|method|mechanism|framework|result|failure|ablation)\b", text) else 0.0
+            novelty_bonus = 0.15 if re.search(r"\b(we propose|we introduce|novel|first|outperform)\b", text) else 0.0
+            score = round(
+                (0.32 * topic_relevance)
+                + (0.24 * body_weight)
+                + (0.16 * role_weight)
+                + (0.14 * evidence_density)
+                + figure_bonus
+                + mechanism_bonus
+                + novelty_bonus,
+                6,
+            )
+            reason = {
+                "score": score,
+                "topic_relevance": round(topic_relevance, 4),
+                "body_weight": round(body_weight, 4),
+                "role_weight": round(role_weight, 4),
+                "evidence_density": round(evidence_density, 4),
+                "figure_bonus": round(figure_bonus, 4),
+                "mechanism_bonus": round(mechanism_bonus, 4),
+                "novelty_bonus": round(novelty_bonus, 4),
+                "matched_topic_tokens": matched_tokens,
+                "section_kind": section.get("section_kind", "other"),
+                "body_role": section.get("body_role", ""),
+            }
+            section["selection_score"] = score
+            section["selection_reason"] = reason
+            diagnostics_by_section_id[section["id"]] = reason
+            scored_sections.append(section)
+
+        scored_sections.sort(
+            key=lambda item: (
+                float(item.get("selection_score", 0.0)),
+                int(item.get("is_body", False)),
+                -1 * int(item.get("section_order", 0)),
+            ),
+            reverse=True,
+        )
+
+        primary_candidate_sections = [item for item in scored_sections if item.get("is_body")][:6]
+        if not primary_candidate_sections:
+            primary_candidate_sections = [item for item in scored_sections if item.get("is_abstract")][:2]
+        context_sections = [item for item in sections if item.get("is_abstract") or item.get("body_role") == "introduction"][:3]
+        supporting_sections = [
+            item for item in scored_sections
+            if item["id"] not in {s["id"] for s in primary_candidate_sections}
+        ][:4]
+
+        selected_ids: list[str] = []
+        prompt_sections: list[dict] = []
+        for group_name, group in (
+            ("context", context_sections),
+            ("primary", primary_candidate_sections),
+            ("supporting", supporting_sections),
+        ):
+            for section in group:
+                if section["id"] in selected_ids:
+                    continue
+                selected_ids.append(section["id"])
+                section["role_hint"] = group_name
+                prompt_sections.append(section)
+
+        selected_id_set = set(selected_ids)
+        scored_figures: list[tuple[float, dict[str, Any]]] = []
+        for figure in figures:
+            linked_ids = set(figure.get("linked_section_ids", []))
+            caption = str(figure.get("caption", "")).lower()
+            matched_tokens = [token for token in topic_tokens if token in caption]
+            score = (3.0 * len(linked_ids.intersection(selected_id_set))) + len(matched_tokens)
+            asset_status = str(figure.get("asset_status", "")).strip()
+            if asset_status == "validated_local_asset":
+                score += 1.0
+            elif asset_status == "external_reference_only":
+                score += 0.25
+            if caption:
+                score += 0.25
+            if score > 0:
+                scored_figures.append((score, figure))
+        if not scored_figures:
+            scored_figures = [
+                (
+                    len([token for token in topic_tokens if token in str(figure.get("caption", "")).lower()])
+                    + (1.0 if figure.get("asset_status", "") == "validated_local_asset" else 0.25 if figure.get("asset_status", "") == "external_reference_only" else 0.0),
+                    figure,
+                )
+                for figure in figures[:4]
+            ]
+        scored_figures.sort(key=lambda item: item[0], reverse=True)
+        figure_candidates = [item[1] for item in scored_figures[:4]]
+
+        return {
+            "context_sections": context_sections,
+            "primary_candidate_sections": primary_candidate_sections,
+            "supporting_sections": supporting_sections,
+            "prompt_sections": prompt_sections,
+            "figure_candidates": figure_candidates,
+            "selection_diagnostics": diagnostics_by_section_id,
+        }
+
+    def _gate_extracted_candidates(
+        self,
+        extracted_cards: list[dict],
+        sections: list[dict],
+    ) -> tuple[list[dict], list[dict]]:
+        section_map = {section["id"]: section for section in sections}
+        body_exists = any(section.get("is_body") for section in sections)
+        kept: list[dict] = []
+        excluded: list[dict] = []
+        for candidate in extracted_cards:
+            primary_ids = list(candidate.get("primary_section_ids") or [])
+            if not primary_ids:
+                primary_ids = [item["section_id"] for item in candidate.get("evidence", [])[:1]]
+            supporting_ids = list(candidate.get("supporting_section_ids") or [])
+            evidence_ids = primary_ids + [sid for sid in supporting_ids if sid not in primary_ids]
+            primary_sections = [section_map[sid] for sid in primary_ids if sid in section_map]
+            evidence_sections = [section_map[sid] for sid in evidence_ids if sid in section_map]
+            fail_reasons: list[str] = []
+            if not str(candidate.get("paper_specific_object", "")).strip():
+                # Backward-compatible fallback for old extraction contract.
+                candidate["paper_specific_object"] = str(candidate.get("title", "")).strip()
+            if not str(candidate.get("paper_specific_object", "")).strip():
+                fail_reasons.append("paper_specific_object_missing_gate")
+            if body_exists and primary_sections and all(section.get("is_abstract") for section in primary_sections):
+                fail_reasons.append("abstract_dominant_evidence_gate")
+            if body_exists and primary_sections and all(section.get("is_front_matter") for section in primary_sections):
+                fail_reasons.append("front_matter_primary_evidence_gate")
+            if body_exists and evidence_sections and not any(section.get("is_body") for section in evidence_sections):
+                fail_reasons.append("weak_body_grounding_gate")
+
+            if fail_reasons:
+                excluded.append(
+                    {
+                        "label": candidate.get("title", "被门禁拒绝的候选"),
+                        "exclusion_type": "insufficient_evidence",
+                        "reason": f"Structured grounding gate failed: {', '.join(fail_reasons)}",
+                        "section_ids": evidence_ids or [item["section_id"] for item in candidate.get("evidence", [])],
+                    }
+                )
+                continue
+            candidate["primary_section_ids"] = primary_ids
+            candidate["supporting_section_ids"] = supporting_ids
+            kept.append(candidate)
+        return kept, excluded
+
+    def _suppress_same_paper_duplicates(self, cards: list[dict]) -> tuple[list[dict], list[dict]]:
+        if len(cards) <= 1:
+            for card in cards:
+                card["duplicate_disposition"] = "kept"
+                card["duplicate_rank"] = 1
+            return cards, []
+
+        clusters: dict[str, list[dict]] = {}
+        for card in cards:
+            primary_ids = tuple(sorted(card.get("primary_section_ids", [])))
+            signature = (
+                card.get("possible_duplicate_signature", "").strip()
+                or f"{'|'.join(primary_ids)}::{card.get('paper_specific_object', '').strip().lower()}::{card.get('claim_type', '').strip().lower()}"
+            )
+            clusters.setdefault(signature or card["title"], []).append(card)
+
+        kept: list[dict] = []
+        excluded: list[dict] = []
+        for cluster_index, members in enumerate(clusters.values(), start=1):
+            members.sort(
+                key=lambda item: (
+                    {"strong": 3, "medium": 2, "weak": 1}.get(item.get("evidence_level", "medium"), 2),
+                    {"green": 3, "yellow": 2, "red": 1}.get((item.get("judgement") or {}).get("color", "yellow"), 2),
+                    len(item.get("primary_section_ids", [])),
+                    len(item.get("evidence", [])),
+                ),
+                reverse=True,
+            )
+            cluster_id = f"dup_cluster_{cluster_index}"
+            for rank, card in enumerate(members, start=1):
+                card["duplicate_cluster_id"] = cluster_id
+                card["duplicate_rank"] = rank
+                if rank == 1:
+                    card["duplicate_disposition"] = "kept"
+                    kept.append(card)
+                else:
+                    card["duplicate_disposition"] = "suppressed_variant"
+                    excluded.append(
+                        {
+                            "label": card.get("title", "重复候选"),
+                            "exclusion_type": "replaced_by_stronger_card",
+                            "reason": f"Suppressed by same-paper duplicate governance; replaced by cluster representative {members[0]['title']}.",
+                            "section_ids": card.get("primary_section_ids", []) or [item["section_id"] for item in card.get("evidence", [])],
+                        }
+                    )
+        return kept, excluded
+
+    def _gate_judged_cards_for_concept_alignment(self, cards: list[dict]) -> tuple[list[dict], list[dict]]:
+        kept: list[dict] = []
+        excluded: list[dict] = []
+        for card in cards:
+            fail_reasons: list[str] = []
+            has_belief_gap = has_concept_belief_gap_signal(
+                card.get("title", ""),
+                card.get("teachable_one_liner", ""),
+                (card.get("judgement") or {}).get("reason", ""),
+            )
+            has_direct_transfer = has_direct_transfer_signal(
+                card.get("title", ""),
+                card.get("teachable_one_liner", ""),
+                card.get("course_transformation", ""),
+                card.get("paper_specific_object", ""),
+                (card.get("judgement") or {}).get("reason", ""),
+            )
+            has_source_fidelity = has_source_object_fidelity_signal(
+                card.get("course_transformation", ""),
+                card.get("title", ""),
+                card.get("paper_specific_object", ""),
+            )
+            if not has_named_course_object_signal(card.get("course_transformation", "")):
+                fail_reasons.append("course_object_naming_missing_gate")
+            if not (has_belief_gap or has_direct_transfer):
+                fail_reasons.append("belief_gap_or_direct_transfer_missing_gate")
+            if not (has_source_fidelity or has_direct_transfer):
+                fail_reasons.append("source_object_fidelity_missing_gate")
+            if fail_reasons:
+                excluded.append(
+                    {
+                        "label": card.get("title", "概念对齐未通过候选"),
+                        "exclusion_type": "weak_transfer",
+                        "reason": f"CONCEPT alignment gate failed: {', '.join(fail_reasons)}",
+                        "section_ids": card.get("primary_section_ids", []) or [item.get("section_id") for item in card.get("evidence", []) if item.get("section_id")],
+                    }
+                )
+                continue
+            kept.append(card)
+        return kept, excluded
+
+    def _build_cards_with_llm(
+        self,
+        sections: list[dict],
+        topic: dict,
+        paper: dict,
+        run_id: str = "",
+        precomputed_understanding: Optional[dict[str, Any]] = None,
+        precomputed_card_plan: Optional[dict[str, Any]] = None,
+        persist_records: bool = True,
+    ) -> dict:
         active_calibration_set = self.repository.get_active_calibration_set()
         figures = self.repository.get_figures(paper["id"])
+        understanding = precomputed_understanding or self._build_paper_understanding(
+            sections=sections,
+            figures=figures,
+            topic_name=topic["name"],
+            paper_title=paper["title"],
+        )
+        if run_id and persist_records:
+            self.repository.create_paper_understanding_record(
+                paper_id=paper["id"],
+                topic_id=topic["id"],
+                run_id=run_id,
+                version=understanding.get("version", "understanding-v1"),
+                understanding=understanding,
+            )
+        card_plan = precomputed_card_plan or self._build_card_plan(
+            understanding=understanding,
+            topic_name=topic["name"],
+        )
+        if run_id and persist_records:
+            self.repository.create_card_plan(
+                paper_id=paper["id"],
+                topic_id=topic["id"],
+                run_id=run_id,
+                version=card_plan.get("version", "card-plan-v1"),
+                plan=card_plan,
+            )
+        evidence_packet = self._assemble_plan_driven_packet(
+            sections=sections,
+            figures=figures,
+            topic_name=topic["name"],
+            card_plan=card_plan,
+        )
+        self.repository.update_section_selection_diagnostics(paper["id"], evidence_packet["selection_diagnostics"])
         extracted_output = self.card_engine.extract_candidates(
             topic_name=topic["name"],
             paper_title=paper["title"],
-            sections=sections,
-            figures=figures,
+            sections=evidence_packet["prompt_sections"],
+            figures=evidence_packet["figure_candidates"],
             calibration_examples=(active_calibration_set or {}).get("examples", []),
             calibration_set_name=(active_calibration_set or {}).get("name", ""),
         )
+        gated_cards, gated_excluded = self._gate_extracted_candidates(extracted_output["cards"], sections)
+        recovery_excluded: list[dict] = []
+        if not gated_cards and extracted_output["cards"]:
+            recovered_extraction = self._recover_candidates_with_expanded_context(
+                topic_name=topic["name"],
+                paper_title=paper["title"],
+                sections=sections,
+                figures=evidence_packet["figure_candidates"],
+                calibration_examples=(active_calibration_set or {}).get("examples", []),
+                calibration_set_name=(active_calibration_set or {}).get("name", ""),
+            )
+            recovered_cards, recovered_excluded = self._gate_extracted_candidates(recovered_extraction["cards"], sections)
+            if recovered_cards:
+                gated_cards = recovered_cards
+                extracted_output = recovered_extraction
+            recovery_excluded = recovered_excluded
         judged_output = self.card_engine.judge_candidates(
             topic_name=topic["name"],
             paper_title=paper["title"],
-            extracted_cards=extracted_output["cards"],
+            extracted_cards=gated_cards,
+            figures=evidence_packet["figure_candidates"],
             calibration_examples=(active_calibration_set or {}).get("examples", []),
             calibration_set_name=(active_calibration_set or {}).get("name", ""),
         )
+        concept_kept_cards, concept_excluded = self._gate_judged_cards_for_concept_alignment(judged_output["cards"])
+        plan_aligned_cards, plan_excluded = self._align_cards_to_plan(concept_kept_cards, card_plan)
+        deduped_cards, duplicate_excluded = self._suppress_same_paper_duplicates(plan_aligned_cards)
         return {
-            "cards": [self._finalize_card(card, topic["name"]) for card in judged_output["cards"]],
+            "cards": [self._finalize_card(card, topic["name"]) for card in deduped_cards],
             "excluded_content": [
                 self._finalize_excluded_content(item)
-                for item in extracted_output["excluded_content"]
+                for item in (extracted_output["excluded_content"] + gated_excluded + recovery_excluded + concept_excluded + plan_excluded + duplicate_excluded)
             ],
         }
 
@@ -2242,6 +4795,20 @@ class PaperPipeline:
             "figure_ids": card.get("figure_ids", []),
             "status": card.get("status", "candidate"),
             "embedding": embedding_for_text(embedding_source),
+            "primary_section_ids": card.get("primary_section_ids", []),
+            "supporting_section_ids": card.get("supporting_section_ids", []),
+            "paper_specific_object": card.get("paper_specific_object", ""),
+            "claim_type": card.get("claim_type", ""),
+            "evidence_level": card.get("evidence_level", ""),
+            "body_grounding_reason": card.get("body_grounding_reason", ""),
+            "grounding_quality": card.get("grounding_quality", ""),
+            "duplicate_cluster_id": card.get("duplicate_cluster_id", ""),
+            "duplicate_rank": int(card.get("duplicate_rank", 0) or 0),
+            "duplicate_disposition": card.get("duplicate_disposition", ""),
+            "planned_level": card.get("planned_level", ""),
+            "plan_id": card.get("plan_id", ""),
+            "plan_target_object_id": card.get("plan_target_object_id", ""),
+            "plan_target_object_label": card.get("plan_target_object_label", ""),
             "created_at": utc_now(),
             "judgement": card["judgement"],
         }
@@ -2255,6 +4822,173 @@ class PaperPipeline:
             "section_ids": item["section_ids"],
             "created_at": utc_now(),
         }
+
+    def validate_single_paper_flow(self, *, paper: dict, topic: dict, run_id: str) -> dict[str, Any]:
+        sections = self.repository.get_sections(paper["id"])
+        if not sections:
+            raise ValueError("Paper has no parsed sections; parse must succeed before single-paper validation.")
+        figures = self.repository.get_figures(paper["id"])
+        llm_trace_events: list[dict[str, Any]] = []
+        if hasattr(self.card_engine, "set_trace_sink"):
+            self.card_engine.set_trace_sink(lambda event: llm_trace_events.append(event))
+        understanding = self._build_paper_understanding(
+            sections=sections,
+            figures=figures,
+            topic_name=topic["name"],
+            paper_title=paper["title"],
+        )
+        understanding_record = self.repository.create_paper_understanding_record(
+            paper_id=paper["id"],
+            topic_id=topic["id"],
+            run_id=run_id,
+            version=understanding.get("version", "understanding-v1"),
+            understanding=understanding,
+        )
+        card_plan = self._build_card_plan(
+            understanding=understanding,
+            topic_name=topic["name"],
+        )
+        card_plan_record = self.repository.create_card_plan(
+            paper_id=paper["id"],
+            topic_id=topic["id"],
+            run_id=run_id,
+            version=card_plan.get("version", "card-plan-v1"),
+            plan=card_plan,
+        )
+        try:
+            generation_output = self._build_cards_with_llm(
+                sections,
+                topic,
+                paper,
+                run_id=run_id,
+                precomputed_understanding=understanding,
+                precomputed_card_plan=card_plan,
+                persist_records=False,
+            )
+        finally:
+            if hasattr(self.card_engine, "set_trace_sink"):
+                self.card_engine.set_trace_sink(None)
+
+        validation_dir = self.settings.data_dir / "validation" / f"{run_id}_{paper['id']}_{topic['id']}"
+        validation_dir.mkdir(parents=True, exist_ok=True)
+        understanding_path = validation_dir / "paper_understanding.json"
+        card_plan_path = validation_dir / "card_plan.json"
+        cards_path = validation_dir / "final_cards.json"
+        excluded_path = validation_dir / "excluded_content.json"
+        llm_trace_path = validation_dir / "llm_step_traces.json"
+        report_path = validation_dir / "single_paper_validation_report.md"
+        understanding_path.write_text(json.dumps(understanding, ensure_ascii=False, indent=2), encoding="utf-8")
+        card_plan_path.write_text(json.dumps(card_plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        cards_path.write_text(json.dumps(generation_output["cards"], ensure_ascii=False, indent=2), encoding="utf-8")
+        excluded_path.write_text(json.dumps(generation_output["excluded_content"], ensure_ascii=False, indent=2), encoding="utf-8")
+        llm_trace_path.write_text(json.dumps(llm_trace_events, ensure_ascii=False, indent=2), encoding="utf-8")
+        report_path.write_text(
+            self._build_single_paper_validation_report(
+                paper=paper,
+                topic=topic,
+                run_id=run_id,
+                understanding=understanding,
+                card_plan=card_plan,
+                generation_output=generation_output,
+                understanding_record=understanding_record,
+                card_plan_record=card_plan_record,
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "paper_id": paper["id"],
+            "topic_id": topic["id"],
+            "run_id": run_id,
+            "understanding_record_id": understanding_record["id"],
+            "card_plan_id": card_plan_record["id"],
+            "card_count": len(generation_output["cards"]),
+            "excluded_count": len(generation_output["excluded_content"]),
+            "artifacts": {
+                "paper_understanding": str(understanding_path),
+                "card_plan": str(card_plan_path),
+                "final_cards": str(cards_path),
+                "excluded_content": str(excluded_path),
+                "llm_step_traces": str(llm_trace_path),
+                "report": str(report_path),
+            },
+        }
+
+    def _build_single_paper_validation_report(
+        self,
+        *,
+        paper: dict,
+        topic: dict,
+        run_id: str,
+        understanding: dict[str, Any],
+        card_plan: dict[str, Any],
+        generation_output: dict[str, Any],
+        understanding_record: dict,
+        card_plan_record: dict,
+    ) -> str:
+        lines = [
+            "# Single Paper Validation Report",
+            "",
+            f"- run_id: `{run_id}`",
+            f"- topic: `{topic['name']}`",
+            f"- paper: `{paper['title']}`",
+            f"- understanding_record_id: `{understanding_record['id']}`",
+            f"- card_plan_id: `{card_plan_record['id']}`",
+            "",
+            "## Contribution Objects",
+        ]
+        objects = understanding.get("global_contribution_objects", [])
+        if not objects:
+            lines.append("- (none)")
+        for item in objects:
+            lines.append(
+                f"- `{item.get('id', '')}` | {item.get('level_hint', '')} | {item.get('object_type', '')} | {item.get('label', '')}"
+            )
+            lines.append(f"  - evidence_sections: {item.get('evidence_section_ids', [])}")
+            lines.append(f"  - evidence_figures: {item.get('evidence_figure_ids', [])}")
+            if item.get("evidence_figure_ids"):
+                lines.append("  - figure_note: object has figure-backed evidence")
+
+        lines.append("")
+        lines.append("## Card Plan")
+        planned_cards = card_plan.get("planned_cards", [])
+        if not planned_cards:
+            lines.append("- (none)")
+        for item in planned_cards:
+            lines.append(
+                f"- `{item.get('plan_id', '')}` | level={item.get('level', '')} | disposition={item.get('disposition', '')} | object={item.get('target_object_id', '')}"
+            )
+            lines.append(f"  - must_have_evidence_ids: {item.get('must_have_evidence_ids', [])}")
+            lines.append(f"  - optional_supporting_ids: {item.get('optional_supporting_ids', [])}")
+            lines.append(f"  - must_have_figure_ids: {item.get('must_have_figure_ids', [])}")
+            lines.append(f"  - optional_supporting_figure_ids: {item.get('optional_supporting_figure_ids', [])}")
+            if item.get("disposition_reason"):
+                lines.append(f"  - reason: {item.get('disposition_reason', '')}")
+
+        lines.append("")
+        lines.append("## Final Cards")
+        cards = generation_output.get("cards", [])
+        if not cards:
+            lines.append("- (no cards)")
+        for item in cards:
+            lines.append(f"- {item.get('title', '')}")
+            lines.append(f"  - level: {item.get('planned_level', '')}")
+            lines.append(f"  - course_transformation: {item.get('course_transformation', '')}")
+            lines.append(f"  - paper_specific_object: {item.get('paper_specific_object', '')}")
+            lines.append(f"  - primary_section_ids: {item.get('primary_section_ids', [])}")
+            lines.append(f"  - figure_ids: {item.get('figure_ids', [])}")
+            lines.append(f"  - judgement: {(item.get('judgement') or {}).get('color', '')} | {(item.get('judgement') or {}).get('reason', '')}")
+
+        lines.append("")
+        lines.append("## Excluded Content")
+        excluded = generation_output.get("excluded_content", [])
+        if not excluded:
+            lines.append("- (none)")
+        for item in excluded:
+            lines.append(
+                f"- {item.get('label', '')} | type={item.get('exclusion_type', '')} | reason={item.get('reason', '')}"
+            )
+
+        return "\n".join(lines) + "\n"
 
 
 class ReviewService:
@@ -2370,6 +5104,7 @@ class EvaluationService:
             topic_name=example["topic_name"],
             paper_title=example["title"],
             extracted_cards=extraction_output["cards"],
+            figures=[],
             calibration_examples=calibration_set["examples"],
             calibration_set_name=calibration_set["name"],
         )
@@ -2384,6 +5119,9 @@ class EvaluationService:
             "excluded_count": len(extraction_output["excluded_content"]),
             "card_titles": [card["title"] for card in judgement_output["cards"]],
             "card_colors": [card["judgement"]["color"] for card in judgement_output["cards"]],
+            "course_transformations": [card.get("course_transformation", "") for card in judgement_output["cards"]],
+            "paper_specific_objects": [card.get("paper_specific_object", "") for card in judgement_output["cards"]],
+            "figure_attachment_count": sum(len(card.get("figure_ids", [])) for card in judgement_output["cards"]),
             "excluded_labels": [item["label"] for item in extraction_output["excluded_content"]],
             "excluded_types": [item["exclusion_type"] for item in extraction_output["excluded_content"]],
         }
@@ -2407,6 +5145,27 @@ class EvaluationService:
         colors = actual["card_colors"]
         expected_card_count = len(example["expected_cards"])
         expected_exclusion_count = len(example["expected_exclusions"])
+        tags = {str(tag).strip().lower() for tag in example.get("tags", []) if str(tag).strip()}
+
+        if judged_card_count > 0:
+            course_transformations = actual.get("course_transformations", [])
+            paper_specific_objects = actual.get("paper_specific_objects", [])
+            has_fidelity = any(
+                has_source_object_fidelity_signal(course, title, paper_object)
+                for course, title, paper_object in zip(
+                    course_transformations,
+                    actual.get("card_titles", []),
+                    paper_specific_objects,
+                )
+            )
+            if "principle-drift-negative" in tags and judged_card_count > 0:
+                return ("failed", "principle_drift", "Negative example incorrectly produced a card despite principle-drift guardrails.")
+            if "audience-mismatch" in tags and judged_card_count > 0:
+                return ("failed", "audience_mismatch", "Negative example incorrectly produced a card despite audience-fit guardrails.")
+            if "visual-evidence-required" in tags and int(actual.get("figure_attachment_count", 0)) <= 0:
+                return ("failed", "missing_figure_support", "Card passed without attaching required figure evidence.")
+            if not has_fidelity and ("direct-transfer" in tags or "nontechnical-audience" in tags):
+                return ("failed", "principle_drift", "Card drifted away from the source object for a direct-transfer / non-technical example.")
 
         if example_type == "positive":
             if judged_card_count <= 0:
@@ -2444,8 +5203,16 @@ class EvaluationService:
             "boundary_examples": 0,
             "summary_drift_count": 0,
             "weak_transfer_drift_count": 0,
+            "principle_drift_count": 0,
+            "audience_mismatch_count": 0,
+            "missing_figure_support_count": 0,
             "missed_aha_count": 0,
             "boundary_mismatch_count": 0,
+            "abstract_only_evidence_failures": 0,
+            "framing_only_card_failures": 0,
+            "same_evidence_duplicate_split_failures": 0,
+            "paper_specific_object_missing_failures": 0,
+            "body_evidence_ignored_failures": 0,
         }
         for result in results:
             summary[f"{result['example_type']}_examples"] += 1
@@ -2457,11 +5224,111 @@ class EvaluationService:
                 summary["summary_drift_count"] += 1
             elif result["regression_type"] == "weak_transfer_drift":
                 summary["weak_transfer_drift_count"] += 1
+            elif result["regression_type"] == "principle_drift":
+                summary["principle_drift_count"] += 1
+            elif result["regression_type"] == "audience_mismatch":
+                summary["audience_mismatch_count"] += 1
+            elif result["regression_type"] == "missing_figure_support":
+                summary["missing_figure_support_count"] += 1
             elif result["regression_type"] == "missed_aha":
                 summary["missed_aha_count"] += 1
             elif result["regression_type"] == "boundary_mismatch":
                 summary["boundary_mismatch_count"] += 1
+            actual = result.get("actual", {}) if isinstance(result, dict) else {}
+            card_titles = " ".join(actual.get("card_titles", [])) if isinstance(actual.get("card_titles", []), list) else ""
+            if "abstract" in card_titles.lower():
+                summary["abstract_only_evidence_failures"] += 1
+            if result.get("regression_type") == "summary_drift":
+                summary["framing_only_card_failures"] += 1
+            if result.get("regression_type") == "principle_drift":
+                summary["framing_only_card_failures"] += 1
+            if result.get("regression_type") == "boundary_mismatch":
+                summary["same_evidence_duplicate_split_failures"] += 1
+            if result.get("regression_type") == "missed_aha":
+                summary["paper_specific_object_missing_failures"] += 1
+            if result.get("regression_type") in {"weak_transfer_drift", "summary_drift"}:
+                summary["body_evidence_ignored_failures"] += 1
         return summary
+
+
+class AccessQueueService:
+    def __init__(self, settings: Settings, repository: Repository, coordinator: RunCoordinator):
+        self.settings = settings
+        self.repository = repository
+        self.coordinator = coordinator
+        self.pipeline = coordinator.pipeline
+
+    def reactivate_item(self, queue_item_id: str, local_path: str, reviewer: str) -> dict:
+        queue_item = self.repository.get_access_queue_item(queue_item_id)
+        if not queue_item:
+            raise LookupError("Access queue item not found")
+        if queue_item["status"] != "open":
+            raise ValueError(f"Access queue item {queue_item_id} is not open")
+        paper = self.repository.get_paper(queue_item["paper_id"])
+        if not paper:
+            raise LookupError("Paper not found for access queue item")
+
+        artifact_path = self.pipeline.ingest_local_pdf(local_path)
+        self.repository.update_paper(
+            paper["id"],
+            local_path=local_path,
+            artifact_path=artifact_path,
+            access_status="open_fulltext",
+            ingestion_status="artifact_ready",
+            parse_status="pending",
+            parse_failure_reason="",
+            card_generation_status="pending",
+            card_generation_failure_reason="",
+        )
+        self.repository.update_access_queue_item(queue_item_id, status="reactivated", owner=reviewer)
+
+        refreshed_paper = self.repository.get_paper(paper["id"])
+        if not refreshed_paper:
+            raise LookupError("Paper disappeared during reactivation")
+        self.pipeline.parse_and_store(refreshed_paper)
+        refreshed_paper = self.repository.get_paper(paper["id"])
+        topic_runs = self.repository.list_topic_runs_for_paper_run(paper["id"], queue_item["run_id"])
+        processed_topics = []
+
+        for topic_run in topic_runs:
+            stats = topic_run["stats"]
+            self.coordinator._mark_topic_progress(topic_run["id"], stats, stage="parsing")
+            if refreshed_paper and refreshed_paper["parse_status"] == "parsed":
+                self.coordinator._build_cards_for_paper(refreshed_paper, {"id": topic_run["topic_id"], "name": topic_run["topic_name"]}, queue_item["run_id"])
+                stats["parsed_papers"] = stats.get("parsed_papers", 0) + 1
+                stats["card_generation_attempts"] = stats.get("card_generation_attempts", 0) + 1
+            else:
+                self.repository.replace_cards_for_paper_topic(paper["id"], topic_run["topic_id"], queue_item["run_id"], [])
+            stats["accessible"] = sum(
+                1
+                for item in self.repository.list_papers_for_topic_run(queue_item["run_id"], topic_run["topic_id"])
+                if item["access_status"] == "open_fulltext"
+            )
+            stats["parsed_papers"] = sum(
+                1
+                for item in self.repository.list_papers_for_topic_run(queue_item["run_id"], topic_run["topic_id"])
+                if item["parse_status"] == "parsed"
+            )
+            stats["cards"] = len(self.repository.list_cards(run_id=queue_item["run_id"], topic=topic_run["topic_name"]))
+            stats["queued_for_access"] = self.repository.count_open_access_queue_for_topic(queue_item["run_id"], topic_run["topic_id"])
+            stats = self.coordinator._build_topic_run_metrics(
+                queue_item["run_id"],
+                {"id": topic_run["topic_id"], "name": topic_run["topic_name"]},
+                topic_run,
+                stats,
+            )
+            stats = self.coordinator._attach_topic_stop_decision({"id": topic_run["topic_id"], "name": topic_run["topic_name"]}, stats)
+            stats["current_stage"] = "completed"
+            stats["last_progress_at"] = utc_now()
+            self.repository.update_topic_run(topic_run["id"], "completed", stats=stats)
+            processed_topics.append(self.repository.get_topic_run(topic_run["id"]))
+
+        self.coordinator._refresh_run_status_from_topics(queue_item["run_id"])
+        return {
+            "queue_item": self.repository.get_access_queue_item(queue_item_id),
+            "paper": self.repository.get_paper(paper["id"]),
+            "topic_runs": [item for item in processed_topics if item],
+        }
 
 
 class ExportService:
@@ -2546,15 +5413,22 @@ class ExportService:
 
         google_doc_id = ""
         export_status = "artifact_only"
+        export_mode = "artifact_only"
+        error_message = ""
         if self.settings.google_docs_mode == "gws":
-            google_doc_id = self._try_gws_export(document_title, existing_google_doc_id, export_payload)
-            export_status = "exported" if google_doc_id else "artifact_only"
+            gws_result = self._try_gws_export(document_title, existing_google_doc_id, export_payload)
+            google_doc_id = gws_result["google_doc_id"]
+            export_status = gws_result["export_status"]
+            export_mode = gws_result["export_mode"]
+            error_message = gws_result["error_message"]
 
         record = self.repository.create_export(
             run_id=run_id,
             destination_type="google_docs",
+            export_mode=export_mode,
             google_doc_id=google_doc_id,
             export_status=export_status,
+            error_message=error_message,
             artifact_path=str(markdown_path),
             request_payload=export_payload,
         )
@@ -2627,10 +5501,46 @@ class ExportService:
     def _insert_text(self, index: int, text: str) -> list[dict]:
         return [{"insertText": {"location": {"index": index}, "text": text}}]
 
-    def _try_gws_export(self, document_title: str, existing_google_doc_id: str, payload: dict) -> str:
+    def _offset_google_doc_requests(self, requests: list[dict], base_index: int) -> list[dict]:
+        if base_index <= 1:
+            return requests
+        shifted = []
+        offset = base_index - 1
+        for request in requests:
+            cloned = json.loads(json.dumps(request))
+            insert_text = cloned.get("insertText")
+            if insert_text and isinstance(insert_text.get("location"), dict):
+                insert_text["location"]["index"] = int(insert_text["location"].get("index", 1)) + offset
+            shifted.append(cloned)
+        return shifted
+
+    def _get_google_doc_append_index(self, document_id: str) -> int:
+        result = subprocess.run(
+            [
+                "gws",
+                "docs",
+                "documents",
+                "get",
+                "--params",
+                json.dumps({"documentId": document_id}),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        payload = json.loads(result.stdout or "{}")
+        content = payload.get("body", {}).get("content", [])
+        if not content:
+            return 1
+        end_index = int(content[-1].get("endIndex", 1))
+        return max(1, end_index - 1)
+
+    def _try_gws_export(self, document_title: str, existing_google_doc_id: str, payload: dict) -> dict[str, str]:
+        export_mode = "append" if existing_google_doc_id else "create"
+        document_id = existing_google_doc_id
         try:
             if existing_google_doc_id:
-                document_id = existing_google_doc_id
+                insert_index = self._get_google_doc_append_index(document_id)
             else:
                 result = subprocess.run(
                     ["gws", "docs", "documents", "create", "--json", json.dumps({"title": document_title})],
@@ -2640,8 +5550,15 @@ class ExportService:
                 )
                 created = json.loads(result.stdout or "{}")
                 document_id = created.get("documentId", "")
+                insert_index = 1
             if not document_id:
-                return ""
+                return {
+                    "google_doc_id": "",
+                    "export_status": "export_failed",
+                    "export_mode": export_mode,
+                    "error_message": "Google Docs export did not return a document id.",
+                }
+            shifted_requests = self._offset_google_doc_requests(payload["requests"], insert_index)
             subprocess.run(
                 [
                     "gws",
@@ -2651,15 +5568,32 @@ class ExportService:
                     "--params",
                     json.dumps({"documentId": document_id}),
                     "--json",
-                    json.dumps({"requests": payload["requests"]}, ensure_ascii=False),
+                    json.dumps({"requests": shifted_requests}, ensure_ascii=False),
                 ],
                 check=True,
                 capture_output=True,
                 text=True,
             )
-            return document_id
-        except Exception:
-            return ""
+            return {
+                "google_doc_id": document_id,
+                "export_status": "exported",
+                "export_mode": export_mode,
+                "error_message": "",
+            }
+        except Exception as error:
+            error_message = str(error)
+            stderr = getattr(error, "stderr", "")
+            stdout = getattr(error, "stdout", "")
+            if stderr:
+                error_message = str(stderr).strip()
+            elif stdout:
+                error_message = str(stdout).strip()
+            return {
+                "google_doc_id": document_id,
+                "export_status": "export_failed",
+                "export_mode": export_mode,
+                "error_message": error_message,
+            }
 
 
 class RunCoordinator:
@@ -2697,8 +5631,92 @@ class RunCoordinator:
                 )
             )
 
-        self.executor.submit(self._finalize_run, run["id"], futures)
+        threading.Thread(target=self._finalize_run, args=(run["id"], futures), daemon=True).start()
         return run
+
+    def retry_topic_run(self, topic_run_id: str) -> dict:
+        topic_run = self.repository.get_topic_run(topic_run_id)
+        if not topic_run:
+            raise LookupError("Topic run not found")
+        if topic_run["status"] == "running":
+            raise ValueError("Topic run is already active")
+        topic = self.repository.get_topic(topic_run["topic_id"])
+        if not topic:
+            raise LookupError("Topic not found for topic run")
+        local_papers = self.repository.list_local_papers_for_topic_run(topic_run["run_id"], topic_run["topic_id"])
+        self.repository.update_run_status(topic_run["run_id"], "running")
+        future = self.executor.submit(self._process_topic_run, topic_run["run_id"], topic, topic_run, local_papers)
+        threading.Thread(target=self._finalize_run, args=(topic_run["run_id"], [future]), daemon=True).start()
+        refreshed = self.repository.get_topic_run(topic_run_id)
+        if not refreshed:
+            raise LookupError("Topic run disappeared during retry")
+        return refreshed
+
+    def _mark_topic_progress(
+        self,
+        topic_run_id: str,
+        stats: dict[str, Any],
+        *,
+        stage: str = "",
+        note: str = "",
+        status: str = "running",
+    ) -> None:
+        now = utc_now()
+        if stage and stats.get("current_stage") != stage:
+            stats["current_stage"] = stage
+            stats["stage_started_at"] = now
+        elif stage and not stats.get("stage_started_at"):
+            stats["stage_started_at"] = now
+        stats["last_progress_at"] = now
+        if note:
+            stats.setdefault("processing_warnings", []).append(note)
+        self.repository.update_topic_run(topic_run_id, status, stats=stats, started=(status == "running"))
+
+    def _run_discovery_with_budget(self, topic_name: str) -> list[dict]:
+        discovery_executor = ThreadPoolExecutor(max_workers=1)
+        future = discovery_executor.submit(self.discovery.discover, topic_name)
+        try:
+            return future.result(timeout=self.settings.discovery_timeout_seconds)
+        except FutureTimeoutError:
+            future.cancel()
+            raise TimeoutError(
+                f"Discovery timed out after {self.settings.discovery_timeout_seconds}s for topic '{topic_name}'"
+            ) from None
+        finally:
+            discovery_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _parse_paper(self, paper: dict) -> tuple[str, bool]:
+        current = self.repository.get_paper(paper["id"])
+        if not current:
+            return paper["id"], False
+        self.pipeline.parse_and_store(current)
+        refreshed = self.repository.get_paper(paper["id"])
+        parsed_ok = bool(refreshed and refreshed["parse_status"] == "parsed")
+        if not parsed_ok:
+            self.repository.replace_cards_for_paper_topic(paper["id"], paper["topic_id"], paper["run_id"], [])
+        return paper["id"], parsed_ok
+
+    def _build_cards_for_paper(self, paper: dict, topic: dict, run_id: str) -> int:
+        current = self.repository.get_paper(paper["id"])
+        if not current or current["parse_status"] != "parsed":
+            self.repository.replace_cards_for_paper_topic(current["id"] if current else paper["id"], topic["id"], run_id, [])
+            return 0
+        return self.pipeline.build_cards(current, topic, run_id)
+
+    def _refresh_run_status_from_topics(self, run_id: str) -> None:
+        topic_runs = self.repository.list_topic_runs(run_id)
+        statuses = [item["status"] for item in topic_runs]
+        if not statuses:
+            self.repository.update_run_status(run_id, "failed")
+            return
+        if any(status == "running" for status in statuses):
+            self.repository.update_run_status(run_id, "running")
+        elif all(status == "completed" for status in statuses):
+            self.repository.update_run_status(run_id, "completed")
+        elif "completed" in statuses:
+            self.repository.update_run_status(run_id, "partial_failed")
+        else:
+            self.repository.update_run_status(run_id, "failed")
 
     def _ingest_local_pdfs(self, run_id: str, topics: list[dict], local_pdfs: list[dict]) -> dict[str, list[dict]]:
         topic_by_name = {topic["name"].lower(): topic for topic in topics}
@@ -2727,27 +5745,43 @@ class RunCoordinator:
                 self.repository.link_paper_to_topic(paper["id"], topic["id"], run_id, "local_pdf")
         return local_mapping
 
-    def _create_discovery_strategy_records(self, run_id: str, topic: dict, topic_run: dict, discovered: list[dict]) -> dict[tuple[str, str, str], dict]:
-        strategy_counts: dict[tuple[str, str, str], int] = {}
+    def _create_discovery_strategy_records(
+        self,
+        run_id: str,
+        topic: dict,
+        topic_run: dict,
+        discovered: list[dict],
+    ) -> dict[tuple[str, str, str, int, str], dict]:
+        strategy_counts: dict[tuple[str, str, str, int, str], int] = {}
+        strategy_params: dict[tuple[str, str, str, int, str], dict] = {}
         for candidate in discovered:
             for source in candidate.get("discovery_sources", []):
                 key = (
                     str(source.get("provider", "")).strip(),
                     str(source.get("strategy_type", "topic_query")).strip(),
                     str(source.get("query_text", topic["name"])).strip(),
+                    int(source.get("strategy_order", 0)),
+                    str(source.get("strategy_family", "core")).strip(),
                 )
                 strategy_counts[key] = strategy_counts.get(key, 0) + 1
+                strategy_params.setdefault(key, source.get("strategy_params", {}))
         strategy_records = {}
-        for (provider, strategy_type, query_text), result_count in strategy_counts.items():
-            strategy_records[(provider, strategy_type, query_text)] = self.repository.create_discovery_strategy(
+        ordered_items = sorted(strategy_counts.items(), key=lambda item: (item[0][3], item[0][0], item[0][1], item[0][2]))
+        for (provider, strategy_type, query_text, strategy_order, strategy_family), result_count in ordered_items:
+            strategy_records[(provider, strategy_type, query_text, strategy_order, strategy_family)] = self.repository.create_discovery_strategy(
                 run_id=run_id,
                 topic_run_id=topic_run["id"],
                 topic_id=topic["id"],
                 provider=provider,
+                strategy_family=strategy_family,
                 strategy_type=strategy_type,
+                strategy_order=strategy_order,
                 query_text=query_text,
                 result_count=result_count,
-                metadata={"topic_name": topic["name"]},
+                metadata={
+                    "topic_name": topic["name"],
+                    "strategy_params": strategy_params.get((provider, strategy_type, query_text, strategy_order, strategy_family), {}),
+                },
             )
         return strategy_records
 
@@ -2775,7 +5809,18 @@ class RunCoordinator:
 
         semantic_duplicate_cards = near_duplicate_cards + same_pattern_cards
         strategy_comparison = []
-        for strategy in strategies:
+        seen_paper_ids: set[str] = set()
+        seen_card_ids: set[str] = set()
+        ordered_strategies = sorted(
+            strategies,
+            key=lambda item: (
+                int(item.get("strategy_order", 0)),
+                str(item.get("provider", "")),
+                str(item.get("strategy_type", "")),
+                str(item.get("query_text", "")),
+            ),
+        )
+        for strategy in ordered_strategies:
             canonical_results = [
                 item
                 for item in discovery_results
@@ -2785,19 +5830,34 @@ class RunCoordinator:
             accessible_papers = sum(
                 1 for paper_id in canonical_paper_ids if (papers.get(paper_id) or {}).get("access_status") == "open_fulltext"
             )
-            yielded_cards = sum(1 for card in cards if card["paper_id"] in canonical_paper_ids)
+            strategy_card_ids = {card["id"] for card in cards if card["paper_id"] in canonical_paper_ids}
+            yielded_cards = len(strategy_card_ids)
+            incremental_new_papers = len(canonical_paper_ids - seen_paper_ids)
+            incremental_new_cards = len(strategy_card_ids - seen_card_ids)
+            seen_paper_ids.update(canonical_paper_ids)
+            seen_card_ids.update(strategy_card_ids)
             strategy_comparison.append(
                 {
                     "strategy_id": strategy["id"],
                     "provider": strategy["provider"],
+                    "strategy_family": strategy.get("strategy_family", "core"),
                     "strategy_type": strategy["strategy_type"],
+                    "strategy_order": int(strategy.get("strategy_order", 0)),
                     "query_text": strategy["query_text"],
                     "raw_hits": strategy["result_count"],
                     "canonical_candidates": len(canonical_paper_ids),
                     "accessible_papers": accessible_papers,
                     "yielded_cards": yielded_cards,
+                    "incremental_new_papers": incremental_new_papers,
+                    "incremental_new_cards": incremental_new_cards,
                 }
             )
+        comparison_tail = strategy_comparison[-3:] if len(strategy_comparison) >= 3 else strategy_comparison
+        flattening_likely = (
+            bool(comparison_tail)
+            and all(item["incremental_new_cards"] == 0 for item in comparison_tail)
+            and (semantic_duplicate_cards > 0)
+        )
 
         stats["saturation_metrics"] = {
             "card_count": len(cards),
@@ -2807,14 +5867,101 @@ class RunCoordinator:
             "semantic_duplicate_cards": semantic_duplicate_cards,
             "semantic_duplication_ratio": round(semantic_duplicate_cards / max(len(cards), 1), 4),
             "search_strategy_comparison": strategy_comparison,
+            "flattening_signal": {
+                "tail_size": len(comparison_tail),
+                "tail_incremental_new_cards": [item["incremental_new_cards"] for item in comparison_tail],
+                "likely_flattening": flattening_likely,
+            },
         }
         return stats
 
+    def _attach_topic_stop_decision(self, topic: dict, stats: dict[str, Any]) -> dict[str, Any]:
+        saturation_metrics = stats.get("saturation_metrics", {})
+        if not isinstance(saturation_metrics, dict):
+            return stats
+        previous_snapshots = self.repository.list_topic_saturation_snapshots(topic=topic["name"], limit=10)
+        evaluate_saturation_stop(
+            current_metrics=saturation_metrics,
+            previous_snapshots=previous_snapshots,
+            policy=default_saturation_stop_policy(),
+        )
+        stats["saturation_stop"] = saturation_metrics.get("stop_decision", {})
+        return stats
+
+    def _process_accessible_papers(
+        self,
+        accessible_papers: list[dict],
+        topic: dict,
+        run_id: str,
+        topic_run: dict,
+        stats: dict[str, Any],
+    ) -> dict[str, Any]:
+        unique_papers = {paper["id"]: paper for paper in accessible_papers}
+        stats["accessible"] = len(unique_papers)
+        if not unique_papers:
+            return stats
+        paper_worker_count = max(1, min(self.settings.max_workers, len(unique_papers)))
+
+        self._mark_topic_progress(topic_run["id"], stats, stage="parsing")
+        parsed_papers: list[dict] = []
+        with ThreadPoolExecutor(max_workers=paper_worker_count) as paper_executor:
+            futures = [
+                paper_executor.submit(
+                    self._parse_paper,
+                    {
+                        **paper,
+                        "topic_id": topic["id"],
+                        "run_id": run_id,
+                    },
+                )
+                for paper in unique_papers.values()
+            ]
+            for future in as_completed(futures):
+                try:
+                    paper_id, parsed_ok = future.result()
+                    if parsed_ok:
+                        stats["parsed_papers"] += 1
+                        refreshed = self.repository.get_paper(paper_id)
+                        if refreshed:
+                            parsed_papers.append(refreshed)
+                except Exception as error:
+                    stats["paper_processing_errors"] += 1
+                    stats["processing_warnings"].append(f"paper_process_failed:{error}")
+                    append_failure_log(
+                        stats,
+                        stage="parsing",
+                        code="paper_parse_failed",
+                        message=str(error),
+                    )
+                self._mark_topic_progress(topic_run["id"], stats, stage="parsing")
+
+        if not parsed_papers:
+            return stats
+
+        self._mark_topic_progress(topic_run["id"], stats, stage="card_generation")
+        with ThreadPoolExecutor(max_workers=max(1, min(self.settings.max_workers, len(parsed_papers)))) as paper_executor:
+            futures = [paper_executor.submit(self._build_cards_for_paper, paper, topic, run_id) for paper in parsed_papers]
+            for future in as_completed(futures):
+                try:
+                    stats["card_generation_attempts"] += 1
+                    stats["cards"] += future.result()
+                except Exception as error:
+                    stats["paper_processing_errors"] += 1
+                    stats["processing_warnings"].append(f"card_generation_failed:{error}")
+                    append_failure_log(
+                        stats,
+                        stage="card_generation",
+                        code="card_generation_failed",
+                        message=str(error),
+                    )
+                self._mark_topic_progress(topic_run["id"], stats, stage="card_generation")
+        return stats
+
     def _process_topic_run(self, run_id: str, topic: dict, topic_run: dict, local_papers: list[dict]) -> None:
-        self.repository.update_topic_run(topic_run["id"], "running", started=True)
         stats = initial_topic_run_stats()
         try:
-            discovered = self.discovery.discover(topic["name"])
+            self._mark_topic_progress(topic_run["id"], stats, stage="discovery")
+            discovered = self._run_discovery_with_budget(topic["name"])
             raw_discovered = sum(len(item.get("discovery_sources", [])) or 1 for item in discovered)
             strategy_records = self._create_discovery_strategy_records(run_id, topic, topic_run, discovered)
             stats["discovered"] = len(discovered)
@@ -2833,114 +5980,141 @@ class RunCoordinator:
                 summary["deduped_candidates"] += 1
             stats["provider_summary"] = provider_summary
             accessible_papers = list(local_papers)
+            self._mark_topic_progress(topic_run["id"], stats, stage="acquisition")
             for item in discovered:
-                paper = self.repository.create_or_get_paper(
-                    title=item["title"],
-                    authors=item["authors"],
-                    publication_year=item["publication_year"],
-                    external_id=item["external_id"],
-                    source_type=item["provider"],
-                    original_url=item["original_url"],
-                    access_status="metadata_only",
-                    ingestion_status="discovered",
-                    parse_status="pending",
-                )
-                primary_source_id = str(item.get("source_external_id", "")).strip()
-                for source in item.get("discovery_sources", []):
-                    self.repository.add_paper_source(
-                        paper["id"],
-                        str(source.get("provider", item["provider"])).strip() or item["provider"],
-                        float(source.get("confidence", item["confidence"])),
-                        {
-                            "source_external_id": source.get("source_external_id", ""),
-                            "query_text": source.get("query_text", topic["name"]),
-                            "strategy_type": source.get("strategy_type", "topic_query"),
-                            "identifiers": source.get("ids", {}),
-                            "source_metadata": source.get("metadata", {}),
-                        },
+                try:
+                    paper = self.repository.create_or_get_paper(
+                        title=item["title"],
+                        authors=item["authors"],
+                        publication_year=item["publication_year"],
+                        external_id=item["external_id"],
+                        source_type=item["provider"],
+                        original_url=item["original_url"],
+                        access_status="metadata_only",
+                        ingestion_status="discovered",
+                        parse_status="pending",
                     )
-                    strategy_key = (
-                        str(source.get("provider", "")).strip(),
-                        str(source.get("strategy_type", "topic_query")).strip(),
-                        str(source.get("query_text", topic["name"])).strip(),
-                    )
-                    strategy_record = strategy_records.get(strategy_key)
-                    if strategy_record:
-                        self.repository.create_discovery_result(
-                            run_id=run_id,
-                            topic_run_id=topic_run["id"],
-                            strategy_id=strategy_record["id"],
-                            dedupe_key=item["external_id"],
-                            provider=str(source.get("provider", item["provider"])).strip() or item["provider"],
-                            source_external_id=str(source.get("source_external_id", "")).strip(),
-                            paper_title=item["title"],
-                            authors=item["authors"],
-                            publication_year=item["publication_year"],
-                            original_url=str(source.get("original_url", item["original_url"])).strip(),
-                            asset_url=str(source.get("asset_url", item["asset_url"])).strip(),
-                            confidence=float(source.get("confidence", item["confidence"])),
-                            dedupe_status="canonical" if str(source.get("source_external_id", "")).strip() == primary_source_id else "duplicate_source",
-                            paper_id=paper["id"],
-                            metadata={
-                                "topic_name": topic["name"],
+                    primary_source_id = str(item.get("source_external_id", "")).strip()
+                    for source in item.get("discovery_sources", []):
+                        self.repository.add_paper_source(
+                            paper["id"],
+                            str(source.get("provider", item["provider"])).strip() or item["provider"],
+                            float(source.get("confidence", item["confidence"])),
+                            {
+                                "source_external_id": source.get("source_external_id", ""),
+                                "query_text": source.get("query_text", topic["name"]),
+                                "strategy_family": source.get("strategy_family", "core"),
+                                "strategy_type": source.get("strategy_type", "topic_query"),
+                                "strategy_order": int(source.get("strategy_order", 0)),
+                                "strategy_params": source.get("strategy_params", {}),
                                 "identifiers": source.get("ids", {}),
                                 "source_metadata": source.get("metadata", {}),
                             },
                         )
-                self.repository.link_paper_to_topic(paper["id"], topic["id"], run_id, "search")
-                artifact_path = self.pipeline.acquire_remote_asset(paper, item.get("asset_url", ""))
-                if artifact_path:
-                    self.repository.update_paper(
-                        paper["id"],
-                        access_status="open_fulltext",
-                        ingestion_status="artifact_ready",
-                        artifact_path=artifact_path,
+                        strategy_key = (
+                            str(source.get("provider", "")).strip(),
+                            str(source.get("strategy_type", "topic_query")).strip(),
+                            str(source.get("query_text", topic["name"])).strip(),
+                            int(source.get("strategy_order", 0)),
+                            str(source.get("strategy_family", "core")).strip(),
+                        )
+                        strategy_record = strategy_records.get(strategy_key)
+                        if strategy_record:
+                            self.repository.create_discovery_result(
+                                run_id=run_id,
+                                topic_run_id=topic_run["id"],
+                                strategy_id=strategy_record["id"],
+                                dedupe_key=item["external_id"],
+                                provider=str(source.get("provider", item["provider"])).strip() or item["provider"],
+                                source_external_id=str(source.get("source_external_id", "")).strip(),
+                                paper_title=item["title"],
+                                authors=item["authors"],
+                                publication_year=item["publication_year"],
+                                original_url=str(source.get("original_url", item["original_url"])).strip(),
+                                asset_url=str(source.get("asset_url", item["asset_url"])).strip(),
+                                confidence=float(source.get("confidence", item["confidence"])),
+                                dedupe_status="canonical" if str(source.get("source_external_id", "")).strip() == primary_source_id else "duplicate_source",
+                                paper_id=paper["id"],
+                                metadata={
+                                    "topic_name": topic["name"],
+                                    "strategy_family": source.get("strategy_family", "core"),
+                                    "strategy_type": source.get("strategy_type", "topic_query"),
+                                    "strategy_order": int(source.get("strategy_order", 0)),
+                                    "strategy_params": source.get("strategy_params", {}),
+                                    "identifiers": source.get("ids", {}),
+                                    "source_metadata": source.get("metadata", {}),
+                                },
+                            )
+                    self.repository.link_paper_to_topic(paper["id"], topic["id"], run_id, "search")
+                    try:
+                        artifact_path = self.pipeline.acquire_remote_asset(paper, item.get("asset_url", ""))
+                    except Exception as error:
+                        stats["acquisition_errors"] += 1
+                        stats["processing_warnings"].append(f"asset_acquire_failed:{paper['id']}:{error}")
+                        append_failure_log(
+                            stats,
+                            stage="acquisition",
+                            code="asset_acquire_failed",
+                            message=str(error),
+                        )
+                        artifact_path = None
+                    if artifact_path:
+                        self.repository.update_paper(
+                            paper["id"],
+                            access_status="open_fulltext",
+                            ingestion_status="artifact_ready",
+                            artifact_path=artifact_path,
+                        )
+                        paper["artifact_path"] = artifact_path
+                        paper["access_status"] = "open_fulltext"
+                        accessible_papers.append(paper)
+                    else:
+                        self.repository.update_paper(paper["id"], access_status="manual_needed", ingestion_status="queued")
+                        stats["queued_for_access"] += 1
+                        self.repository.create_access_queue_item(
+                            paper_id=paper["id"],
+                            run_id=run_id,
+                            reason="Relevant paper discovered but full text could not be acquired automatically.",
+                        )
+                    self._mark_topic_progress(topic_run["id"], stats, stage="acquisition")
+                except Exception as error:
+                    stats["processing_warnings"].append(
+                        f"discovery_item_failed:{item.get('external_id', item.get('title', 'unknown'))}:{error}"
                     )
-                    paper["artifact_path"] = artifact_path
-                    paper["access_status"] = "open_fulltext"
-                    accessible_papers.append(paper)
-                else:
-                    self.repository.update_paper(paper["id"], access_status="manual_needed", ingestion_status="queued")
-                    stats["queued_for_access"] += 1
-                    self.repository.create_access_queue_item(
-                        paper_id=paper["id"],
-                        run_id=run_id,
-                        reason="Relevant paper discovered but full text could not be acquired automatically.",
+                    append_failure_log(
+                        stats,
+                        stage="acquisition",
+                        code="discovery_item_failed",
+                        message=str(error),
                     )
+                    self._mark_topic_progress(topic_run["id"], stats, stage="acquisition")
+                    continue
 
-            unique_papers = {paper["id"]: paper for paper in accessible_papers}
-            stats["accessible"] = len(unique_papers)
-            futures = [self.executor.submit(self._process_paper, paper, topic, run_id) for paper in unique_papers.values()]
-            for future in as_completed(futures):
-                stats["cards"] += future.result()
+            stats = self._process_accessible_papers(accessible_papers, topic, run_id, topic_run, stats)
             stats = self._build_topic_run_metrics(run_id, topic, topic_run, stats)
+            stats = self._attach_topic_stop_decision(topic, stats)
+            self._mark_topic_progress(topic_run["id"], stats, stage="review_ready")
+            self.repository.create_topic_saturation_snapshot(
+                run_id=run_id,
+                topic_run_id=topic_run["id"],
+                topic_id=topic["id"],
+                saturation_metrics=stats.get("saturation_metrics", {}),
+            )
+            stats["current_stage"] = "completed"
+            stats["stage_started_at"] = stats.get("stage_started_at") or utc_now()
+            stats["last_progress_at"] = utc_now()
             self.repository.update_topic_run(topic_run["id"], "completed", stats=stats)
         except Exception as error:
             stats["error"] = str(error)
+            append_failure_log(stats, stage=stats.get("current_stage", "unknown"), code="topic_run_failed", message=str(error))
+            stats["current_stage"] = "failed"
+            stats["last_progress_at"] = utc_now()
             self.repository.update_topic_run(topic_run["id"], "failed", stats=stats)
 
-    def _process_paper(self, paper: dict, topic: dict, run_id: str) -> int:
-        current = self.repository._fetchone("SELECT * FROM papers WHERE id = ?", (paper["id"],))
-        if not current:
-            return 0
-        self.pipeline.parse_and_store(current)
-        current = self.repository._fetchone("SELECT * FROM papers WHERE id = ?", (paper["id"],))
-        if not current or current["parse_status"] != "parsed":
-            self.repository.replace_cards_for_paper_topic(current["id"] if current else paper["id"], topic["id"], run_id, [])
-            return 0
-        return self.pipeline.build_cards(current, topic, run_id)
-
     def _finalize_run(self, run_id: str, futures: Iterable) -> None:
-        statuses = []
         for future in futures:
             try:
                 future.result()
-                statuses.append("completed")
             except Exception:
-                statuses.append("failed")
-        if statuses and all(status == "completed" for status in statuses):
-            self.repository.update_run_status(run_id, "completed")
-        elif "completed" in statuses:
-            self.repository.update_run_status(run_id, "partial_failed")
-        else:
-            self.repository.update_run_status(run_id, "failed")
+                continue
+        self._refresh_run_status_from_topics(run_id)

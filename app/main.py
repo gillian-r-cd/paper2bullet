@@ -10,13 +10,22 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
 from .config import Settings, get_settings
 from .db import init_db
-from .schemas import CalibrationSetImportRequest, EvaluationRunRequest, ExportRequest, PromoteExcludedRequest, ReviewRequest, RunCreateRequest
+from .schemas import (
+    AccessQueueReactivateRequest,
+    CalibrationSetImportRequest,
+    EvaluationRunRequest,
+    ExportRequest,
+    PromoteExcludedRequest,
+    ReviewRequest,
+    RunCreateRequest,
+    SinglePaperValidationRequest,
+)
 from .llm import LLMCardEngine, LLMGenerationError
-from .services import EvaluationService, ExportService, Repository, ReviewService, RunCoordinator
+from .services import AccessQueueService, EvaluationService, ExportService, Repository, ReviewService, RunCoordinator
 
 
 def build_index_html(static_path: Path) -> str:
@@ -26,14 +35,20 @@ def build_index_html(static_path: Path) -> str:
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app_settings = settings or get_settings()
     app_settings.ensure_directories()
-    init_db(app_settings.db_path)
+    init_db(
+        app_settings.db_path,
+        busy_timeout_seconds=app_settings.sqlite_busy_timeout_seconds,
+        journal_mode=app_settings.sqlite_journal_mode,
+    )
 
     repository = Repository(app_settings)
+    repository.sync_governance_records()
     coordinator = RunCoordinator(app_settings, repository)
     exporter = ExportService(app_settings, repository)
     llm_engine = LLMCardEngine(app_settings)
     reviewer = ReviewService(app_settings, repository, llm_engine)
     evaluator = EvaluationService(app_settings, repository, llm_engine)
+    access_queue_service = AccessQueueService(app_settings, repository, coordinator)
 
     app = FastAPI(title=app_settings.app_name)
     index_html = build_index_html(Path(__file__).parent / "static" / "index.html")
@@ -78,6 +93,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "discovery_results": repository.list_discovery_results(run_id=run_id),
         }
 
+    @app.get("/api/saturation/topics")
+    def list_saturation_topics(topic: str = Query(default=""), history_limit: int = Query(default=5, ge=1, le=20)) -> dict:
+        return {
+            "trends": repository.list_topic_saturation_trends(topic=topic, history_limit=history_limit),
+            "snapshots": repository.list_topic_saturation_snapshots(topic=topic, limit=50),
+        }
+
     @app.get("/api/calibration/sets")
     def list_calibration_sets() -> dict:
         return {
@@ -91,6 +113,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if not calibration_set:
             raise HTTPException(status_code=404, detail="Calibration set not found")
         return {"calibration_set": calibration_set}
+
+    @app.get("/api/calibration/workflow")
+    def get_calibration_workflow() -> dict:
+        return repository.get_calibration_workflow_status()
 
     @app.post("/api/calibration/sets/import")
     def import_calibration_set(payload: CalibrationSetImportRequest) -> dict:
@@ -144,6 +170,51 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         cards = repository.list_cards(run_id=run_id or None, topic=topic)
         return {"cards": cards}
 
+    @app.post("/api/papers/{paper_id}/validate-single")
+    def validate_single_paper_flow(paper_id: str, payload: SinglePaperValidationRequest) -> dict:
+        paper = repository.get_paper(paper_id)
+        if not paper:
+            raise HTTPException(status_code=404, detail="Paper not found")
+        topic = repository.get_topic(payload.topic_id)
+        if not topic:
+            raise HTTPException(status_code=404, detail="Topic not found")
+        run = repository.get_run(payload.run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        try:
+            result = coordinator.pipeline.validate_single_paper_flow(
+                paper=paper,
+                topic=topic,
+                run_id=payload.run_id,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except LLMGenerationError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"validation": result}
+
+    @app.get("/api/papers/{paper_id}/understanding")
+    def get_latest_paper_understanding(paper_id: str, topic_id: str = Query(default=""), run_id: str = Query(default="")) -> dict:
+        if not topic_id or not run_id:
+            raise HTTPException(status_code=400, detail="topic_id and run_id are required")
+        record = repository.get_latest_paper_understanding(paper_id, topic_id, run_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="Paper understanding record not found")
+        return {"understanding_record": record}
+
+    @app.get("/api/papers/{paper_id}/card-plan")
+    def get_latest_card_plan(paper_id: str, topic_id: str = Query(default=""), run_id: str = Query(default="")) -> dict:
+        if not topic_id or not run_id:
+            raise HTTPException(status_code=400, detail="topic_id and run_id are required")
+        record = repository.get_latest_card_plan(paper_id, topic_id, run_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="Card plan record not found")
+        return {"card_plan": record}
+
+    @app.get("/api/quality/metrics")
+    def get_quality_metrics(run_id: str = Query(default="")) -> dict:
+        return {"metrics": repository.get_quality_metrics(run_id=run_id or None)}
+
     @app.get("/api/review-items")
     def list_review_items(
         run_id: str = Query(default=""),
@@ -170,6 +241,34 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if target_type == "card":
             item["neighbors"] = repository.build_neighbors(target_id)
         return {"item": item}
+
+    @app.get("/api/figures/{figure_id}")
+    def get_figure(figure_id: str) -> dict:
+        figure = repository.get_figure(figure_id)
+        if not figure:
+            raise HTTPException(status_code=404, detail="Figure not found")
+        return {"figure": figure}
+
+    @app.get("/api/figures/{figure_id}/asset")
+    def get_figure_asset(figure_id: str):
+        figure = repository.get_figure(figure_id)
+        if not figure:
+            raise HTTPException(status_code=404, detail="Figure not found")
+        asset_status = str(figure.get("asset_status", "")).strip()
+        asset_local_path = str(figure.get("asset_local_path", "")).strip()
+        asset_source_url = str(figure.get("asset_source_url", "")).strip()
+        if asset_status == "validated_local_asset" and asset_local_path:
+            asset_path = Path(asset_local_path)
+            if not asset_path.exists():
+                raise HTTPException(status_code=404, detail="Validated figure asset path does not exist")
+            media_type = str(figure.get("mime_type", "")).strip() or None
+            return FileResponse(asset_path, media_type=media_type)
+        if asset_status == "external_reference_only" and asset_source_url.startswith(("http://", "https://")):
+            return RedirectResponse(asset_source_url)
+        raise HTTPException(
+            status_code=404,
+            detail=f"Figure asset is not available as a validated local file (status={asset_status or 'unknown'})",
+        )
 
     @app.post("/api/review-items/{target_type}/{target_id}/review")
     def review_item(target_type: str, target_id: str, payload: ReviewRequest) -> dict:
@@ -215,6 +314,26 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     def list_access_queue(run_id: str = Query(default="")) -> dict:
         return {"items": repository.list_access_queue(run_id or None)}
 
+    @app.post("/api/access-queue/{queue_item_id}/reactivate")
+    def reactivate_access_queue_item(queue_item_id: str, payload: AccessQueueReactivateRequest) -> dict:
+        try:
+            result = access_queue_service.reactivate_item(queue_item_id, payload.local_path, payload.reviewer)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except (ValueError, FileNotFoundError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return result
+
+    @app.post("/api/topic-runs/{topic_run_id}/retry")
+    def retry_topic_run(topic_run_id: str) -> dict:
+        try:
+            topic_run = coordinator.retry_topic_run(topic_run_id)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"topic_run": topic_run}
+
     @app.post("/api/exports/google-doc")
     def export_google_doc(payload: ExportRequest) -> dict:
         if not payload.card_ids:
@@ -237,6 +356,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "data_dir": str(app_settings.data_dir),
                 "db_path": str(app_settings.db_path),
                 "max_workers": app_settings.max_workers,
+                "sqlite_busy_timeout_seconds": app_settings.sqlite_busy_timeout_seconds,
+                "sqlite_journal_mode": app_settings.sqlite_journal_mode,
+                "discovery_timeout_seconds": app_settings.discovery_timeout_seconds,
+                "remote_asset_timeout_seconds": app_settings.remote_asset_timeout_seconds,
+                "stalled_after_seconds": app_settings.stalled_after_seconds,
                 "google_docs_mode": app_settings.google_docs_mode,
                 "llm_mode": app_settings.llm_mode,
                 "llm_model": app_settings.llm_model,
@@ -247,9 +371,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "access_queue": repository.list_access_queue(),
             "discovery_strategies": repository.list_discovery_strategies(),
             "discovery_results": repository.list_discovery_results(),
+            "saturation_trends": repository.list_topic_saturation_trends(history_limit=3),
             "calibration_sets": repository.list_calibration_sets(),
             "active_calibration_set": repository.get_active_calibration_set(),
+            "prompt_versions": repository.list_prompt_versions(),
+            "rubric_versions": repository.list_rubric_versions(),
+            "calibration_workflow": repository.get_calibration_workflow_status(),
             "latest_evaluation_run": repository.get_latest_evaluation_run(),
+            "quality_metrics": repository.get_quality_metrics(),
         }
 
     @app.post("/api/llm/smoke")

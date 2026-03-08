@@ -6,6 +6,481 @@ Main sections: completed work, pending work, known issues, and next starting poi
 
 ## 本次做了什么
 
+- 已按 `ROOT_CAUSE_REMEDIATION_PLAN.md` 落地“先单篇测通，再谈 saturation”的根治主链（不再只靠后置门禁）：
+  - Stage A（全文理解记录）已持久化：
+    - `app/db.py` 新增表：`paper_understanding_records`
+    - `Repository` 新增：
+      - `create_paper_understanding_record()`
+      - `get_paper_understanding_record()`
+      - `get_latest_paper_understanding()`
+  - Stage B（卡片规划记录）已持久化：
+    - `app/db.py` 新增表：`card_plans`
+    - `Repository` 新增：
+      - `create_card_plan()`
+      - `get_card_plan()`
+      - `get_latest_card_plan()`
+  - Stage C（先理解 -> 再规划 -> 后生成）已接入 `PaperPipeline`：
+    - 新增：
+      - `_build_paper_understanding()`
+      - `_build_card_plan()`
+      - `_assemble_plan_driven_packet()`
+      - `_align_cards_to_plan()`
+      - `_recover_candidates_with_expanded_context()`
+    - `_build_cards_with_llm()` 现在会：
+      - 先产出 understanding + card plan 并落库
+      - 按 plan 组装证据包再提取
+      - 先尝试恢复（expanded context），再进行拒绝
+      - 最终按 plan 与 duplicate governance 双重收敛
+  - 单篇端到端验证能力已落地（先于 saturation）：
+    - `PaperPipeline.validate_single_paper_flow()` 会产出 5 份工件：
+      - `paper_understanding.json`
+      - `card_plan.json`
+      - `final_cards.json`
+      - `excluded_content.json`
+      - `single_paper_validation_report.md`
+  - API/UI 已打通单篇验证观察链路：
+    - `app/main.py` 新增：
+      - `POST /api/papers/{paper_id}/validate-single`
+      - `GET /api/papers/{paper_id}/understanding?topic_id=&run_id=`
+      - `GET /api/papers/{paper_id}/card-plan?topic_id=&run_id=`
+    - `app/static/index.html` 新增 `Single Paper Validation` 面板：
+      - 可直接触发单篇验证
+      - 可加载 understanding/card plan 记录
+  - 本阶段新增测试覆盖：
+    - `test_repository_persists_understanding_and_card_plan_records`
+    - `test_pipeline_single_paper_validation_writes_required_artifacts`
+    - `test_api_single_paper_validation_endpoint_returns_artifacts`
+  - 本阶段验证结果：
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 76 个
+    - 已在仓库本地跑通一篇单篇验证 demo（stub LLM），并生成 5 份验证工件到：
+      - `data/demo_validation_run/validation/<run_paper_topic>/`
+
+- 已完成 `CARD_CONTENT_REMEDIATION` 的核心链路整改（结构化证据治理版本）：
+  - `app/db.py` 已扩展并迁移 `paper_sections` 与 `candidate_cards` 字段，新增：
+    - section 结构字段：`section_kind` / `section_label` / `is_front_matter` / `is_abstract` / `is_body` / `body_role` / `has_figure_reference` / `source_format`
+    - section 选择诊断字段：`selection_score` / `selection_reason_json`
+    - card grounding 与去重字段：`primary_section_ids_json` / `supporting_section_ids_json` / `paper_specific_object` / `claim_type` / `evidence_level` / `body_grounding_reason` / `grounding_quality` / `duplicate_cluster_id` / `duplicate_rank` / `duplicate_disposition`
+  - `app/services.py` 已新增并接入：
+    - section classification helper：`classify_section_metadata()` / `enrich_sections_with_structure()`
+    - parse 阶段统一结构标注（MarkItDown PDF / PDF fallback / HTML 全覆盖）
+    - extraction 前证据包选择：`_build_evidence_packet()`（context/primary/supporting/figure + 诊断）
+    - deterministic grounding gates：`_gate_extracted_candidates()`（abstract/front-matter/object/body grounding）
+    - same-paper duplicate governance：`_suppress_same_paper_duplicates()`
+    - review 详情诊断：`_build_card_grounding_diagnostics()`（section mix / sibling cards / duplicate cluster）
+    - 质量指标：`get_quality_metrics()`（abstract/front/body/duplicate/object/accepted 子指标）
+  - `app/llm.py` 已升级 extraction/judgement 契约：
+    - prompt 版本已升级到 grounded 版本（v3/v4）
+    - extraction payload 已支持 primary/supporting/context 分离与 paper-specific object 字段
+    - judgement payload 已加入 grounding/duplicate 明确问题
+    - normalization 已兼容新旧合同并透传 grounding/duplicate 字段
+  - `app/main.py` 新增：`GET /api/quality/metrics`
+  - `app/static/index.html` 已新增：
+    - `Content Quality Metrics` 面板
+    - review detail 中 grounding diagnostics / duplicate cluster / same-paper siblings 展示
+  - 新增测试覆盖（`tests/test_app.py`）：
+    - section 结构分类
+    - evidence packet body-priority
+    - abstract-only gate
+    - same-evidence duplicate suppression
+    - quality metrics endpoint
+    - review detail grounding diagnostics
+  - 验证结果：
+    - 定向回归与新增测试通过
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 73 个
+
+- 已完成一整个“SQLite 并发写锁根因修复”阶段：
+  - 已确认失败 run 的根因不是 discovery / access queue / LLM，而是 parsing 阶段的 SQLite 写锁竞争：
+    - paper parsing worker 会并发写 `papers` / `paper_sections` / `figures`
+    - 主线程还会持续写 `topic_runs.stats_json`
+    - 旧实现里这些写事务过于碎片化，且 SQLite 连接层没有明确的运行时并发写策略
+  - 已补 SQLite 运行时配置：
+    - `Settings` 新增：
+      - `sqlite_busy_timeout_seconds`
+      - `sqlite_journal_mode`
+    - `create_app()` / `init_db()` 现在会按配置注册数据库运行时策略
+    - 连接层新增：
+      - `PRAGMA busy_timeout`
+      - `PRAGMA journal_mode=WAL`
+      - `PRAGMA synchronous=NORMAL`（WAL 模式下）
+  - 已把写事务边界收紧：
+    - `db_cursor()` 现在会显式 `BEGIN IMMEDIATE`
+    - 写事务会在一开始就排队拿锁，而不是中途写到一半再失败
+  - 已把 parsing 成功/失败持久化改成单事务：
+    - 新增 `Repository.persist_parse_result()`
+    - 解析阶段不再分别调用
+      - `replace_sections()`
+      - `replace_figures()`
+      - `update_paper()`
+    - 改为一次事务内统一删除/写入 sections、figures，并回写 paper parse 状态
+    - 这样每篇 paper parse 完成时只竞争一次写事务，显著降低锁抖动
+  - `debug state` 已同步暴露：
+    - `sqlite_busy_timeout_seconds`
+    - `sqlite_journal_mode`
+  - 本阶段新增回归测试覆盖：
+    - transient SQLite write lock 持续 6 秒时，写请求会等待并成功提交，而不是直接 `database is locked`
+    - `parse_and_store()` 成功路径会走统一原子持久化路径，而不是旧的碎片写库路径
+    - 旧的并发 run 回归继续通过
+  - 本阶段验证结果：
+    - 定向 SQLite lock / atomic parse / concurrent run 回归通过
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 67 个
+
+- 已完成 `PRD Track K-001 / K-002 / K-005` 的 calibration governance 收口：
+  - 已新增正式的 prompt / rubric 治理记录持久层：
+    - `prompt_versions`
+    - `rubric_versions`
+  - `create_app()` 启动时会自动同步当前代码内置的治理记录，不再只有散落在代码里的版本常量：
+    - extraction prompt 版本
+    - judgement prompt 版本
+    - active rubric 版本
+  - 新增 `calibration workflow` 视图：
+    - `GET /api/calibration/workflow`
+    - 现在会结构化返回：
+      - active calibration set
+      - positive / negative / boundary example counts
+      - active prompt versions
+      - active rubric versions
+      - latest evaluation run
+      - failed examples
+      - failed boundary examples
+  - `debug state` 也已同步暴露治理记录：
+    - `prompt_versions`
+    - `rubric_versions`
+    - `calibration_workflow`
+  - `Calibration Status` 面板已升级为 workflow 视图，不再只显示粗粒度 evaluation summary：
+    - 可直接看到 active prompt/rubric 版本
+    - 可直接看到 boundary examples 数量
+    - 可直接看到最近失败的 boundary cases
+  - `list_calibration_sets()` 现在会附带 `example_type_counts`，后续做 boundary-focused set 管理时不需要再额外扫表
+  - 本阶段新增回归测试覆盖：
+    - workflow endpoint 暴露 active governance versions
+    - workflow endpoint 汇总 boundary failures
+    - debug state 暴露 prompt/rubric 治理记录
+  - 本阶段验证结果：
+    - 定向 governance workflow 测试通过
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 65 个
+
+- 已完成 `PRD Track I` 的真实 Google Docs 导出收口大阶段：
+  - `gws` 导出不再只是“能试一下”的薄封装，而是已补齐真正的 create / append / failure 三态：
+    - 新文档导出走 `create`
+    - 已有文档导出走 `append`
+    - `gws` 批量写入失败会显式记录为 `export_failed`
+  - 已修正旧 append 语义不真实的问题：
+    - 旧实现向已有文档导出时，仍然按 index 1 开始插入，请求语义更像“重新写一份”
+    - 新实现会先读取目标 Google Doc 的末尾位置，再把 export requests 做 index 偏移，真正追加到文档尾部
+  - `exports` 持久层记录已增强：
+    - 新增 `export_mode`
+    - 新增 `error_message`
+    - 现在导出 job 会清楚区分：
+      - `artifact_only`
+      - `exported`
+      - `export_failed`
+    - 也能区分本次是：
+      - `artifact_only`
+      - `create`
+      - `append`
+  - `ExportService` 现在会把 gws 的真实失败原因优先从 `stderr/stdout` 提炼出来，而不是只留下 Python 包装异常文本
+  - 本阶段新增回归测试覆盖：
+    - `gws` create 模式
+    - `gws` append 模式
+    - `gws` failure 持久化结果
+  - 本阶段验证结果：
+    - 定向 Google Docs export 测试通过
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 63 个
+
+- 已完成 `PRD C-006` 的 access queue 回流闭环：
+  - 新增正式 reactivation 主链：
+    - `POST /api/access-queue/{queue_item_id}/reactivate`
+    - 输入本地全文路径后，系统会：
+      - 重新摄取 PDF/HTML
+      - 更新 paper 为 `open_fulltext`
+      - 重新进入 parse
+      - 再按该 paper 关联的 topic runs 重新执行 card generation
+  - 新增 `AccessQueueService`：
+    - 负责 queue item 校验、全文摄取、paper 状态回写、topic run 回流与 run 状态收口
+  - Repository 新增 access queue / topic-paper 关联能力：
+    - `get_access_queue_item()`
+    - `update_access_queue_item()`
+    - `list_topic_runs_for_paper_run()`
+    - `count_open_access_queue_for_topic()`
+  - 控制台 `Access Queue` 面板已支持直接操作：
+    - 每条 open queue item 现在有 `Reactivate` 按钮
+    - 输入本地全文路径后即可把该 paper 拉回主链，而不必重建整个 run
+  - reactivation 完成后：
+    - queue item 状态会变成 `reactivated`
+    - 相关 topic run 会重新收口
+    - run 状态也会同步刷新
+  - 本阶段新增回归测试覆盖：
+    - 有效本地全文路径可完成 reactivation 并重新进入主链
+    - 缺失文件路径会被 API 正确拒绝为 `400`
+  - 本阶段验证结果：
+    - 定向 access queue reactivation 测试通过
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 63 个
+
+- 已完成 `PRD Track J` 的一整个运行可观测性收口大阶段：
+  - 已统一 topic run 的运行态数据契约：
+    - `stats_json` 现在会持续携带
+      - `current_stage`
+      - `stage_started_at`
+      - `last_progress_at`
+      - `parsed_papers`
+      - `card_generation_attempts`
+      - `failure_log`
+    - 阶段现在可明确区分为：
+      - `discovery`
+      - `acquisition`
+      - `parsing`
+      - `card_generation`
+      - `review_ready`
+      - `completed`
+      - `failed`
+  - Repository 侧新增标准化观测投影：
+    - `list_runs()` / `get_run()` 现在会附带 `progress_summary`
+    - `list_topic_runs()` / `get_topic_run()` 现在会附带：
+      - `current_stage`
+      - `elapsed_seconds`
+      - `stage_elapsed_seconds`
+      - `last_progress_seconds_ago`
+      - `derived_status`
+      - `latest_failures`
+  - `derived_status` 已支持：
+    - `running`
+    - `waiting_for_access`
+    - `stalled`
+    - `completed`
+    - `failed`
+  - 已补 run 级 progress summary：
+    - 可直接看到每个 run 的
+      - topic 总数 / 完成数 / 失败数
+      - discovered papers
+      - accessible papers
+      - parsed papers
+      - carded cards
+      - judged cards
+      - reviewed cards
+      - exported cards
+  - 已补 failure logging 与 retry hook：
+    - topic run 现在会把 acquisition / parsing / card generation / topic-level failure 写入 `failure_log`
+    - 新增 `POST /api/topic-runs/{topic_run_id}/retry`
+    - 失败 topic run 可以直接重试，而不需要重建整个 run
+  - 已完成 timeout budget 收口：
+    - 新增配置项：
+      - `P2B_DISCOVERY_TIMEOUT_SECONDS`
+      - `P2B_REMOTE_ASSET_TIMEOUT_SECONDS`
+      - `P2B_STALLED_AFTER_SECONDS`
+    - discovery 现在走 topic-level budget
+    - remote asset acquisition 现在走配置化下载 budget
+    - 长时间工作不再只能“看起来在跑”，而是会收口成可见失败或派生停滞态
+  - 控制台已同步增强：
+    - `Run Status` 现在展示：
+      - run progress summary
+      - topic derived status
+      - current stage
+      - elapsed seconds
+      - latest failures
+      - retry action
+    - `Calibration Status` 现在额外展示 failed examples 数量与标题
+  - 本阶段新增回归测试覆盖：
+    - runs API 返回 `progress_summary`
+    - topic runs 返回 `current_stage` / `derived_status` / elapsed
+    - `waiting_for_access` / `stalled` 派生状态
+    - discovery timeout 会把 topic/run 收口为失败
+    - 并发 run 回归仍通过
+  - 本阶段验证结果：
+    - 定向 observability 测试通过
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 58 个
+
+- 已完成一整个“run 调度死锁修复”大阶段：
+  - 现象与根因已彻底定位：
+    - 老实现里 `RunCoordinator` 让同一个 `ThreadPoolExecutor` 同时承载：
+      - topic run 任务
+      - run finalize 任务
+      - paper 子任务
+    - 在多个 run 并发、且 topic 内部继续提交 paper 子任务时，worker 会被 topic/finalize 占满，导致 paper 任务拿不到执行机会，run 长时间停留在 `running`
+  - 已完成根治性修复：
+    - `run finalize` 不再占用共享 topic executor，改为独立后台线程等待 topic futures
+    - topic 内部的 paper 处理不再提交回同一个共享 executor，而是使用独立的 paper-level executor 执行并等待
+    - 这样 topic-level 调度与 paper-level 调度解耦，避免多层任务互相饿死
+  - 已补齐并发回归测试：
+    - 新增 `max_workers=2` 场景下的并发 run 回归
+    - 同时启动两个 run，验证都能顺利从 `running` 收口到 `completed`
+    - 同时确保原有 discovery / timeout / saturation 相关链路不回退
+  - 已做全量验证：
+    - 定向并发调度回归通过
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 56 个
+  - 已处理线上遗留状态：
+    - 将两个因旧调度实现而卡住的 run 标记为 `failed`
+    - 对应 topic run 也同步标记为 `failed`
+    - 已重启 `8000` 服务，当前运行的是包含死锁修复的新版本
+
+- 已完成 `PRD Track K` 的本阶段 stop recommendation 收口：从“看见 flattening”推进到“给出可审阅的停止建议”
+  - 新增可审阅 stop policy：
+    - `default_saturation_stop_policy()` 统一定义 stop 判定阈值
+    - 当前策略明确要求：
+      - 至少已有 2 次 snapshot
+      - duplication ratio 达到阈值
+      - flattening signal 成立
+      - tail 增量为 0
+      - 相比上一轮 duplication ratio 没有明显回落
+  - 新增 `evaluate_saturation_stop()`：
+    - 产出结构化 `stop_decision`
+    - 输出：
+      - `decision`
+      - `reason`
+      - `policy`
+      - `checks`
+    - 当前决策值包括：
+      - `insufficient_history`
+      - `continue_search`
+      - `candidate_stop`
+  - `RunCoordinator` 现在会在 topic run 完成时：
+    - 先计算 `saturation_metrics`
+    - 再结合历史 snapshots 计算 stop recommendation
+    - 把结果写回：
+      - `stats["saturation_stop"]`
+      - `stats["saturation_metrics"]["stop_decision"]`
+  - `topic_saturation_snapshots` 持久层新增字段：
+    - `stop_decision`
+    - `stop_reason`
+    - `stop_policy_json`
+    - migration 已兼容旧库补列
+  - saturation trend API 现已暴露：
+    - `latest_stop_decision`
+    - `latest_stop_reason`
+    - `latest_stop_policy`
+  - 控制台增强：
+    - `Run Status` 的 topic stats summary 现在会直接显示 `stop=<decision>`
+    - `Saturation Trends` 面板新增：
+      - `Stop`
+      - `Reason`
+    - 用户可以直接看到系统为什么建议继续搜索，或为什么进入 `candidate_stop`
+  - 本阶段新增回归测试覆盖：
+    - history 不足时必须返回 `insufficient_history`
+    - flattening + 高 duplication + 零 tail 时可返回 `candidate_stop`
+    - `/api/saturation/topics` 可返回最新 stop decision / reason
+    - topic run stats 会带上 `saturation_stop`
+  - 本阶段验证结果：
+    - 定向 saturation/stop 测试通过
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 55 个
+
+- 已完成 `PRD Track K` 的再下一阶段：从“单次 run 内可见的指标”推进到“跨 run 的饱和趋势账本与查询面板”
+  - 新增 `topic_saturation_snapshots` 表：
+    - 每个 `topic_run` 在完成时都会持久化一条饱和快照
+    - 快照包含：
+      - `card_count`
+      - `near_duplicate_cards`
+      - `same_pattern_cards`
+      - `novel_cards`
+      - `semantic_duplication_ratio`
+      - `likely_flattening`
+      - `tail_incremental_new_cards`
+      - `search_strategy_comparison`
+      - 全量 `saturation_metrics_json`
+  - `Repository` 新增：
+    - `create_topic_saturation_snapshot()`
+    - `list_topic_saturation_snapshots()`
+    - `list_topic_saturation_trends()`
+  - trend 聚合逻辑现已支持：
+    - latest snapshot
+    - previous snapshot
+    - duplication ratio delta
+    - latest flattening flag
+    - latest tail incremental sequence
+    - 最近若干次 history 明细
+  - `app/main.py` 新增 API：
+    - `GET /api/saturation/topics?topic=<optional>&history_limit=<n>`
+    - 返回：
+      - `snapshots`
+      - `trends`
+  - `debug state` 现在会附带 `saturation_trends`
+  - 控制台新增 `Saturation Trends` 面板：
+    - 支持按 topic 过滤
+    - 直接显示：
+      - latest run
+      - cards
+      - duplication ratio
+      - delta
+      - flattening
+      - tail
+    - 可展开 `History` 看完整历史 JSON
+  - 这轮同时补强了迁移健壮性：
+    - discovery / saturation 相关索引现在按“表是否存在”分别创建
+    - 避免最小旧库/最小迁移测试场景缺表时报错
+  - 本阶段新增回归测试覆盖：
+    - run 完成后可通过 `/api/saturation/topics` 查询到 snapshot/trend
+    - trend 可正确比较 latest vs previous 并计算 ratio delta
+    - 首页结构包含 saturation trend 面板元素
+  - 本阶段验证结果：
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 53 个
+
+- 已完成 `PRD Track K` 的下一阶段：把单次 run 指标升级为跨 run 饱和趋势能力
+  - 新增 topic-level saturation ledger：
+    - `topic_saturation_snapshots` 持久层表已落地
+    - 每个 topic run 在 `completed` 时都会写入一条快照（含 duplication ratio、flattening、strategy comparison 等核心字段）
+  - 新增跨 run 查询能力：
+    - `Repository.list_topic_saturation_snapshots()`
+    - `Repository.list_topic_saturation_trends()`
+    - 可以按 topic 查看历史，也可看最新 vs 上一次的 duplication ratio 变化
+  - 新增 API：
+    - `GET /api/saturation/topics?topic=<optional>&history_limit=<n>`
+    - 返回：
+      - `snapshots`（明细）
+      - `trends`（latest/previous/delta/flattening）
+  - `debug state` 增补了 `saturation_trends`，便于快速诊断
+  - 控制台新增 `Saturation Trends` 面板：
+    - 支持 topic 过滤
+    - 表格展示 latest ratio、ratio delta、flattening、tail
+    - 支持展开历史 JSON
+  - 为确保旧库和最小迁移测试稳定：
+    - `ensure_discovery_indexes()` 改为“按表存在性逐个建索引”，避免缺表时报错
+  - 补齐回归测试：
+    - run 结束后可通过 `/api/saturation/topics` 查询到 trend/snapshot
+    - trend 可比较 latest vs previous 并产出 delta
+    - 首页结构测试覆盖 saturation panel 元素
+  - 本阶段验证：
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 53 个
+
+- 已完成按 `PRD K-004` 推进的“策略矩阵 + 增量收益比较”大阶段：
+  - discovery 不再是“topic 一把梭”：
+    - 新增 `build_topic_search_strategies()`，每个 topic 会生成有序策略矩阵（`core / mechanism / application / recency`）
+    - 每条策略具备 `strategy_family`、`strategy_type`、`strategy_order`、`query_text`、`params`
+  - `DiscoveryService` 现在按“策略 × provider”执行，并把策略上下文回填到每条 discovery source：
+    - provider 侧签名升级为可接收 strategy 上下文（保留旧签名兼容）
+    - OpenAlex / Crossref 支持 `year_from`（recent window）参数
+    - arXiv 的 recent 策略会切到提交时间排序
+  - discovery ledger 结构进一步标准化：
+    - `discovery_strategies` 新增 `strategy_family`、`strategy_order`
+    - `discovery_results` 查询现在会带回 strategy family/order
+    - migration 已兼容“老测试只建最小表结构”的场景（缺表时安全跳过）
+  - topic run 指标从“静态计数”升级为“可比较增量收益”：
+    - `search_strategy_comparison` 现在包含：
+      - `incremental_new_papers`
+      - `incremental_new_cards`
+      - `strategy_family`
+      - `strategy_order`
+    - 新增 `flattening_signal`：
+      - 最近策略尾窗的增量卡片序列
+      - `likely_flattening` 早期信号
+  - 这轮补齐了策略链相关回归测试：
+    - 策略矩阵顺序与策略族验证
+    - DiscoveryService 是否把策略上下文传给 provider
+    - cross-provider dedupe 仍可用（并且带策略顺序）
+    - run 级 strategy/result 记录与 dedupe 状态
+    - early saturation metrics 的增量字段与 flattening 信号
+  - 验证结果：
+    - 全量 `python -m unittest tests.test_app` 通过
+    - 当前测试总数增至 51 个
+
 - 已按 `PRD` 推进 discovery / dedupe / saturation 的下一个大阶段：
   - 已完成 `Track C` 的 discovery foundation 收口：
     - `DiscoveryService` 不再是硬编码的“两路搜一下就结束”，而是正式引入 provider 抽象
@@ -307,62 +782,82 @@ Main sections: completed work, pending work, known issues, and next starting poi
     - `/api/llm/smoke` 的内置示例主题/论文/段落已改成中文
   - 首页新增 calibration status 区块，可看到 active calibration set 和最近一次 evaluation summary
   - 当前测试总数已增至 30 个，并全部通过
+- 已完成本轮“单篇真实论文质量迭代”闭环（对齐 `CONCEPT.md`）：
+  - `app/llm.py`：
+    - 新增 Stage A / Stage B 语义接口：
+      - `build_paper_understanding()`
+      - `build_card_plan()`
+    - 新增 understanding / plan 归一化：
+      - `_normalize_understanding_payload()`
+      - `_normalize_card_plan_payload()`
+    - 新增真实联调稳定性修复：provider 客户端统一重试（429/5xx/timeout/部分可恢复 SSL/URLError）
+  - `app/services.py`：
+    - `PaperPipeline._build_paper_understanding()` 升级为 LLM 优先、启发式回退，并收敛 `selection_overview`（替代超大 `selection_diagnostics` 工件噪声）
+    - `PaperPipeline._build_card_plan()` 升级为 LLM 优先、启发式回退
+    - 修复单篇验证一致性根因：`validate_single_paper_flow()` 生成卡片时复用同一版 understanding + card_plan（不再“落盘一版、生成再跑一版”）
+    - 强化 plan 对齐：`_align_cards_to_plan()` 要求 must-have evidence overlap，且在缺失 `primary_section_ids` 时回退到 `evidence.section_id`
+  - `tests/test_app.py`：
+    - 新增 LLM client 重试链路测试（瞬时 URLError、429）
+    - 新增 plan 对齐回归测试（必须命中 must-have evidence）
+    - 新增单篇验证工件一致性断言（final card 的 `plan_id` 必须来自 produce 计划槽位）
+  - 真实论文复跑结果（最新）：
+    - run_id: `run_1253950f2261414b993999f862b5d9bc`
+    - artifacts: `data/validation/run_1253950f2261414b993999f862b5d9bc_paper_dad4d44180d24040992b5dec6f99d9d2_topic_cdc4a00ed5fd41e19e6eef5f5b9e88a6/`
+    - 质量对比：旧 run 的 `Markdown Extraction` 泛标签已消失；新 run 的对象命名、层级与证据锚点均为语义对象；最终卡片从“弱计划绑定”提升到“计划对齐+可教学对象”。
+  - 当前测试总数已增至 79 个，并全部通过
+- 已完成连续迭代第2轮（从“流程对齐”升级到“价值对齐”）：
+  - `app/services.py` 新增 `CONCEPT` 后置硬门禁：
+    - `has_concept_belief_gap_signal()`：要求卡片具备“信念落差/认知反转”信号
+    - `has_named_course_object_signal()`：要求课程转化字段具备可命名课程对象特征
+    - `_gate_judged_cards_for_concept_alignment()`：在 judge 后、plan 对齐前执行硬过滤
+  - 第1轮已移除固定产量约束并保留后段治理：
+    - `app/llm.py` extraction 上限从 3 提升到 8
+    - planning 从固定 `max_cards=3` 改为无固定上限（以证据与价值决定）
+    - `app/services.py` fallback planner 不再按 3 槽硬限制 produce
+  - 真实论文复跑（第2轮硬门禁后）：
+    - run_id: `run_777ac440d6ae4cfe827b0a550e6b92ae`
+    - 产物目录：`data/validation/run_777ac440d6ae4cfe827b0a550e6b92ae_paper_dad4d44180d24040992b5dec6f99d9d2_topic_cdc4a00ed5fd41e19e6eef5f5b9e88a6/`
+    - 结果：`card_count=4`、`excluded_count=5`
+  - 测试：
+    - 新增 `test_concept_alignment_gate_requires_belief_gap_and_named_course_object`
+    - 当前测试总数已增至 80 个，并全部通过
 
 ## 还没做什么
 
-- 多源在线检索的真实联网验证
-- 真正的 Google Docs 在线写入验证
-- 更强的 PDF 图表抽取
-- 后续阶段的 calibration / saturation 实现
-- 基于 live 数据的浏览器自动化验证仍未补完；当前完成的是 API 回归、HTML/页面挂载检查、本地 `8765` 服务活体验证和 live run 数据检查
-- promote 后如果未来要支持“一个 excluded item 拆成多张 candidate card”，需要重新定义当前的一对一 linkage 不变量
+- 还未进入 saturation 阶段（按计划需先在真实论文上完成单篇验证报告的人审验收）
+- 单篇验证目前已可产出完整工件，但还缺“多篇批量对比看板”与“失败类型趋势统计”
+- 历史 run 的 pre-fix / post-fix 指标对比与 rerun 分层策略还未做完（需要按新质量指标补历史比较报表）
+- 多源在线检索和真实 provider 的联网联调仍需在你的本地可联网环境验证
+- 真实 `gws` 凭证和 Google Docs 在线写入仍需在已安装 CLI / 已登录账号的本机环境做 live 验证
+- PDF figure / asset extraction 仍是轻量实现，尚未升级到更强的图表抽取链路
+- 基于 live 数据的浏览器自动化回放仍未补完；当前以 API 回归和静态页面挂载验证为主
+- 如果未来要支持“一个 excluded item 拆成多张 candidate card”，仍需重新定义当前 promote 的一对一 linkage 不变量
 
 ## 已知的问题和 bug
 
-- 当前环境未确认可直接联网访问论文源。
-- 当前环境未安装 `gws`，Google Docs 导出需要先走工件模式或后续补 CLI/API 凭证。
-- PDF 图表抽取在 Phase 0 只保留了接口和空结果，不是完整实现。
-- `MarkItDown` 解决的是 PDF 正文/Markdown 转换问题，不等于完整 figure asset extraction；当前只保留 Markdown 图片引用和 caption 级信息，尚未把 PDF 内嵌图片导出为独立文件。
-- 当前沙箱环境禁止本地端口绑定，因此本次没有完成真实浏览器访问验证；已完成 API 层完整调用链自测。
-- 当前 PDF 解析已改为 fail-closed，不会再把明显乱码推进到 card 层；但对复杂压缩 PDF，仍可能因无法可靠提取正文而直接 `parse_failed`。
-- 已存在于数据库里的历史坏卡片不会自动消失；新 parser 只影响修复后的新 run，老 run 需要重新跑或手动清理。
-- 当前 LLM 路径已支持 OpenAI-compatible、Anthropic、Gemini，但本环境未做真实联网联调；已用 stub 测试验证集成逻辑。
-- 当前沙箱限制阻止直接写入新的 `.env` / `.env.example` dotfile；代码已支持 `.env` 加载，但实际密钥文件需要在本地环境落盘。
-- 当前沙箱既不能直接读你的 `.env` 内容，也无法从这里连到你本地启动的 `127.0.0.1:8000` 服务，因此真实 provider 的 live smoke call 无法在这个受限执行环境里完成。
-- 如果本地调用 `POST /api/llm/smoke` 返回 `404 Not Found`，优先判断为本地 `uvicorn` 仍在运行旧代码；需要重启服务进程才能加载新路由。
-- 已确认一次真实本地失败根因是 LLM provider endpoint 的 DNS / base_url 问题，而非 PDF 解析问题；当前已改为 LLM-only，因此 provider 配置不通时会显式 `0 cards`，不会再混入 heuristic 卡。
-- 当前工作区现在是 git repository；如果后续需要继续交班，优先用 `git log --oneline -n 10` 对齐最近改动。
-- 这轮内容校准改造仍然只是第一阶段：
-  - 现在已经有了 calibration corpus 的正式持久层和导入链，并且 active set 已接入 judgement prompt，但还没有 evaluation loop
-  - review 列表页还没有把 excluded content 做成单独列表或更强筛选器，目前主要在 card detail 中可见
-  - evaluation loop 还没有落库，也没有 prompt/rubric/model 的回归评估执行链
-- 上面这组三条旧交班信息已经过时：
-  - evaluation loop 现在已经落库并能通过 API / CLI 执行
-  - excluded content 现在已经是一等 review object，不再只存在 card detail 中
-  - 但“把 excluded item 重新提回 candidate card”还没做，仍是下一阶段工作
-- 当前 review list 虽已支持 excluded item，但还没有真正的浏览器自动化验证；本次仍以 API 层和页面 HTML 结构验证为主
-- 当前 `create_app()` 会同时创建 `LLMCardEngine` 和 `EvaluationService`，如果未来再加更多调度层，需留意启动时依赖注入不要重复膨胀
-- 如果后续要发布到 GitHub，先确认当前 remote、默认分支和忽略规则，再按现有提交规范继续推进
-- 已补 `.gitignore`，新增忽略 `.venv/`，避免首次发布时把本地虚拟环境误提交
-- 当前受限执行环境阻止创建 `.git` 目录，因此无法在这里完成 `git init` 和后续推送；如果继续发布，需要在本地终端完成初始化与 push
-- 当前 promote 流程故意是 fail-closed：如果 LLM reconsideration 返回 0 张或多于 1 张 candidate card，会直接报错交还人工，而不会自动挑一张继续
-- 当前真实页面验证仍以本地 HTTP 访问和结构检查为主，没有对 live 数据做无副作用的完整浏览器交互回放
-- 当前截图对应的 export 失败是业务规则命中：被选中的 card 尚未 `accepted`，所以 accepted-only resolver 正常拒绝导出
-- 当前一些 live LLM 产出的中文字段仍存在编码/可读性异常；这次没有直接改历史数据，只补了 evidence bilingual、paper link、review/export 交互与错误呈现
+- 单篇验证 API 默认会触发当前 LLM 链路；若本地未配置可用 LLM provider，验证会按既有逻辑返回无卡或失败信息，需要先确认 `.env` provider 可用性。
+- 新治理链路只对新生成卡片生效；历史库里已入库的弱卡与重复卡不会自动重写，需要 rerun 或人工清理。
+- 当前环境是否可直接联网访问论文源，仍未在这里完成 live 验证。
+- 当前环境如果未安装或未登录 `gws`，Google Docs 导出会自动退回工件模式或记录 `export_failed`，不会伪装成成功。
+- PDF 图表抽取仍停留在 caption / Markdown 引用级别，尚未把 PDF 内嵌图片抽成独立资产。
+- 当前 PDF 解析是 fail-closed 策略：遇到正文提取质量不足的 PDF，会直接 `parse_failed`，不会硬推入 card 层。
+- 已存在于数据库里的历史坏卡片不会自动消失；修复只影响新 run 或重新处理后的 paper。
+- 当前 LLM 路径已支持 OpenAI-compatible、Anthropic、Gemini，但这里只做了 stub / API 回归，没有做真实 provider 联调。
+- 当前 review / access queue / export UI 已有功能验证，但仍缺少完整浏览器自动化回放。
+- 当前 promote 仍故意保持 fail-closed：一个 excluded item 只能稳定回流成恰好一张 candidate card，否则交还人工处理。
 
 ## 下次开始时应该先做什么
 
-- 先跑一遍 `python3 -m unittest tests/test_app.py` 确认 Phase 0 没坏。
-- 如果要验证 LLM-only 主链路，优先在 `.venv` 里启动服务，并确认 `.env` 里的 provider/base_url/model/api_key 可解析、可联网。
-- 如果本地 PDF intake、card 生成和 export 仍正常，再接 discovery 的真实联网联调。
-- 如果需要老板可直接打开的 Google Doc，再接 `gws` 或官方 Docs API 写入流程。
-- 后续如果要提高 PDF 成功率，优先接入正式 PDF 解析库（如 `pypdf` 或 `PyMuPDF`），在保留当前质量闸门的前提下提升正文召回。
-- 先在本地补上 `.env`，再用真实 LLM API 对少量 topic 做联调，并根据输出修 prompt/schema。
-- 下一次若继续做 live 联调，优先在你本地终端直接执行 `python3 scripts/live_llm_smoke_test.py` 或调用 `/api/llm/smoke`。
-- 下一次如果继续提高出卡质量，优先做内容层校准：先整理 5-8 张强正样本、5-8 张强负样本、5-10 个边界 case，再据此改 LLM prompt 和评审 rubric，而不是继续盲调模型。
-- 下一次如果继续做内容校准，先跑一遍当前 44 个测试，再补：
-  - 现在应先跑当前 44 个测试
-  - 然后优先决定 promote 的 fail-closed 行为是否要继续保持“恰好 1 张卡”，还是扩成“1 个 excluded 可回流多张 card”
-  - 如果 promote / export 主链稳定，再优先处理 live LLM 中文乱码/编码质量问题
-  - 然后继续 saturation / boundary-case workflow 的后续阶段
-- 如果下一次继续做 GitHub 发布之后的开发，先确认远端主分支和默认分支名称，再按 `[module] description` 规范继续提交
+- 先跑一遍 `python -m pytest tests/test_app.py`，当前基线应为 80 个测试全部通过。
+- 先选 1 篇真实论文执行单篇验证：
+  - `POST /api/papers/{paper_id}/validate-single`
+  - 人工审阅生成的 `single_paper_validation_report.md`
+  - 确认“先理解->再规划->后生成”的三段结果符合 `ROOT_CAUSE_REMEDIATION_PLAN.md`
+- 单篇通过后再进入 saturation 相关指标和策略扩展，避免先扩规模再回头修根因。
+- 如果要做真实联调，优先在你本地启动最新服务进程，并确认 `.env` 中的 provider / base_url / model / api_key / `gws` 凭证都可用。
+- 然后做三条 live 验证：
+  - 跑一个真实 topic run，确认 discovery / access queue / card 主链正常
+  - 用一条 access queue item 执行 `Reactivate`，确认 paper 能重新进入 parse / card generation
+  - 走一次真实 Google Docs create 或 append，确认不是 `artifact_only`
+- 如果下一阶段要继续提高 PDF 成功率，优先升级 PDF 正文与 figure extraction 能力，而不是继续堆 prompt 补丁。
+- 如果下一阶段要提高内容质量，优先利用现有 calibration workflow 补更多 boundary cases，再基于失败边界样本修 prompt / rubric。

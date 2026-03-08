@@ -3,3 +3,6 @@ uvicorn
 pydantic
 markitdown[pdf]
 httpx
+beautifulsoup4
+Pillow
+PyMuPDF
