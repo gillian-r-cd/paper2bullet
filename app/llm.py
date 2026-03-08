@@ -17,12 +17,12 @@ from typing import Any, Callable, Optional
 
 from .config import LLMProviderConfig, Settings
 
-SHARED_PROMPT_POLICY_VERSION = "llm-shared-policy-v3-plain-english"
-EXTRACTION_PROMPT_VERSION = "llm-card-extract-v7-plain-english-zh"
+SHARED_PROMPT_POLICY_VERSION = "llm-shared-policy-v4-off-topic-gate"
+EXTRACTION_PROMPT_VERSION = "llm-card-extract-v8-off-topic-gate-zh"
 JUDGEMENT_PROMPT_VERSION = "llm-card-judge-v8-plain-english-zh"
 CARD_RUBRIC_VERSION = "llm-card-rubric-v7-plain-english"
-UNDERSTANDING_PROMPT_VERSION = "llm-paper-understanding-v4-plain-english"
-CARD_PLAN_PROMPT_VERSION = "llm-card-plan-v5-plain-english"
+UNDERSTANDING_PROMPT_VERSION = "llm-paper-understanding-v5-off-topic-gate"
+CARD_PLAN_PROMPT_VERSION = "llm-card-plan-v6-off-topic-gate"
 MAX_PROMPT_SECTIONS = 14
 MAX_PROMPT_FIGURES = 4
 MAX_CALIBRATION_EXAMPLES = 6
@@ -31,30 +31,30 @@ PROMPT_VERSION_RECORDS = [
     {
         "version": UNDERSTANDING_PROMPT_VERSION,
         "stage": "paper_understanding",
-        "summary": "Understanding stage that finds the paper's concrete card-worthy objects before any course packaging.",
+        "summary": "Understanding stage that decides paper-level course worthiness before extracting concrete card-worthy objects.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "uses_figures": True,
             "uses_stage_examples": False,
-            "stage_contract": "identify_objects_only",
+            "stage_contract": "paper_worthiness_then_identify_objects",
             "prefers_direct_transfer_patterns": True,
         },
     },
     {
         "version": CARD_PLAN_PROMPT_VERSION,
         "stage": "card_planning",
-        "summary": "Planning stage that decides which concrete objects deserve cards and binds each one to a card slot.",
+        "summary": "Planning stage that inherits the paper verdict and only plans cards for on-topic concrete objects.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "uses_stage_examples": True,
-            "stage_contract": "produce_or_exclude_only",
+            "stage_contract": "inherit_paper_verdict_then_produce_or_exclude",
             "max_cards_hint_is_soft": True,
         },
     },
     {
         "version": EXTRACTION_PROMPT_VERSION,
         "stage": "candidate_extraction",
-        "summary": "Chinese extraction that assembles quote-first cards for explicit planned slots.",
+        "summary": "Chinese extraction that assembles quote-first cards for explicit planned slots and logs zero-slot exclusions.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "language": "zh-CN learner-facing output",
@@ -258,6 +258,32 @@ def compact_text_length(text: str) -> int:
 
 def normalize_evidence_paragraph(text: str) -> str:
     return str(text or "").strip()
+
+
+def normalize_paper_relevance_verdict(value: Any, default: str = "on_topic") -> str:
+    verdict = str(value or "").strip().lower() or default
+    if verdict not in {"on_topic", "borderline_reject", "off_topic_hard"}:
+        verdict = default
+    return verdict
+
+
+def normalize_relevance_failure_type(value: Any, verdict: str) -> str:
+    failure_type = str(value or "").strip().lower()
+    allowed = {
+        "pure_technical_mismatch",
+        "cannot_name_course_object",
+        "long_transfer_distance",
+        "taxonomy_not_insight",
+        "weak_method_or_data",
+        "low_hanging_fruit",
+        "topic_word_overlap_only",
+        "other",
+    }
+    if verdict == "on_topic":
+        return ""
+    if failure_type not in allowed:
+        return "other"
+    return failure_type
 
 
 def looks_like_complete_translation(source_text: str, translated_text: str) -> bool:
@@ -728,20 +754,23 @@ class LLMCardEngine:
             "top_level_rules": [
                 "A card is one atomic pattern or one atomic data finding, not a summary, topic label, or outline slot.",
                 "Start from the paper's concrete object and stay close to it before doing any course naming.",
+                "Treat a paper as invalid for this pipeline when it cannot yield a concrete course object, not only when topic words mismatch.",
                 "A card survives only if it can create a real learner shift and has short distance to course use.",
                 "The shift should come from a deeper mechanism, a counterintuitive claim, or something learners feel but cannot name clearly.",
                 "Every surviving card must be actionable in understanding, attitude, or method.",
                 "Use body evidence as the main material whenever body evidence exists.",
                 "Keep the original figure when the figure is needed to understand the point.",
-                "Reject recap, taxonomy, survey framing, generic advice, obvious 2026 claims, and wording that drifts above the source object.",
+                "Reject recap, taxonomy, survey framing, generic advice, obvious 2026 claims, weak evidence, and wording that drifts above the source object.",
             ],
         }
 
     def _stage_spec(self, stage: str) -> dict[str, Any]:
         specs = {
             "paper_understanding": {
-                "stage_goal": "Find the paper's concrete objects that could later become cards.",
+                "stage_goal": "Judge whether the paper is worth entering this course pipeline, then find concrete objects only when it is.",
                 "must_do": [
+                    "Return a paper-level verdict before proposing any object: on_topic, borderline_reject, or off_topic_hard.",
+                    "Name the exact failure type when the paper should not continue.",
                     "Map each object to section evidence and figure evidence.",
                     "Prefer a single complete pattern or data finding over a broad umbrella label.",
                     "Mark the object at the right size: overall, local, or detail.",
@@ -749,11 +778,13 @@ class LLMCardEngine:
                 "must_not_do": [
                     "Do not decide course naming or green/yellow/red here.",
                     "Do not turn literature structure, survey framing, or broad themes into objects.",
+                    "Do not rescue a topic-adjacent paper if you still cannot say what it becomes in the course.",
                 ],
             },
             "card_planning": {
-                "stage_goal": "Decide which concrete objects deserve cards and what each card would be in the course.",
+                "stage_goal": "Inherit the paper-level verdict and plan cards only for objects that are worth carrying forward.",
                 "must_do": [
+                    "Respect the understanding verdict before planning any card.",
                     "Answer what each produced object becomes in the course.",
                     "State the learner shift that makes the card worth keeping.",
                     "Require must-have section ids and figure ids when they are central.",
@@ -770,6 +801,7 @@ class LLMCardEngine:
                     "Keep the candidate close to the paper-specific object.",
                     "Use quotes and source evidence as the main body material.",
                     "Add only brief analysis instead of rewriting the paper into a cleaner doctrine.",
+                    "When no planned slots survive, emit zero cards and log explicit exclusions only.",
                 ],
                 "must_not_do": [
                     "Do not do final color judgement here.",
@@ -884,6 +916,7 @@ class LLMCardEngine:
         sections: list[dict],
         figures: Optional[list[dict]] = None,
         planned_cards: Optional[list[dict]] = None,
+        planning_context: Optional[dict[str, Any]] = None,
         calibration_examples: Optional[list[dict]] = None,
         calibration_set_name: str = "",
     ) -> dict[str, list[dict]]:
@@ -901,6 +934,7 @@ class LLMCardEngine:
                 prompt_sections=prompt_sections,
                 prompt_figures=prompt_figures,
                 planned_cards=planned_cards or [],
+                planning_context=planning_context or {},
                 calibration_examples=selected_examples,
                 stage_examples=stage_examples,
                 calibration_set_name=calibration_set_name,
@@ -1085,6 +1119,12 @@ class LLMCardEngine:
                 "sections": prompt_sections,
                 "figures": prompt_figures,
                 "requirements": {
+                    "paper_relevance_rules": [
+                        "First decide whether this paper is worth entering this course pipeline, not just whether topic words overlap.",
+                        "Use off_topic_hard only for clear cases: pure technical mismatch, obvious topic-word-overlap-only, or clearly unusable input for this learner and topic.",
+                        "Use borderline_reject for close-but-not-worth-it cases where the paper seems related yet still cannot cleanly become a course object.",
+                        "If verdict is not on_topic, return global_contribution_objects as an empty list.",
+                    ],
                     "object_requirements": [
                         "Object labels must be concrete and plain, not generic section names like 'Markdown Extraction'.",
                         "Each object should be one atomic pattern or one atomic data finding, not a mixed basket.",
@@ -1103,6 +1143,9 @@ class LLMCardEngine:
                     ],
                 },
                 "output_schema": {
+                    "paper_relevance_verdict": "on_topic|borderline_reject|off_topic_hard",
+                    "paper_relevance_reason": "一句话说明为什么这篇论文值得继续或不值得继续",
+                    "relevance_failure_type": "pure_technical_mismatch|cannot_name_course_object|long_transfer_distance|taxonomy_not_insight|weak_method_or_data|low_hanging_fruit|topic_word_overlap_only|other",
                     "global_contribution_objects": [
                         {
                             "id": "obj_1",
@@ -1171,6 +1214,9 @@ class LLMCardEngine:
                 "understanding": understanding,
                 "requirements": {
                     "planning_rules": [
+                        "Inherit the paper_relevance_verdict from understanding before you plan anything.",
+                        "If paper_relevance_verdict is off_topic_hard, produce zero cards.",
+                        "If paper_relevance_verdict is borderline_reject, default to zero cards unless the understanding payload already contains a clearly teachable concrete object with short transfer distance.",
                         "Do not force card counts; 0 card is allowed when no object is teachable.",
                         "A planned card must be one card, not a theme bucket or a paper recap.",
                         "A planned card should center on one atomic pattern or one atomic data finding.",
@@ -1186,6 +1232,9 @@ class LLMCardEngine:
                     ]
                 },
                 "output_schema": {
+                    "paper_relevance_verdict": "on_topic|borderline_reject|off_topic_hard",
+                    "paper_relevance_reason": "沿用或补充 paper-level verdict 的原因",
+                    "relevance_failure_type": "pure_technical_mismatch|cannot_name_course_object|long_transfer_distance|taxonomy_not_insight|weak_method_or_data|low_hanging_fruit|topic_word_overlap_only|other",
                     "planned_cards": [
                         {
                             "plan_id": "plan_obj_1",
@@ -1286,6 +1335,7 @@ class LLMCardEngine:
         prompt_sections: list[dict],
         prompt_figures: list[dict],
         planned_cards: list[dict],
+        planning_context: dict[str, Any],
         calibration_examples: list[dict],
         stage_examples: list[dict],
         calibration_set_name: str,
@@ -1293,6 +1343,15 @@ class LLMCardEngine:
         context_sections = [section for section in prompt_sections if section.get("role_hint") == "context"]
         primary_sections = [section for section in prompt_sections if section.get("role_hint") == "primary"]
         supporting_sections = [section for section in prompt_sections if section.get("role_hint") == "supporting"]
+        paper_relevance_verdict = normalize_paper_relevance_verdict(
+            planning_context.get("paper_relevance_verdict"),
+            default="on_topic",
+        )
+        paper_relevance_reason = str(planning_context.get("paper_relevance_reason", "")).strip()
+        relevance_failure_type = normalize_relevance_failure_type(
+            planning_context.get("relevance_failure_type"),
+            paper_relevance_verdict,
+        )
         return {
             "topic": topic_name,
             "paper_title": paper_title,
@@ -1304,6 +1363,9 @@ class LLMCardEngine:
             "stage_spec": self._stage_spec("candidate_extraction"),
             "stage_examples": stage_examples,
             "calibration_examples": calibration_examples,
+            "paper_relevance_verdict": paper_relevance_verdict,
+            "paper_relevance_reason": paper_relevance_reason,
+            "relevance_failure_type": relevance_failure_type,
             "sections": prompt_sections,
             "context_sections": context_sections,
             "primary_candidate_sections": primary_sections,
@@ -1331,6 +1393,7 @@ class LLMCardEngine:
                     "Prefer a workflow, decision point, failure mode, comparison structure, mechanism, or evidence-backed data point that the learner can picture directly.",
                     "Ground the card in the provided section_ids, and include figure_ids when a figure materially supports or anchors the idea.",
                     "If planned_card_slots are provided, each surviving candidate must clearly match exactly one slot.",
+                    "If planned_card_slots are empty, emit zero cards.",
                 ],
                 "card_shape_rules": [
                     "Write all card-facing strings in Simplified Chinese.",
@@ -1363,6 +1426,11 @@ class LLMCardEngine:
                     "Claims that only describe what this paper is generally about without naming its concrete contribution object.",
                     "Candidates that do not clearly match any provided planned_card_slot.",
                 ],
+                "zero_slot_behavior": [
+                    "When planned_card_slots are empty, do not invent a rescue card.",
+                    "Use excluded_content to record why this paper or this remaining content should not continue.",
+                    "Reuse the paper_relevance_verdict and relevance_failure_type when they already explain the exclusion.",
+                ],
             },
             "output_schema": {
                 "cards": [
@@ -1392,7 +1460,7 @@ class LLMCardEngine:
                     {
                         "label": "中文排除项名称",
                         "section_ids": ["section_id"],
-                        "exclusion_type": "background|summary|weak_transfer|wrong_audience|replaced_by_stronger_card|insufficient_evidence|other",
+                        "exclusion_type": "background|summary|weak_transfer|wrong_audience|replaced_by_stronger_card|insufficient_evidence|pure_technical_mismatch|cannot_name_course_object|long_transfer_distance|taxonomy_not_insight|weak_method_or_data|low_hanging_fruit|topic_word_overlap_only|other",
                         "reason": "中文简短理由，说明为什么这部分不应该出卡",
                     }
                 ],
@@ -1684,6 +1752,13 @@ class LLMCardEngine:
                 "wrong_audience",
                 "replaced_by_stronger_card",
                 "insufficient_evidence",
+                "pure_technical_mismatch",
+                "cannot_name_course_object",
+                "long_transfer_distance",
+                "taxonomy_not_insight",
+                "weak_method_or_data",
+                "low_hanging_fruit",
+                "topic_word_overlap_only",
                 "other",
             }:
                 exclusion_type = "other"
@@ -1823,6 +1898,16 @@ class LLMCardEngine:
     ) -> dict[str, Any]:
         section_id_set = {section.get("id", "") for section in sections}
         figure_id_set = {figure.get("id", "") for figure in figures}
+        raw_objects = payload.get("global_contribution_objects", [])
+        paper_relevance_verdict = normalize_paper_relevance_verdict(
+            payload.get("paper_relevance_verdict"),
+            default="on_topic" if isinstance(raw_objects, list) and raw_objects else "borderline_reject",
+        )
+        paper_relevance_reason = str(payload.get("paper_relevance_reason", "")).strip()
+        relevance_failure_type = normalize_relevance_failure_type(
+            payload.get("relevance_failure_type"),
+            paper_relevance_verdict,
+        )
         figure_ids_by_section: dict[str, list[str]] = {}
         for figure in figures:
             figure_id = str(figure.get("id", "")).strip()
@@ -1832,7 +1917,6 @@ class LLMCardEngine:
                 normalized_section_id = str(section_id).strip()
                 if normalized_section_id:
                     figure_ids_by_section.setdefault(normalized_section_id, []).append(figure_id)
-        raw_objects = payload.get("global_contribution_objects", [])
         raw_graph = payload.get("contribution_graph", [])
         raw_hints = payload.get("candidate_level_hints", {})
         if not isinstance(raw_objects, list):
@@ -1840,6 +1924,10 @@ class LLMCardEngine:
         if not isinstance(raw_graph, list):
             raw_graph = []
         if not isinstance(raw_hints, dict):
+            raw_hints = {}
+        if paper_relevance_verdict != "on_topic":
+            raw_objects = []
+            raw_graph = []
             raw_hints = {}
         objects = []
         for index, item in enumerate(raw_objects[:8], start=1):
@@ -1887,6 +1975,9 @@ class LLMCardEngine:
             )
         if not objects:
             return {
+                "paper_relevance_verdict": paper_relevance_verdict,
+                "paper_relevance_reason": paper_relevance_reason,
+                "relevance_failure_type": relevance_failure_type,
                 "global_contribution_objects": [],
                 "contribution_graph": [],
                 "candidate_level_hints": {},
@@ -1917,6 +2008,9 @@ class LLMCardEngine:
             for item in objects
         }
         return {
+            "paper_relevance_verdict": paper_relevance_verdict,
+            "paper_relevance_reason": paper_relevance_reason,
+            "relevance_failure_type": relevance_failure_type,
             "global_contribution_objects": objects,
             "contribution_graph": graph,
             "candidate_level_hints": hints,
@@ -1930,6 +2024,28 @@ class LLMCardEngine:
         *,
         max_cards: int,
     ) -> dict[str, Any]:
+        paper_relevance_verdict = normalize_paper_relevance_verdict(
+            payload.get("paper_relevance_verdict", understanding.get("paper_relevance_verdict")),
+            default=normalize_paper_relevance_verdict(
+                understanding.get("paper_relevance_verdict"),
+                default="on_topic" if understanding.get("global_contribution_objects") else "borderline_reject",
+            ),
+        )
+        paper_relevance_reason = str(
+            payload.get("paper_relevance_reason", understanding.get("paper_relevance_reason", ""))
+        ).strip()
+        relevance_failure_type = normalize_relevance_failure_type(
+            payload.get("relevance_failure_type", understanding.get("relevance_failure_type")),
+            paper_relevance_verdict,
+        )
+        if paper_relevance_verdict != "on_topic":
+            return {
+                "paper_relevance_verdict": paper_relevance_verdict,
+                "paper_relevance_reason": paper_relevance_reason,
+                "relevance_failure_type": relevance_failure_type,
+                "planned_cards": [],
+                "coverage_report": {"produce": 0, "exclude": 0, "overall": 0, "local": 0, "detail": 0},
+            }
         objects = understanding.get("global_contribution_objects", [])
         object_map = {item.get("id"): item for item in objects if isinstance(item, dict)}
         raw_cards = payload.get("planned_cards", [])
@@ -2034,6 +2150,9 @@ class LLMCardEngine:
                     best_figure_candidate["disposition"] = "produce"
                     best_figure_candidate["disposition_reason"] = ""
         return {
+            "paper_relevance_verdict": paper_relevance_verdict,
+            "paper_relevance_reason": paper_relevance_reason,
+            "relevance_failure_type": relevance_failure_type,
             "planned_cards": planned_cards,
             "coverage_report": {
                 "produce": sum(1 for item in planned_cards if item["disposition"] == "produce"),

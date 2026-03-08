@@ -4161,7 +4161,12 @@ class PaperPipeline:
                     sections=merged_sections,
                     figures=figures,
                 )
-                if llm_understanding and llm_understanding.get("global_contribution_objects"):
+                if llm_understanding and (
+                    llm_understanding.get("global_contribution_objects")
+                    or str(llm_understanding.get("paper_relevance_verdict", "")).strip().lower()
+                    in {"borderline_reject", "off_topic_hard"}
+                    or str(llm_understanding.get("paper_relevance_reason", "")).strip()
+                ):
                     llm_understanding["version"] = "understanding-v2-llm"
                     llm_understanding["topic_name"] = topic_name
                     llm_understanding["paper_title"] = paper_title
@@ -4207,6 +4212,9 @@ class PaperPipeline:
                 "version": "understanding-v1",
                 "topic_name": topic_name,
                 "paper_title": paper_title,
+                "paper_relevance_verdict": "borderline_reject",
+                "paper_relevance_reason": "Fallback understanding could not name a concrete course object from this paper.",
+                "relevance_failure_type": "cannot_name_course_object",
                 "global_contribution_objects": [],
                 "contribution_graph": [],
                 "evidence_index": {},
@@ -4228,6 +4236,9 @@ class PaperPipeline:
             "version": "understanding-v1",
             "topic_name": topic_name,
             "paper_title": paper_title,
+            "paper_relevance_verdict": "on_topic",
+            "paper_relevance_reason": "",
+            "relevance_failure_type": "",
             "global_contribution_objects": objects,
             "contribution_graph": graph,
             "evidence_index": evidence_index,
@@ -4252,12 +4263,30 @@ class PaperPipeline:
                     calibration_examples=(active_calibration_set or {}).get("examples", []),
                     calibration_set_name=(active_calibration_set or {}).get("name", ""),
                 )
-                if llm_plan and llm_plan.get("planned_cards"):
+                if llm_plan and (
+                    "planned_cards" in llm_plan
+                    or str(llm_plan.get("paper_relevance_verdict", "")).strip().lower()
+                    in {"borderline_reject", "off_topic_hard"}
+                    or str(llm_plan.get("paper_relevance_reason", "")).strip()
+                ):
                     llm_plan["version"] = CARD_PLAN_PROMPT_VERSION
                     llm_plan["topic_name"] = topic_name
                     return llm_plan
             except Exception:
                 pass
+        paper_relevance_verdict = str(understanding.get("paper_relevance_verdict", "on_topic")).strip().lower() or "on_topic"
+        paper_relevance_reason = str(understanding.get("paper_relevance_reason", "")).strip()
+        relevance_failure_type = str(understanding.get("relevance_failure_type", "")).strip().lower()
+        if paper_relevance_verdict != "on_topic":
+            return {
+                "version": "card-plan-v1",
+                "topic_name": topic_name,
+                "paper_relevance_verdict": paper_relevance_verdict,
+                "paper_relevance_reason": paper_relevance_reason,
+                "relevance_failure_type": relevance_failure_type,
+                "planned_cards": [],
+                "coverage_report": {"produce": 0, "exclude": 0, "overall": 0, "local": 0, "detail": 0},
+            }
         objects = list(understanding.get("global_contribution_objects", []))
         objects.sort(key=lambda item: float(item.get("importance_score", 0.0)), reverse=True)
         planned_cards = []
@@ -4283,6 +4312,9 @@ class PaperPipeline:
         return {
             "version": "card-plan-v1",
             "topic_name": topic_name,
+            "paper_relevance_verdict": paper_relevance_verdict,
+            "paper_relevance_reason": paper_relevance_reason,
+            "relevance_failure_type": relevance_failure_type,
             "planned_cards": planned_cards,
             "coverage_report": {
                 "produce": sum(1 for item in planned_cards if item["disposition"] == "produce"),
@@ -4389,6 +4421,7 @@ class PaperPipeline:
         sections: list[dict],
         figures: list[dict],
         planned_cards: list[dict],
+        planning_context: dict[str, Any],
         calibration_examples: list[dict],
         calibration_set_name: str,
     ) -> dict[str, Any]:
@@ -4408,6 +4441,7 @@ class PaperPipeline:
             sections=deduped,
             figures=figures,
             planned_cards=planned_cards,
+            planning_context=planning_context,
             calibration_examples=calibration_examples,
             calibration_set_name=calibration_set_name,
         )
@@ -4415,28 +4449,24 @@ class PaperPipeline:
     def _align_cards_to_plan(self, cards: list[dict], card_plan: dict[str, Any]) -> tuple[list[dict], list[dict]]:
         planned_produce = [item for item in card_plan.get("planned_cards", []) if item.get("disposition") == "produce"]
         if not planned_produce:
-            kept: list[dict] = []
+            paper_relevance_verdict = str(card_plan.get("paper_relevance_verdict", "on_topic")).strip().lower() or "on_topic"
+            paper_relevance_reason = str(card_plan.get("paper_relevance_reason", "")).strip()
+            relevance_failure_type = str(card_plan.get("relevance_failure_type", "")).strip().lower() or "other"
             excluded: list[dict] = []
             for card in cards:
-                color = (card.get("judgement") or {}).get("color", "yellow")
-                if color == "red":
-                    excluded.append(
-                        {
-                            "label": card.get("title", "未命中计划的候选"),
-                            "exclusion_type": "other",
-                            "reason": "Card plan produced zero slots and this card was already judged red.",
-                            "section_ids": card.get("primary_section_ids", []) or [item.get("section_id") for item in card.get("evidence", []) if item.get("section_id")],
-                        }
-                    )
-                    continue
-                granularity = str(card.get("granularity_level", "")).strip().lower()
-                fallback_level = {"framework": "overall", "subpattern": "local", "detail": "detail"}.get(granularity, granularity)
-                card["planned_level"] = fallback_level
-                card["plan_id"] = "fallback_no_plan"
-                card["plan_target_object_id"] = ""
-                card["plan_target_object_label"] = "Fallback from judged cards because planner produced zero slots."
-                kept.append(card)
-            return kept, excluded
+                excluded.append(
+                    {
+                        "label": card.get("title", "未命中计划的候选"),
+                        "exclusion_type": relevance_failure_type if paper_relevance_verdict != "on_topic" else "other",
+                        "reason": (
+                            paper_relevance_reason
+                            if paper_relevance_verdict != "on_topic"
+                            else "Card plan produced zero slots, so extraction output cannot survive without an approved plan slot."
+                        ),
+                        "section_ids": card.get("primary_section_ids", []) or [item.get("section_id") for item in card.get("evidence", []) if item.get("section_id")],
+                    }
+                )
+            return [], excluded
         remaining = sorted(
             cards,
             key=lambda item: (
@@ -4827,6 +4857,7 @@ class PaperPipeline:
             sections=evidence_packet["prompt_sections"],
             figures=evidence_packet["figure_candidates"],
             planned_cards=planned_card_slots,
+            planning_context=card_plan,
             calibration_examples=(active_calibration_set or {}).get("examples", []),
             calibration_set_name=(active_calibration_set or {}).get("name", ""),
         )
@@ -4839,6 +4870,7 @@ class PaperPipeline:
                 sections=sections,
                 figures=evidence_packet["figure_candidates"],
                 planned_cards=planned_card_slots,
+                planning_context=card_plan,
                 calibration_examples=(active_calibration_set or {}).get("examples", []),
                 calibration_set_name=(active_calibration_set or {}).get("name", ""),
             )

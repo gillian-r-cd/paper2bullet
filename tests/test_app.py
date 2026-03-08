@@ -1718,6 +1718,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 sections: list[dict],
                 figures: list[dict] | None = None,
                 planned_cards: list[dict] | None = None,
+                planning_context: dict | None = None,
                 calibration_examples: list[dict] | None = None,
                 calibration_set_name: str = "",
             ) -> dict:
@@ -2184,6 +2185,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 sections: list[dict],
                 figures: list[dict] | None = None,
                 planned_cards: list[dict] | None = None,
+                planning_context: dict | None = None,
                 calibration_examples: list[dict] | None = None,
                 calibration_set_name: str = "",
             ) -> dict:
@@ -2309,7 +2311,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(len(excluded), 1)
         self.assertEqual(excluded[0]["label"], "Card A")
 
-    def test_align_cards_to_plan_keeps_non_red_cards_when_planner_produces_zero_slots(self) -> None:
+    def test_align_cards_to_plan_rejects_cards_when_planner_produces_zero_slots(self) -> None:
         pipeline = PaperPipeline(self.settings, self.repository)
         cards = [
             {
@@ -2341,12 +2343,11 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
             ]
         }
         kept, excluded = pipeline._align_cards_to_plan(cards, card_plan)
-        self.assertEqual(len(kept), 1)
-        self.assertEqual(kept[0]["title"], "Card A")
-        self.assertEqual(kept[0]["plan_id"], "fallback_no_plan")
-        self.assertEqual(kept[0]["planned_level"], "local")
-        self.assertEqual(len(excluded), 1)
-        self.assertEqual(excluded[0]["label"], "Card B")
+        self.assertEqual(kept, [])
+        self.assertEqual(len(excluded), 2)
+        self.assertEqual(excluded[0]["label"], "Card A")
+        self.assertIn("zero slots", excluded[0]["reason"])
+        self.assertEqual(excluded[1]["label"], "Card B")
 
     def test_align_cards_to_plan_prefers_matching_planned_object_with_same_evidence(self) -> None:
         pipeline = PaperPipeline(self.settings, self.repository)
@@ -2587,6 +2588,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 sections: list[dict],
                 figures: list[dict] | None = None,
                 planned_cards: list[dict] | None = None,
+                planning_context: dict | None = None,
                 calibration_examples: list[dict] | None = None,
                 calibration_set_name: str = "",
             ) -> dict:
@@ -3000,6 +3002,253 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(payload["card_count"], 0)
         self.assertEqual(len(payload["excluded_content"]), 1)
 
+    def test_llm_engine_understanding_blocks_objects_when_paper_is_rejected(self) -> None:
+        class StubClient:
+            model = "stub-understanding-gate-model"
+
+            def chat_json(self, system_prompt: str, user_prompt: str) -> dict:
+                payload = json.loads(user_prompt)
+                self_payload = {
+                    "paper_relevance_verdict": "borderline_reject",
+                    "paper_relevance_reason": "主题相邻，但仍无法明确命名课程对象。",
+                    "relevance_failure_type": "cannot_name_course_object",
+                    "global_contribution_objects": [
+                        {
+                            "id": "obj_1",
+                            "label": "看起来相关但其实无法成卡的对象",
+                            "object_type": "framework",
+                            "level_hint": "overall",
+                            "evidence_section_ids": ["section_demo_1"],
+                            "evidence_figure_ids": [],
+                            "summary": "这个对象不应该继续。",
+                            "importance_score": 0.9,
+                        }
+                    ],
+                    "contribution_graph": [],
+                    "candidate_level_hints": {"obj_1": "overall"},
+                }
+                if payload["stage"] != "paper_understanding":
+                    raise AssertionError("This test only exercises understanding.")
+                return self_payload
+
+        engine = LLMCardEngine(self.settings, client=StubClient())
+        outputs = engine.build_paper_understanding(
+            topic_name="LLM roleplay",
+            paper_title="Borderline Paper",
+            sections=[
+                {
+                    "id": "section_demo_1",
+                    "section_title": "Page 1",
+                    "section_kind": "results",
+                    "body_role": "results",
+                    "selection_score": 0.8,
+                    "paragraph_text": "The paper discusses evaluation setup details but still does not expose a clean course object.",
+                    "page_number": 1,
+                }
+            ],
+            figures=[],
+        )
+
+        self.assertEqual(outputs["paper_relevance_verdict"], "borderline_reject")
+        self.assertEqual(outputs["relevance_failure_type"], "cannot_name_course_object")
+        self.assertEqual(outputs["global_contribution_objects"], [])
+
+    def test_llm_engine_card_plan_inherits_rejected_paper_verdict(self) -> None:
+        class StubClient:
+            model = "stub-plan-gate-model"
+
+            def chat_json(self, system_prompt: str, user_prompt: str) -> dict:
+                payload = json.loads(user_prompt)
+                if payload["stage"] != "card_planning":
+                    raise AssertionError("This test only exercises planning.")
+                return {
+                    "paper_relevance_verdict": "off_topic_hard",
+                    "paper_relevance_reason": "论文核心对象是训练算法调参，不是课程对象。",
+                    "relevance_failure_type": "pure_technical_mismatch",
+                    "planned_cards": [
+                        {
+                            "plan_id": "plan_obj_1",
+                            "level": "detail",
+                            "target_object_id": "obj_1",
+                            "target_object_label": "训练技巧",
+                            "why_valuable_for_course": "这里不该被保留",
+                            "must_have_evidence_ids": ["section_demo_1"],
+                            "optional_supporting_ids": [],
+                            "disposition": "produce",
+                            "disposition_reason": "",
+                        }
+                    ],
+                }
+
+        engine = LLMCardEngine(self.settings, client=StubClient())
+        outputs = engine.build_card_plan(
+            topic_name="LLM roleplay",
+            paper_title="Pure Technical Paper",
+            understanding={
+                "paper_relevance_verdict": "off_topic_hard",
+                "paper_relevance_reason": "论文核心对象是训练算法调参，不是课程对象。",
+                "relevance_failure_type": "pure_technical_mismatch",
+                "global_contribution_objects": [
+                    {
+                        "id": "obj_1",
+                        "label": "训练技巧",
+                        "level_hint": "detail",
+                        "evidence_section_ids": ["section_demo_1"],
+                        "evidence_figure_ids": [],
+                        "importance_score": 0.8,
+                    }
+                ],
+                "evidence_index": {"obj_1": {"section_ids": ["section_demo_1"], "figure_ids": []}},
+                "candidate_level_hints": {"obj_1": "detail"},
+            },
+            max_cards=3,
+            calibration_examples=[],
+            calibration_set_name="",
+        )
+
+        self.assertEqual(outputs["paper_relevance_verdict"], "off_topic_hard")
+        self.assertEqual(outputs["relevance_failure_type"], "pure_technical_mismatch")
+        self.assertEqual(outputs["planned_cards"], [])
+        self.assertEqual(outputs["coverage_report"]["produce"], 0)
+
+    def test_pipeline_zero_slot_plan_does_not_fallback_to_judged_cards(self) -> None:
+        run = self.repository.create_run("LLM roleplay", {"operator": "tester"})
+        topic = self.repository.create_or_get_topic("LLM roleplay")
+        paper = self.repository.create_or_get_paper(
+            title="Pure Technical Optimizer Paper",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id="paper::pure-technical-gate",
+            source_type="local",
+            local_path="",
+            original_url="",
+            access_status="open_fulltext",
+            ingestion_status="ready",
+            parse_status="parsed",
+            artifact_path="",
+        )
+        self.repository.link_paper_to_topic(paper["id"], topic["id"], run["id"], "local_pdf")
+        self.repository.replace_sections(
+            paper["id"],
+            [
+                {
+                    "id": "section_theta",
+                    "section_order": 1,
+                    "section_title": "Page 1",
+                    "paragraph_text": "We optimize training stability with a new gradient clipping schedule and ablation-heavy tuning recipe.",
+                    "page_number": 1,
+                    "embedding": [0.0] * 64,
+                }
+            ],
+        )
+
+        class StubCardEngine:
+            def is_enabled(self) -> bool:
+                return True
+
+            def build_paper_understanding(self, **kwargs) -> dict:
+                return {
+                    "paper_relevance_verdict": "off_topic_hard",
+                    "paper_relevance_reason": "核心对象是训练算法调参与优化，不是当前课程对象。",
+                    "relevance_failure_type": "pure_technical_mismatch",
+                    "global_contribution_objects": [],
+                    "contribution_graph": [],
+                    "evidence_index": {},
+                    "candidate_level_hints": {},
+                }
+
+            def build_card_plan(self, **kwargs) -> dict:
+                return {
+                    "paper_relevance_verdict": "off_topic_hard",
+                    "paper_relevance_reason": "核心对象是训练算法调参与优化，不是当前课程对象。",
+                    "relevance_failure_type": "pure_technical_mismatch",
+                    "planned_cards": [],
+                    "coverage_report": {"produce": 0, "exclude": 0, "overall": 0, "local": 0, "detail": 0},
+                }
+
+            def extract_candidates(
+                self,
+                *,
+                topic_name: str,
+                paper_title: str,
+                sections: list[dict],
+                figures: list[dict] | None = None,
+                planned_cards: list[dict] | None = None,
+                planning_context: dict | None = None,
+                calibration_examples: list[dict] | None = None,
+                calibration_set_name: str = "",
+            ) -> dict:
+                assert planned_cards == []
+                assert (planning_context or {}).get("paper_relevance_verdict") == "off_topic_hard"
+                return {
+                    "cards": [
+                        {
+                            "title": "训练稳定性调参技巧",
+                            "primary_section_ids": ["section_theta"],
+                            "supporting_section_ids": [],
+                            "granularity_level": "detail",
+                            "claim_type": "method",
+                            "paper_specific_object": "gradient clipping schedule",
+                            "body_grounding_reason": "正文只是在讲训练技巧",
+                            "evidence_level": "strong",
+                            "possible_duplicate_signature": "gradient-clipping-schedule",
+                            "draft_body": "这是一张不该被放行的技术调参卡。",
+                            "evidence": [
+                                {
+                                    "section_id": "section_theta",
+                                    "quote": "We optimize training stability with a new gradient clipping schedule and ablation-heavy tuning recipe.",
+                                    "quote_zh": "",
+                                    "page_number": 1,
+                                    "analysis": "这是训练调参，不是当前课程对象。",
+                                }
+                            ],
+                            "figure_ids": [],
+                            "status": "candidate",
+                            "source_plan_id": "",
+                        }
+                    ],
+                    "excluded_content": [],
+                }
+
+            def judge_candidates(self, **kwargs) -> dict:
+                return {
+                    "cards": [
+                        {
+                            "title": "训练稳定性调参技巧",
+                            "course_transformation": "课程里的训练调参案例",
+                            "teachable_one_liner": "这条本来会被误放行，但现在不应该再漏出。",
+                            "draft_body": "这是一张不该被放行的技术调参卡。",
+                            "evidence": [
+                                {
+                                    "section_id": "section_theta",
+                                    "quote": "We optimize training stability with a new gradient clipping schedule and ablation-heavy tuning recipe.",
+                                    "quote_zh": "我们用新的梯度裁剪调度和大量调参来优化训练稳定性。",
+                                    "page_number": 1,
+                                    "analysis": "这是训练调参，不是当前课程对象。",
+                                }
+                            ],
+                            "primary_section_ids": ["section_theta"],
+                            "supporting_section_ids": [],
+                            "figure_ids": [],
+                            "claim_type": "method",
+                            "paper_specific_object": "gradient clipping schedule",
+                            "body_grounding_reason": "正文只是在讲训练技巧",
+                            "evidence_level": "strong",
+                            "possible_duplicate_signature": "gradient-clipping-schedule",
+                            "source_plan_id": "",
+                            "judgement": {"color": "green", "reason": "故意模拟 judgement 越界放行。"},
+                            "status": "candidate",
+                            "granularity_level": "detail",
+                        }
+                    ]
+                }
+
+        pipeline = PaperPipeline(self.settings, self.repository, card_engine=StubCardEngine())
+        created_count = pipeline.build_cards(paper, topic, run["id"])
+
+        self.assertEqual(created_count, 0)
+        self.assertEqual(self.repository.list_cards(run_id=run["id"]), [])
+
     def test_pipeline_passes_active_calibration_examples_to_judgement(self) -> None:
         run = self.repository.create_run("Context Engineering", {"operator": "tester"})
         topic = self.repository.create_or_get_topic("Context Engineering")
@@ -3066,6 +3315,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 sections: list[dict],
                 figures: list[dict] | None = None,
                 planned_cards: list[dict] | None = None,
+                planning_context: dict | None = None,
                 calibration_examples: list[dict] | None = None,
                 calibration_set_name: str = "",
             ) -> dict:
@@ -3255,7 +3505,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertIn("paper_understanding", stages)
         self.assertIn("card_planning", stages)
         extraction_record = next(record for record in records if record["stage"] == "candidate_extraction")
-        self.assertEqual(extraction_record["details"]["shared_policy_version"], "llm-shared-policy-v3-plain-english")
+        self.assertEqual(extraction_record["details"]["shared_policy_version"], "llm-shared-policy-v4-off-topic-gate")
 
     def test_discovery_service_deduplicates_cross_provider_candidates(self) -> None:
         class OpenAlexProvider:

@@ -6,6 +6,49 @@ Main sections: completed work, pending work, known issues, and next starting poi
 
 ## 本次做了什么
 
+- 已完成 `Prompt-Only Off-Topic Gate` 落地，且没有改 pipeline 核心流程，只收紧 prompt contract、normalization 和 zero-slot 承接：
+  - `app/llm.py`：
+    - prompt 版本已推进到：
+      - `llm-shared-policy-v4-off-topic-gate`
+      - `llm-paper-understanding-v5-off-topic-gate`
+      - `llm-card-plan-v6-off-topic-gate`
+      - `llm-card-extract-v8-off-topic-gate-zh`
+    - shared policy 现把 `off topic` 从词面不相关升级为“对当前课程漏斗无效”
+    - `paper_understanding` 现输出并归一化：
+      - `paper_relevance_verdict = on_topic | borderline_reject | off_topic_hard`
+      - `paper_relevance_reason`
+      - `relevance_failure_type`
+    - `relevance_failure_type` 已覆盖：
+      - `pure_technical_mismatch`
+      - `cannot_name_course_object`
+      - `long_transfer_distance`
+      - `taxonomy_not_insight`
+      - `weak_method_or_data`
+      - `low_hanging_fruit`
+      - `topic_word_overlap_only`
+    - 当 verdict 不是 `on_topic` 时，understanding normalization 会强制清空 `global_contribution_objects`
+    - `card_planning` 现继承 paper-level verdict：
+      - 非 `on_topic` 直接返回零 slot
+      - 不再因为 payload 里混入对象或 produce 项就偷偷继续
+    - extraction prompt 现显式接收 `planning_context`
+      - 当 `planned_card_slots` 为空时，只允许记录 `excluded_content`
+      - exclusion type 已能直接映射上述 `CONCEPT.md` 负样本逻辑
+  - `app/services.py`：
+    - `_build_paper_understanding()` 不再因为 LLM 返回“reject + 空对象”就误触发 heuristic fallback
+    - `_build_card_plan()` 不再因为 LLM planner 返回零 slot 就 fallback 继续救卡
+    - `_build_cards_with_llm()` / `_recover_candidates_with_expanded_context()` 现把 `planning_context` 一路传到 extraction
+    - `_align_cards_to_plan()` 已取消旧的 `fallback_no_plan` 生还路径：
+      - planner 零 slot 时，后续 judged cards 不再漏出 final cards
+      - 若 paper-level verdict 非 `on_topic`，排除理由会直接沿用 verdict reason / failure type
+  - `tests/test_app.py`：
+    - 新增 understanding reject 归一化测试
+    - 新增 planner 继承 reject verdict 测试
+    - 新增 zero-slot plan 不再 fallback 到 judged cards 的集成测试
+    - 旧测试已更新为新契约：planner 零 slot 时应全部 reject，而不是保留非红卡
+  - 当前验证结果：
+    - `python -m pytest tests/test_app.py -k "understanding_blocks_objects_when_paper_is_rejected or card_plan_inherits_rejected_paper_verdict or zero_slot_plan_does_not_fallback_to_judged_cards or prompt_version_records_include_understanding_and_planning_stages or extract_candidates_keeps_full_paragraph_evidence"` 通过
+    - 全量 `python -m pytest tests/test_app.py` 通过，合计 97 个测试
+
 - 已完成本轮 `card plan binding + quote-first shape` 收口，并补回被打断期间暴露的 PDF 解析基线：
   - 本轮继续追加 `evidence must be full paragraph` 硬约束：
     - `app/llm.py` 不再用 `extract_relevant_evidence_excerpt()` 裁剪 evidence
