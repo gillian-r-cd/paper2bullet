@@ -17,23 +17,21 @@ from typing import Any, Callable, Optional
 
 from .config import LLMProviderConfig, Settings
 
-SHARED_PROMPT_POLICY_VERSION = "llm-shared-policy-v1-direct-transfer"
-EXTRACTION_PROMPT_VERSION = "llm-card-extract-v5-structured-direct-transfer-zh"
-JUDGEMENT_PROMPT_VERSION = "llm-card-judge-v6-structured-direct-transfer-zh"
-CARD_RUBRIC_VERSION = "llm-card-rubric-v5-direct-transfer"
-UNDERSTANDING_PROMPT_VERSION = "llm-paper-understanding-v3-structured-direct-transfer"
-CARD_PLAN_PROMPT_VERSION = "llm-card-plan-v3-structured-direct-transfer"
+SHARED_PROMPT_POLICY_VERSION = "llm-shared-policy-v3-plain-english"
+EXTRACTION_PROMPT_VERSION = "llm-card-extract-v7-plain-english-zh"
+JUDGEMENT_PROMPT_VERSION = "llm-card-judge-v8-plain-english-zh"
+CARD_RUBRIC_VERSION = "llm-card-rubric-v7-plain-english"
+UNDERSTANDING_PROMPT_VERSION = "llm-paper-understanding-v4-plain-english"
+CARD_PLAN_PROMPT_VERSION = "llm-card-plan-v5-plain-english"
 MAX_PROMPT_SECTIONS = 14
 MAX_PROMPT_FIGURES = 4
 MAX_CALIBRATION_EXAMPLES = 6
 MAX_EXTRACTED_CARDS = 8
-MAX_EVIDENCE_QUOTE_CHARS = 450
-
 PROMPT_VERSION_RECORDS = [
     {
         "version": UNDERSTANDING_PROMPT_VERSION,
         "stage": "paper_understanding",
-        "summary": "Structured understanding stage that identifies source-native contribution objects before planning.",
+        "summary": "Understanding stage that finds the paper's concrete card-worthy objects before any course packaging.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "uses_figures": True,
@@ -45,7 +43,7 @@ PROMPT_VERSION_RECORDS = [
     {
         "version": CARD_PLAN_PROMPT_VERSION,
         "stage": "card_planning",
-        "summary": "Structured planning stage that decides which source-native objects deserve cards.",
+        "summary": "Planning stage that decides which concrete objects deserve cards and binds each one to a card slot.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "uses_stage_examples": True,
@@ -56,7 +54,7 @@ PROMPT_VERSION_RECORDS = [
     {
         "version": EXTRACTION_PROMPT_VERSION,
         "stage": "candidate_extraction",
-        "summary": "Chinese extraction that preserves source-native workflow patterns for non-technical learners.",
+        "summary": "Chinese extraction that assembles quote-first cards for explicit planned slots.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "language": "zh-CN learner-facing output",
@@ -72,7 +70,7 @@ PROMPT_VERSION_RECORDS = [
     {
         "version": JUDGEMENT_PROMPT_VERSION,
         "stage": "candidate_judgement",
-        "summary": "Green/yellow/red judgement with source-fidelity checks and full bilingual evidence localization.",
+        "summary": "Final card judgement with plan-slot fidelity, full evidence translation, and direct green/yellow/red decisions.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "language": "zh-CN learner-facing output",
@@ -90,7 +88,7 @@ RUBRIC_VERSION_RECORDS = [
     {
         "version": CARD_RUBRIC_VERSION,
         "name": "card_judgement_rubric",
-        "summary": "Aha-focused rubric that rejects summary drift and principle drift while preserving direct-transfer patterns.",
+        "summary": "Rubric for deciding whether a planned concrete paper object deserves to survive as a usable course card.",
         "details": {
             "green": "clear learner-facing aha insight with direct course transfer",
             "yellow": "boundary-case insight that may need reviewer judgment or stronger operationalization",
@@ -258,33 +256,8 @@ def compact_text_length(text: str) -> int:
     return len(re.sub(r"\s+", "", text.strip()))
 
 
-def extract_relevant_evidence_excerpt(text: str, *, hints: list[str], max_chars: int = MAX_EVIDENCE_QUOTE_CHARS) -> str:
-    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
-    if len(normalized) <= max_chars:
-        return normalized
-    lowered = normalized.lower()
-    candidate_keywords: list[str] = []
-    for hint in hints:
-        for token in re.split(r"[^A-Za-z0-9\u4e00-\u9fff]+", str(hint or "")):
-            token = token.strip()
-            if len(token) >= 4:
-                candidate_keywords.append(token.lower())
-    for keyword in candidate_keywords:
-        index = lowered.find(keyword)
-        if index < 0:
-            continue
-        start = max(0, index - max_chars // 3)
-        end = min(len(normalized), start + max_chars)
-        excerpt = normalized[start:end].strip()
-        if start > 0:
-            excerpt = "..." + excerpt
-        if end < len(normalized):
-            excerpt = excerpt.rstrip(" ,;:") + "..."
-        return excerpt
-    excerpt = normalized[:max_chars].rstrip(" ,;:")
-    if len(normalized) > max_chars:
-        excerpt += "..."
-    return excerpt
+def normalize_evidence_paragraph(text: str) -> str:
+    return str(text or "").strip()
 
 
 def looks_like_complete_translation(source_text: str, translated_text: str) -> bool:
@@ -750,61 +723,71 @@ class LLMCardEngine:
     def _shared_prompt_policy(self) -> dict[str, Any]:
         return {
             "policy_version": SHARED_PROMPT_POLICY_VERSION,
-            "target_learner": "non-technical AI literacy learner",
-            "core_objective": "extract source-native course-worthy aha moments without principle drift",
+            "target_learner": "a practical AI literacy learner with limited technical depth, real work experience, and low patience for abstract theory",
+            "core_objective": "turn paper evidence into card-worthy aha candidates without drifting away from the paper",
             "top_level_rules": [
-                "Stay faithful to the paper's concrete object before making any course naming decision.",
-                "Prefer workflow tricks, decision rules, failure modes, mechanisms, comparisons, and evidence-backed findings.",
-                "Reject taxonomy recap, survey roadmap, generic summary, and principle drift.",
-                "Keep figures attached when they are required to understand the object.",
-                "Every surviving object must have short transfer distance to course use.",
+                "A card is one atomic pattern or one atomic data finding, not a summary, topic label, or outline slot.",
+                "Start from the paper's concrete object and stay close to it before doing any course naming.",
+                "A card survives only if it can create a real learner shift and has short distance to course use.",
+                "The shift should come from a deeper mechanism, a counterintuitive claim, or something learners feel but cannot name clearly.",
+                "Every surviving card must be actionable in understanding, attitude, or method.",
+                "Use body evidence as the main material whenever body evidence exists.",
+                "Keep the original figure when the figure is needed to understand the point.",
+                "Reject recap, taxonomy, survey framing, generic advice, obvious 2026 claims, and wording that drifts above the source object.",
             ],
         }
 
     def _stage_spec(self, stage: str) -> dict[str, Any]:
         specs = {
             "paper_understanding": {
-                "stage_goal": "Identify concrete source-native contribution objects only.",
+                "stage_goal": "Find the paper's concrete objects that could later become cards.",
                 "must_do": [
                     "Map each object to section evidence and figure evidence.",
-                    "Prefer sub-patterns over umbrella labels when they are more teachable.",
+                    "Prefer a single complete pattern or data finding over a broad umbrella label.",
+                    "Mark the object at the right size: overall, local, or detail.",
                 ],
                 "must_not_do": [
                     "Do not decide course naming or green/yellow/red here.",
-                    "Do not promote survey structure into contribution objects.",
+                    "Do not turn literature structure, survey framing, or broad themes into objects.",
                 ],
             },
             "card_planning": {
-                "stage_goal": "Decide which identified objects should produce cards and why.",
+                "stage_goal": "Decide which concrete objects deserve cards and what each card would be in the course.",
                 "must_do": [
                     "Answer what each produced object becomes in the course.",
+                    "State the learner shift that makes the card worth keeping.",
                     "Require must-have section ids and figure ids when they are central.",
                 ],
                 "must_not_do": [
                     "Do not write final learner-facing card text.",
                     "Do not force card counts.",
+                    "Do not keep a card plan that still sounds like a theme bucket instead of one card.",
                 ],
             },
             "candidate_extraction": {
-                "stage_goal": "Turn approved evidence objects into candidate cards and explicit exclusions.",
+                "stage_goal": "Assemble candidate cards from approved objects and explicit exclusions.",
                 "must_do": [
                     "Keep the candidate close to the paper-specific object.",
-                    "Select the right evidence instead of rewriting the paper into a smoother abstraction.",
+                    "Use quotes and source evidence as the main body material.",
+                    "Add only brief analysis instead of rewriting the paper into a cleaner doctrine.",
                 ],
                 "must_not_do": [
                     "Do not do final color judgement here.",
                     "Do not emit cards that require long technical unpacking before use.",
+                    "Do not hide excluded content that should be logged explicitly.",
                 ],
             },
             "candidate_judgement": {
-                "stage_goal": "Judge the boundary, finalize course naming, and localize evidence faithfully.",
+                "stage_goal": "Make the final keep or border call, finalize course naming, and translate evidence faithfully.",
                 "must_do": [
-                    "Explain the color decision with source fidelity and transfer distance in mind.",
+                    "Explain the color decision with source fidelity, learner shift, and transfer distance in mind.",
                     "Provide full Chinese localization for primary evidence.",
+                    "Check that the card still names one concrete object instead of a vague lesson.",
                 ],
                 "must_not_do": [
                     "Do not invent missing evidence or figures.",
-                    "Do not rescue principle-drift cards with prettier wording.",
+                    "Do not rescue weak cards with prettier wording.",
+                    "Do not let course naming drift above the source object.",
                 ],
             },
         }
@@ -900,6 +883,7 @@ class LLMCardEngine:
         paper_title: str,
         sections: list[dict],
         figures: Optional[list[dict]] = None,
+        planned_cards: Optional[list[dict]] = None,
         calibration_examples: Optional[list[dict]] = None,
         calibration_set_name: str = "",
     ) -> dict[str, list[dict]]:
@@ -916,6 +900,7 @@ class LLMCardEngine:
                 paper_title=paper_title,
                 prompt_sections=prompt_sections,
                 prompt_figures=prompt_figures,
+                planned_cards=planned_cards or [],
                 calibration_examples=selected_examples,
                 stage_examples=stage_examples,
                 calibration_set_name=calibration_set_name,
@@ -932,7 +917,7 @@ class LLMCardEngine:
             },
         )
         payload = self._chat_json(stage="candidate_extraction", system_prompt=system_prompt, user_prompt=user_prompt)
-        normalized = self._normalize_extraction_output(payload, sections, figures or [])
+        normalized = self._normalize_extraction_output(payload, sections, figures or [], planned_cards or [])
         self._emit_trace(
             stage="candidate_extraction",
             direction="output",
@@ -976,6 +961,9 @@ class LLMCardEngine:
             prompt_candidates.append(
                 {
                     "candidate_index": index,
+                    "source_plan_id": card.get("source_plan_id", ""),
+                    "planned_object_label": card.get("planned_object_label", ""),
+                    "planned_why_valuable": card.get("planned_why_valuable", ""),
                     "title": card["title"],
                     "granularity_level": card["granularity_level"],
                     "draft_body": card["draft_body"],
@@ -1098,30 +1086,32 @@ class LLMCardEngine:
                 "figures": prompt_figures,
                 "requirements": {
                     "object_requirements": [
-                        "Object labels must be concrete, not generic section names like 'Markdown Extraction'.",
+                        "Object labels must be concrete and plain, not generic section names like 'Markdown Extraction'.",
+                        "Each object should be one atomic pattern or one atomic data finding, not a mixed basket.",
                         "Each object must map to evidence section ids.",
                         "Use level_hint among overall/local/detail.",
-                        "Prefer objects that a non-technical learner can picture as a workflow, decision point, failure mode, comparison, or reusable pattern.",
+                        "Prefer objects that a practical learner can picture as a workflow, decision point, failure mode, comparison, reusable pattern, or data point.",
                         "When a figure is central to understanding the object, include evidence_figure_ids.",
                     ],
                     "quality_requirements": [
-                        "Prefer paper-specific mechanism/model/method/result objects.",
-                        "Avoid abstract-level framing-only objects when body evidence exists.",
-                        "Prefer source-native workflow and decision structures over broad high-level principles.",
+                        "Prefer paper-specific mechanism, model, method, result, workflow, comparison, or failure-mode objects.",
+                        "Avoid framing-only objects when body evidence exists.",
+                        "Prefer source-native workflow and decision structures over broad principles.",
                         "Do not rewrite technical content into generic management or life advice.",
                         "If a concrete sub-pattern is directly teachable, prefer it over a more abstract umbrella label.",
+                        "If the object would still need heavy unpacking before a learner can picture it, leave it out.",
                     ],
                 },
                 "output_schema": {
                     "global_contribution_objects": [
                         {
                             "id": "obj_1",
-                            "label": "对象名称（中文或英文短语）",
+                            "label": "对象名称，直白、具体，可用中文或英文短语",
                             "object_type": "mechanism|model|method|result|framework|data_finding|other",
                             "level_hint": "overall|local|detail",
                             "evidence_section_ids": ["section_id"],
                             "evidence_figure_ids": ["figure_id"],
-                            "summary": "一到两句说明",
+                            "summary": "一到两句说明，讲清这到底是什么对象",
                             "importance_score": 0.0,
                         }
                     ],
@@ -1182,11 +1172,16 @@ class LLMCardEngine:
                 "requirements": {
                     "planning_rules": [
                         "Do not force card counts; 0 card is allowed when no object is teachable.",
-                        "Prioritize high-value overall/local/detail balance when available.",
+                        "A planned card must be one card, not a theme bucket or a paper recap.",
+                        "A planned card should center on one atomic pattern or one atomic data finding.",
+                        "A produce item is valid only if you can state both the learner shift and what it becomes in the course.",
+                        "Prefer the smallest object that is complete enough to teach well.",
+                        "Use overall/local/detail only when it matches the real size of the object, not to fill slots.",
                         "Each produce item must specify must_have_evidence_ids.",
-                        "Prefer source-faithful workflow tricks, decision patterns, failure modes, and comparison structures that a non-technical learner can grasp quickly.",
+                        "Prefer source-faithful workflow steps, decision rules, failure modes, comparison structures, mechanisms, and data findings that a practical learner can grasp quickly.",
                         "Do not exclude an object merely because it is technical if the evidence describes a concrete workflow or decision process with short transfer distance.",
                         "Do not promote a high-level umbrella object when a more concrete child object is more directly teachable for the target learner.",
+                        "Reject background theory, taxonomy recap, old obvious claims, weak-transfer details, and anything that still needs heavy unpacking before use.",
                         "When a figure is central to the object, require it explicitly with must_have_figure_ids.",
                     ]
                 },
@@ -1196,14 +1191,14 @@ class LLMCardEngine:
                             "plan_id": "plan_obj_1",
                             "level": "overall|local|detail",
                             "target_object_id": "obj_1",
-                            "target_object_label": "对象名",
-                            "why_valuable_for_course": "课程价值说明",
+                            "target_object_label": "对象名，必须具体到一个卡片对象",
+                            "why_valuable_for_course": "课程价值说明，讲清 learner shift 和课程用法",
                             "must_have_evidence_ids": ["section_id"],
                             "optional_supporting_ids": ["section_id"],
                             "must_have_figure_ids": ["figure_id"],
                             "optional_supporting_figure_ids": ["figure_id"],
                             "disposition": "produce|exclude",
-                            "disposition_reason": "排除时必填",
+                            "disposition_reason": "排除时必填，直接说明为什么不该有这张卡",
                         }
                     ],
                     "coverage_report": {"produce": 0, "exclude": 0, "overall": 0, "local": 0, "detail": 0},
@@ -1290,6 +1285,7 @@ class LLMCardEngine:
         paper_title: str,
         prompt_sections: list[dict],
         prompt_figures: list[dict],
+        planned_cards: list[dict],
         calibration_examples: list[dict],
         stage_examples: list[dict],
         calibration_set_name: str,
@@ -1313,30 +1309,47 @@ class LLMCardEngine:
             "primary_candidate_sections": primary_sections,
             "supporting_sections": supporting_sections,
             "figures": prompt_figures,
+            "planned_card_slots": [
+                {
+                    "plan_id": str(item.get("plan_id", "")).strip(),
+                    "level": str(item.get("level", "")).strip(),
+                    "target_object_id": str(item.get("target_object_id", "")).strip(),
+                    "target_object_label": str(item.get("target_object_label", "")).strip(),
+                    "why_valuable_for_course": str(item.get("why_valuable_for_course", "")).strip(),
+                    "must_have_evidence_ids": [str(section_id).strip() for section_id in item.get("must_have_evidence_ids", [])],
+                    "optional_supporting_ids": [str(section_id).strip() for section_id in item.get("optional_supporting_ids", [])],
+                    "must_have_figure_ids": [str(figure_id).strip() for figure_id in item.get("must_have_figure_ids", [])],
+                }
+                for item in planned_cards
+                if str(item.get("plan_id", "")).strip()
+            ],
             "content_rules": {
                 "candidate_should_look_like": [
-                    "A learner-facing aha candidate for non-technical AI literacy learners that stays faithful to the paper's actual object.",
-                    "Something teachable in a course with short transfer distance, not a generic summary or generalized life principle.",
+                    "A learner-facing aha candidate that stays faithful to one concrete paper object.",
+                    "One card should focus on one atomic pattern or one atomic data finding.",
+                    "The card should be teachable with short transfer distance, not a summary or a generalized life principle.",
                     "Prefer a workflow, decision point, failure mode, comparison structure, mechanism, or evidence-backed data point that the learner can picture directly.",
-                    "Grounded in the provided section_ids, and include figure_ids when a figure materially supports or anchors the idea.",
+                    "Ground the card in the provided section_ids, and include figure_ids when a figure materially supports or anchors the idea.",
+                    "If planned_card_slots are provided, each surviving candidate must clearly match exactly one slot.",
                 ],
                 "card_shape_rules": [
                     "Write all card-facing strings in Simplified Chinese.",
-                    "Keep the original paper evidence as the primary body material by selecting the right section_ids rather than rewriting the paper.",
+                    "Keep the original paper evidence as the main body material by selecting the right section_ids rather than rewriting the paper.",
                     "Use evidence_analysis to add only very short 1-2 sentence explanations of why each cited part matters for teaching.",
+                    "Treat draft_body as a short bridge, not the main body of the card.",
                     "Prefer a strong specific title over a paper-topic label.",
-                    "Primary evidence should come from mechanism/model/method/result/failure sections; abstract or framing sections can only be supporting context.",
+                    "Primary evidence should come from mechanism, model, method, result, failure-mode, or data sections; abstract or framing sections can only be supporting context.",
                     "If body evidence is available in sections, do not use abstract or front matter as the only primary evidence.",
                     "If you cannot name the paper-specific object being taught, emit no card.",
-                    "If you cannot articulate a learner-facing candidate, emit no card.",
+                    "If you cannot state the learner shift in plain words, emit no card.",
                     "Do not convert technical evidence into broad management slogans, motivational advice, or generic productivity principles.",
-                    "If a candidate requires multiple layers of explanation before a non-technical learner can use it, reject it in extraction.",
-                    "course_transformation will later name how the source object is presented in the course; do not pre-abstract the object here.",
+                    "If a candidate requires multiple layers of explanation before a practical learner can use it, reject it in extraction.",
+                    "course_transformation will later name how the source object is presented in the course; do not abstract the object upward here.",
                 ],
                 "judgement_boundary_hints": [
-                    "Look for belief-gap, counterintuitive, tacit-to-explicit, or highly actionable insight candidates.",
-                    "Prefer ideas with commercial relevance and presentation usefulness, not only academic validity.",
-                    "Also prefer direct-transfer source patterns even when they are not maximally dramatic, as long as a non-technical learner can understand and reuse them quickly.",
+                    "Look for a clear learner shift: deeper mechanism, counterintuitive claim, tacit-to-explicit explanation, or strong action value.",
+                    "Prefer ideas with business relevance and presentation usefulness, not only academic validity.",
+                    "Keep direct-transfer source patterns even when they are not flashy, as long as a practical learner can understand and reuse them quickly.",
                     "A mere taxonomy recap, literature background, or weak-transfer technical detail should be rejected here.",
                 ],
                 "should_be_rejected_here": [
@@ -1348,11 +1361,13 @@ class LLMCardEngine:
                     "Policy or management recommendation aimed at the wrong audience.",
                     "Old low-hanging-fruit claims that are already obvious to the target learner.",
                     "Claims that only describe what this paper is generally about without naming its concrete contribution object.",
+                    "Candidates that do not clearly match any provided planned_card_slot.",
                 ],
             },
             "output_schema": {
                 "cards": [
                     {
+                        "source_plan_id": "plan_obj_1",
                         "title": "中文卡片标题",
                         "primary_section_ids": ["section_id"],
                         "supporting_section_ids": ["section_id"],
@@ -1408,22 +1423,24 @@ class LLMCardEngine:
             "candidates": prompt_candidates,
             "judgement_rules": {
                 "must_be_true_for_a_card": [
-                    "The candidate expresses a real learner-facing cognitive shift instead of a paper takeaway.",
-                    "The candidate names the paper-specific object (model/mechanism/method/result/failure/framework/data finding), not only topic framing.",
-                    "The idea can be named as a concrete course object, framework, pattern, story, or evidence-backed talking point.",
+                    "The candidate expresses a real learner-facing shift instead of a paper takeaway.",
+                    "The candidate names one paper-specific object: model, mechanism, method, result, failure mode, framework, or data finding.",
+                    "The card can be named as a concrete course object, pattern, story, exercise, comparison, or evidence-backed talking point.",
                     "The transfer distance to course use is short enough to teach.",
                     "The evidence strength matches the claim strength.",
-                    "At least one of these qualities is present: belief-gap, counterintuitive, tacit-to-explicit, or highly actionable.",
+                    "At least one of these is clearly present: deeper mechanism, counterintuitive claim, tacit-to-explicit explanation, or strong action value.",
                     "The card stays close to the paper's source object instead of drifting into a broader principle.",
-                    "A non-technical learner should be able to understand what to picture or do after one slide of explanation.",
+                    "If the candidate came from a planned slot, it still matches that planned object instead of sliding to a sibling object from the same section.",
+                    "A practical learner should be able to understand what to picture, say, or do after one slide of explanation.",
                 ],
                 "business_and_teaching_rules": [
-                    "Judge from the learner and course-design perspective, not only from academic importance.",
-                    "Prefer ideas that would make sense on one slide with one strong line and, when available, one supporting figure.",
+                    "Judge from the learner and course-buying perspective, not only from academic importance.",
+                    "Prefer ideas that work on one slide with one strong line and, when available, one supporting figure.",
                     "If you cannot say what this becomes in the course, the card should not pass as green.",
-                    "Explicitly state whether primary evidence is body evidence or merely abstract/front-matter framing.",
-                    "course_transformation should name the course presentation form of the source object, not rewrite it into a more generic doctrine.",
+                    "Explicitly state whether primary evidence is body evidence or merely abstract or front-matter framing.",
+                    "course_transformation should name the course form of the source object, not rewrite it into a more generic doctrine.",
                     "If the strongest version of the card sounds like a principle that could have been written without this paper, downgrade or reject it.",
+                    "If the card would need minutes of setup before the learner cares, downgrade or reject it.",
                     "If linked_figures materially support the candidate, keep the figure attachment instead of silently dropping it.",
                 ],
                 "evidence_translation_rules": [
@@ -1434,9 +1451,9 @@ class LLMCardEngine:
                     "Preserve informational scope, caveats, enumerations, and logical structure from the English quote.",
                 ],
                 "color_rules": {
-                    "green": "Clear learner belief conflict or tacit-to-explicit shift, evidence is strong, and course use is obvious.",
-                    "yellow": "Potentially valuable but boundary-like: learner prior is uncertain, evidence is partial, or course use needs human judgement.",
-                    "red": "Mostly aligned with common knowledge, generic summary, wrong audience, or too indirect to teach.",
+                    "green": "Clear learner shift, strong evidence, and clear course use.",
+                    "yellow": "Possibly valuable but still a border case: learner prior is uncertain, evidence is partial, or course use needs human judgement.",
+                    "red": "Mostly obvious, generic, wrong for the audience, or too indirect to teach.",
                 },
                 "must_be_downgraded_or_rejected": [
                     "The candidate is merely background, summary, taxonomy, or weak-transfer detail.",
@@ -1448,11 +1465,13 @@ class LLMCardEngine:
                 ],
             },
             "required_judgement_questions": [
-                "What is the paper's unique contribution object here?",
+                "What is the concrete paper object here?",
+                "If a planned slot exists, does this card still match that specific planned object?",
                 "Is this claim grounded in body evidence or only paper framing?",
-                "Does this candidate remain distinct from sibling candidates within the same paper/topic?",
+                "What learner belief or vague intuition does this card change or clarify?",
+                "Does this candidate remain distinct from sibling candidates within the same paper or topic?",
                 "Is the evidence strength proportional to the claim strength?",
-                "Would a non-technical learner still understand the source object without extra technical unpacking?",
+                "Would a practical learner still understand the source object without extra technical unpacking?",
                 "Has the course naming stayed close to the source object instead of abstracting it upward?",
             ],
             "output_schema": {
@@ -1525,6 +1544,7 @@ class LLMCardEngine:
         payload: dict[str, Any],
         sections: list[dict],
         figures: list[dict],
+        planned_cards: list[dict],
     ) -> dict[str, list[dict]]:
         raw_cards = payload.get("cards", [])
         raw_excluded = payload.get("excluded_content", [])
@@ -1535,6 +1555,11 @@ class LLMCardEngine:
 
         section_map = {section["id"]: section for section in sections}
         figure_id_set = {figure["id"] for figure in figures}
+        plan_map = {
+            str(item.get("plan_id", "")).strip(): item
+            for item in planned_cards
+            if isinstance(item, dict) and str(item.get("plan_id", "")).strip()
+        }
         normalized = []
         for raw_card in raw_cards[:MAX_EXTRACTED_CARDS]:
             if not isinstance(raw_card, dict):
@@ -1553,6 +1578,7 @@ class LLMCardEngine:
                 ]
             raw_figure_ids = raw_card.get("figure_ids", [])
             raw_evidence_analysis = raw_card.get("evidence_analysis", [])
+            source_plan_id = str(raw_card.get("source_plan_id", "")).strip()
             claim_type = str(raw_card.get("claim_type", "other")).strip().lower()
             paper_specific_object = str(raw_card.get("paper_specific_object", "")).strip()
             body_grounding_reason = str(raw_card.get("body_grounding_reason", "")).strip()
@@ -1584,10 +1610,7 @@ class LLMCardEngine:
                 evidence.append(
                     {
                         "section_id": section["id"],
-                        "quote": extract_relevant_evidence_excerpt(
-                            section["paragraph_text"],
-                            hints=[title, paper_specific_object, analysis_text],
-                        ),
+                        "quote": normalize_evidence_paragraph(section["paragraph_text"]),
                         "quote_zh": "",
                         "page_number": section["page_number"],
                         "analysis": analysis_text,
@@ -1596,6 +1619,10 @@ class LLMCardEngine:
 
             if not title or not evidence:
                 continue
+            if source_plan_id and source_plan_id not in plan_map:
+                source_plan_id = ""
+            if not source_plan_id and len(plan_map) == 1:
+                source_plan_id = next(iter(plan_map.keys()))
             figure_ids = [
                 str(figure_id).strip()
                 for figure_id in raw_figure_ids
@@ -1629,6 +1656,9 @@ class LLMCardEngine:
                     "body_grounding_reason": body_grounding_reason,
                     "evidence_level": evidence_level,
                     "possible_duplicate_signature": possible_duplicate_signature,
+                    "source_plan_id": source_plan_id,
+                    "planned_object_label": str((plan_map.get(source_plan_id) or {}).get("target_object_label", "")).strip(),
+                    "planned_why_valuable": str((plan_map.get(source_plan_id) or {}).get("why_valuable_for_course", "")).strip(),
                 }
             )
 
@@ -1771,6 +1801,9 @@ class LLMCardEngine:
                     "body_grounding_reason": str(raw_card.get("body_grounding_reason", extracted.get("body_grounding_reason", ""))).strip(),
                     "grounding_quality": grounding_quality,
                     "possible_duplicate_signature": extracted.get("possible_duplicate_signature", ""),
+                    "source_plan_id": extracted.get("source_plan_id", ""),
+                    "planned_object_label": extracted.get("planned_object_label", ""),
+                    "planned_why_valuable": extracted.get("planned_why_valuable", ""),
                     "judgement": {
                         "color": color,
                         "reason": reason,

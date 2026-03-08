@@ -415,8 +415,8 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
             export_json = json.loads(Path(export_payload["json_path"]).read_text(encoding="utf-8"))
             self.assertIn("它在课程里变成什么", markdown_text)
             self.assertIn("可直接讲的一句话", markdown_text)
-            self.assertIn("证据原文（EN）", markdown_text)
-            self.assertIn("证据译文（ZH）", markdown_text)
+            self.assertIn("原文（穿插分析）：", markdown_text)
+            self.assertIn("*→", markdown_text)
             self.assertEqual(export_json["requested_card_ids"], [card_id])
             self.assertEqual(export_json["selection_snapshot"][0]["card_id"], card_id)
             self.assertEqual(export_json["selection_snapshot"][0]["review_status"], "accepted")
@@ -1717,6 +1717,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 paper_title: str,
                 sections: list[dict],
                 figures: list[dict] | None = None,
+                planned_cards: list[dict] | None = None,
                 calibration_examples: list[dict] | None = None,
                 calibration_set_name: str = "",
             ) -> dict:
@@ -2182,6 +2183,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 paper_title: str,
                 sections: list[dict],
                 figures: list[dict] | None = None,
+                planned_cards: list[dict] | None = None,
                 calibration_examples: list[dict] | None = None,
                 calibration_set_name: str = "",
             ) -> dict:
@@ -2346,6 +2348,103 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(len(excluded), 1)
         self.assertEqual(excluded[0]["label"], "Card B")
 
+    def test_align_cards_to_plan_prefers_matching_planned_object_with_same_evidence(self) -> None:
+        pipeline = PaperPipeline(self.settings, self.repository)
+        cards = [
+            {
+                "title": "Self-consistency CoT：多次生成不同推理路径，用最高频答案做最终输出",
+                "paper_specific_object": "Self-consistency CoT：多条推理链 + 最高频答案作为最终结果",
+                "course_transformation": "方法卡：多路径生成后做频次投票",
+                "teachable_one_liner": "不要只采样一次，改成多次生成后投票。",
+                "primary_section_ids": ["section_shared"],
+                "evidence": [{"section_id": "section_shared"}],
+                "judgement": {"color": "yellow"},
+                "evidence_level": "strong",
+                "source_plan_id": "plan_obj_self_consistency",
+            },
+            {
+                "title": "DECKARD：Dreaming 与 Awake 两阶段",
+                "paper_specific_object": "DECKARD 两阶段流程",
+                "course_transformation": "流程卡：先拆子目标再校验假设",
+                "teachable_one_liner": "把拆解和校验拆开。",
+                "primary_section_ids": ["section_shared"],
+                "evidence": [{"section_id": "section_shared"}],
+                "judgement": {"color": "green"},
+                "evidence_level": "strong",
+            },
+        ]
+        card_plan = {
+            "planned_cards": [
+                {
+                    "plan_id": "plan_obj_self_consistency",
+                    "level": "detail",
+                    "target_object_id": "obj_self_consistency",
+                    "target_object_label": "Self-consistency CoT：多次生成不同推理路径，用最高频答案做最终输出",
+                    "why_valuable_for_course": "把单次推理改成多次采样后投票。",
+                    "must_have_evidence_ids": ["section_shared"],
+                    "optional_supporting_ids": [],
+                    "disposition": "produce",
+                }
+            ]
+        }
+        kept, excluded = pipeline._align_cards_to_plan(cards, card_plan)
+
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["title"], "Self-consistency CoT：多次生成不同推理路径，用最高频答案做最终输出")
+        self.assertEqual(kept[0]["plan_id"], "plan_obj_self_consistency")
+        self.assertEqual(len(excluded), 1)
+        self.assertEqual(excluded[0]["label"], "DECKARD：Dreaming 与 Awake 两阶段")
+
+    def test_finalize_card_adds_quote_first_rendering_fields(self) -> None:
+        pipeline = PaperPipeline(self.settings, self.repository)
+        finalized = pipeline._finalize_card(
+            {
+                "title": "中央规划器架构",
+                "granularity_level": "subpattern",
+                "course_transformation": "模式卡：中央规划器架构选择",
+                "teachable_one_liner": "把协商改成中央规划。",
+                "draft_body": "这是一个很短的过桥说明。",
+                "evidence": [
+                    {
+                        "section_id": "section_a",
+                        "quote": "A single LLM acts as the central planner.",
+                        "quote_zh": "单个LLM充当中央规划器。",
+                        "analysis": "这句定义了架构核心。",
+                    },
+                    {
+                        "section_id": "section_b",
+                        "quote": "It reduces context demand and improves scalability.",
+                        "quote_zh": "它减少上下文需求并提升可扩展性。",
+                        "analysis": "这句说明为什么值得教。",
+                    },
+                ],
+                "figure_ids": [],
+                "status": "candidate",
+                "primary_section_ids": ["section_a"],
+                "supporting_section_ids": ["section_b"],
+                "paper_specific_object": "central planner",
+                "claim_type": "method",
+                "evidence_level": "strong",
+                "body_grounding_reason": "正文直接描述机制和收益。",
+                "grounding_quality": "strong",
+                "duplicate_cluster_id": "",
+                "duplicate_rank": 1,
+                "duplicate_disposition": "kept",
+                "planned_level": "local",
+                "plan_id": "plan_obj_1",
+                "plan_target_object_id": "obj_1",
+                "plan_target_object_label": "中央规划器",
+                "judgement": {"color": "green", "reason": "可直接讲。"},
+            },
+            "agentic workflow",
+        )
+
+        self.assertEqual(finalized["body_format"], "quote_first_interleaved_analysis")
+        self.assertEqual(len(finalized["quote_first_blocks"]), 2)
+        self.assertIn("原文（穿插分析）：", finalized["quote_first_markdown"])
+        self.assertIn("单个LLM充当中央规划器。", finalized["quote_first_markdown"])
+        self.assertIn("这句定义了架构核心。", finalized["quote_first_markdown"])
+
     def test_concept_alignment_gate_requires_belief_gap_and_named_course_object(self) -> None:
         pipeline = PaperPipeline(self.settings, self.repository)
         cards = [
@@ -2487,6 +2586,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 paper_title: str,
                 sections: list[dict],
                 figures: list[dict] | None = None,
+                planned_cards: list[dict] | None = None,
                 calibration_examples: list[dict] | None = None,
                 calibration_set_name: str = "",
             ) -> dict:
@@ -2965,6 +3065,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                 paper_title: str,
                 sections: list[dict],
                 figures: list[dict] | None = None,
+                planned_cards: list[dict] | None = None,
                 calibration_examples: list[dict] | None = None,
                 calibration_set_name: str = "",
             ) -> dict:
@@ -3154,7 +3255,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertIn("paper_understanding", stages)
         self.assertIn("card_planning", stages)
         extraction_record = next(record for record in records if record["stage"] == "candidate_extraction")
-        self.assertEqual(extraction_record["details"]["shared_policy_version"], "llm-shared-policy-v1-direct-transfer")
+        self.assertEqual(extraction_record["details"]["shared_policy_version"], "llm-shared-policy-v3-plain-english")
 
     def test_discovery_service_deduplicates_cross_provider_candidates(self) -> None:
         class OpenAlexProvider:
@@ -3978,6 +4079,63 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
 
         self.assertEqual(len(outputs["cards"]), 1)
         self.assertEqual(outputs["cards"][0]["title"], "先统一骨架，再并行展开")
+        self.assertEqual(
+            outputs["cards"][0]["evidence"][0]["quote"],
+            "The workflow first creates an outline and then expands each point in parallel.",
+        )
+
+    def test_llm_engine_extract_candidates_keeps_full_paragraph_evidence(self) -> None:
+        long_paragraph = (
+            "The workflow first creates an outline and then expands each point in parallel while preserving a shared structure. "
+            "Each agent receives the same scaffold, keeps its local reasoning visible, and synchronizes key decisions through a common checkpoint. "
+            "This reduces conflict between branches, lowers rewrite cost, and makes it easier to audit where a bad decision first entered the workflow. "
+            "The paper emphasizes that this works because the outline is not a summary artifact but the control surface for later expansion, review, and correction."
+        )
+
+        class StubClient:
+            model = "stub-full-paragraph-model"
+
+            def chat_json(self, system_prompt: str, user_prompt: str) -> dict:
+                payload = json.loads(user_prompt)
+                if payload["stage"] == "candidate_extraction":
+                    return {
+                        "cards": [
+                            {
+                                "title": "先统一骨架，再并行展开",
+                                "section_ids": ["section_demo_1"],
+                                "granularity_level": "subpattern",
+                                "draft_body": "这张卡强调骨架是后续并行扩写的控制面。",
+                                "evidence_analysis": [
+                                    {
+                                        "section_id": "section_demo_1",
+                                        "analysis": "这里讲清楚了为什么骨架不是摘要，而是后续扩写和纠偏的控制面。",
+                                    }
+                                ],
+                            }
+                        ],
+                        "excluded_content": [],
+                    }
+                raise AssertionError("This test only exercises extraction.")
+
+        engine = LLMCardEngine(self.settings, client=StubClient())
+        outputs = engine.extract_candidates(
+            topic_name="Agentic workflow",
+            paper_title="Workflow Skeleton",
+            sections=[
+                {
+                    "id": "section_demo_1",
+                    "page_number": 1,
+                    "paragraph_text": long_paragraph,
+                }
+            ],
+            calibration_examples=[],
+            figures=[],
+            calibration_set_name="",
+        )
+
+        self.assertEqual(len(outputs["cards"]), 1)
+        self.assertEqual(outputs["cards"][0]["evidence"][0]["quote"], long_paragraph)
+        self.assertNotIn("...", outputs["cards"][0]["evidence"][0]["quote"])
 
     def test_llm_engine_keeps_supporting_evidence_without_localized_quote(self) -> None:
         class StubClient:

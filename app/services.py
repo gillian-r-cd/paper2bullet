@@ -225,6 +225,77 @@ def has_named_course_object_signal(course_transformation: str) -> bool:
     return any(token in lowered for token in object_tokens)
 
 
+def compute_plan_object_match_score(plan_item: dict[str, Any], card: dict[str, Any]) -> float:
+    plan_text = " ".join(
+        [
+            str(plan_item.get("target_object_label", "")).strip(),
+            str(plan_item.get("why_valuable_for_course", "")).strip(),
+        ]
+    )
+    card_text = " ".join(
+        [
+            str(card.get("title", "")).strip(),
+            str(card.get("paper_specific_object", "")).strip(),
+            str(card.get("course_transformation", "")).strip(),
+            str(card.get("teachable_one_liner", "")).strip(),
+            str(card.get("planned_object_label", "")).strip(),
+        ]
+    )
+    plan_grams = _signal_ngrams(plan_text)
+    card_grams = _signal_ngrams(card_text)
+    if not plan_grams or not card_grams:
+        return 0.0
+    shared = plan_grams.intersection(card_grams)
+    strong_shared = {
+        token
+        for token in shared
+        if len(token) >= 3 or any("\u4e00" <= char <= "\u9fff" for char in token)
+    }
+    score = float(len(strong_shared))
+    normalized_plan = _normalized_signal_text(plan_text)
+    normalized_card = _normalized_signal_text(card_text)
+    if normalized_plan and normalized_plan in normalized_card:
+        score += 3.0
+    return score
+
+
+def build_quote_first_blocks(card: dict[str, Any]) -> list[dict[str, str]]:
+    blocks: list[dict[str, str]] = []
+    for evidence in card.get("evidence", []) or []:
+        if not isinstance(evidence, dict):
+            continue
+        quote_zh = str(evidence.get("quote_zh", "")).strip()
+        quote_en = str(evidence.get("quote", "")).strip()
+        analysis = str(evidence.get("analysis", "")).strip()
+        primary_quote = quote_zh or quote_en
+        if not primary_quote:
+            continue
+        blocks.append(
+            {
+                "section_id": str(evidence.get("section_id", "")).strip(),
+                "quote": primary_quote,
+                "quote_en": quote_en,
+                "analysis": analysis,
+            }
+        )
+    return blocks
+
+
+def render_quote_first_markdown(card: dict[str, Any]) -> str:
+    blocks = build_quote_first_blocks(card)
+    lines = ["原文（穿插分析）："]
+    if not blocks:
+        summary = str(card.get("draft_body", "")).strip()
+        if summary:
+            lines.append(f"- {summary}")
+        return "\n".join(lines)
+    for block in blocks:
+        lines.append(f"- {block['quote']}")
+        if block.get("analysis"):
+            lines.append(f"  *→ {block['analysis']}*")
+    return "\n".join(lines)
+
+
 def build_discovery_identity(title: str, publication_year: Optional[int], authors: list[str], ids: dict[str, str]) -> str:
     doi = normalize_identifier(ids.get("doi", ""))
     if doi:
@@ -3888,8 +3959,13 @@ class PdfParser:
                             pages.append(page_text)
                     if pages:
                         combined = "\n\n".join(pages)
-                        self._validate_pdf_text(combined, source_path)
-                        return pages
+                        try:
+                            self._validate_pdf_text(combined, source_path)
+                            return pages
+                        except ParseFailure:
+                            # PyMuPDF sometimes truncates tiny synthetic PDFs; fall back to raw BT/ET extraction
+                            # before declaring the document unreadable.
+                            pass
                 finally:
                     document.close()
         raw_text = source_path.read_bytes().decode("latin-1", errors="ignore")
@@ -4312,6 +4388,7 @@ class PaperPipeline:
         paper_title: str,
         sections: list[dict],
         figures: list[dict],
+        planned_cards: list[dict],
         calibration_examples: list[dict],
         calibration_set_name: str,
     ) -> dict[str, Any]:
@@ -4330,6 +4407,7 @@ class PaperPipeline:
             paper_title=paper_title,
             sections=deduped,
             figures=figures,
+            planned_cards=planned_cards,
             calibration_examples=calibration_examples,
             calibration_set_name=calibration_set_name,
         )
@@ -4378,6 +4456,9 @@ class PaperPipeline:
             for card in remaining:
                 if card.get("title") in used_ids:
                     continue
+                source_plan_id = str(card.get("source_plan_id", "")).strip()
+                if source_plan_id and source_plan_id != str(plan_item.get("plan_id", "")).strip():
+                    continue
                 card_primary = set(
                     card.get("primary_section_ids")
                     or [item.get("section_id") for item in card.get("evidence", []) if item.get("section_id")]
@@ -4389,8 +4470,14 @@ class PaperPipeline:
                     continue
                 if must_have_figures and figure_overlap == 0 and not must_have:
                     continue
+                object_match_score = compute_plan_object_match_score(plan_item, card)
+                exact_source_plan_bonus = 12.0 if source_plan_id == str(plan_item.get("plan_id", "")).strip() else 0.0
+                if source_plan_id == str(plan_item.get("plan_id", "")).strip() and object_match_score <= 0:
+                    continue
                 score = overlap * 10
                 score += figure_overlap * 8
+                score += object_match_score * 6
+                score += exact_source_plan_bonus
                 score += {"green": 3, "yellow": 2, "red": 1}.get((card.get("judgement") or {}).get("color", "yellow"), 2)
                 score += {"strong": 3, "medium": 2, "weak": 1}.get(card.get("evidence_level", "medium"), 2)
                 if score > best_score:
@@ -4722,6 +4809,11 @@ class PaperPipeline:
                 version=card_plan.get("version", "card-plan-v1"),
                 plan=card_plan,
             )
+        planned_card_slots = [
+            item
+            for item in card_plan.get("planned_cards", [])
+            if isinstance(item, dict) and item.get("disposition") == "produce"
+        ]
         evidence_packet = self._assemble_plan_driven_packet(
             sections=sections,
             figures=figures,
@@ -4734,6 +4826,7 @@ class PaperPipeline:
             paper_title=paper["title"],
             sections=evidence_packet["prompt_sections"],
             figures=evidence_packet["figure_candidates"],
+            planned_cards=planned_card_slots,
             calibration_examples=(active_calibration_set or {}).get("examples", []),
             calibration_set_name=(active_calibration_set or {}).get("name", ""),
         )
@@ -4745,6 +4838,7 @@ class PaperPipeline:
                 paper_title=paper["title"],
                 sections=sections,
                 figures=evidence_packet["figure_candidates"],
+                planned_cards=planned_card_slots,
                 calibration_examples=(active_calibration_set or {}).get("examples", []),
                 calibration_set_name=(active_calibration_set or {}).get("name", ""),
             )
@@ -4774,6 +4868,8 @@ class PaperPipeline:
 
     def _finalize_card(self, card: dict, topic_name: str) -> dict:
         evidence = card["evidence"]
+        quote_first_blocks = build_quote_first_blocks(card)
+        quote_first_markdown = render_quote_first_markdown(card)
         embedding_source = " ".join(
             [
                 topic_name,
@@ -4791,6 +4887,9 @@ class PaperPipeline:
             "course_transformation": card["course_transformation"],
             "teachable_one_liner": card["teachable_one_liner"],
             "draft_body": card["draft_body"],
+            "body_format": "quote_first_interleaved_analysis",
+            "quote_first_blocks": quote_first_blocks,
+            "quote_first_markdown": quote_first_markdown,
             "evidence": evidence,
             "figure_ids": card.get("figure_ids", []),
             "status": card.get("status", "candidate"),
@@ -5368,15 +5467,12 @@ class ExportService:
                     current_index += len(paper_link_line)
                 for card in paper_cards:
                     color = (card["judgement"] or {}).get("color", "yellow").upper()
+                    quote_first_markdown = render_quote_first_markdown(card)
                     markdown_lines.append(f"- [{color}] **{card['title']}**")
                     markdown_lines.append(f"  - 它在课程里变成什么：{card['course_transformation']}")
                     markdown_lines.append(f"  - 可直接讲的一句话：{card.get('teachable_one_liner', '')}")
                     markdown_lines.append(f"  - 判断理由：{(card['judgement'] or {}).get('reason', '')}")
-                    for evidence in card["evidence"]:
-                        markdown_lines.append(f"  - 证据原文（EN）：{evidence['quote']}")
-                        markdown_lines.append(f"  - 证据译文（ZH）：{evidence.get('quote_zh', '')}")
-                        if evidence.get("analysis"):
-                            markdown_lines.append(f"    - 为什么值得教：{evidence['analysis']}")
+                    markdown_lines.append(f"  - {quote_first_markdown.replace(chr(10), chr(10) + '    ')}")
                     markdown_lines.append("")
                     block = (
                         f"[{color}] {card['title']}\n"
@@ -5384,11 +5480,7 @@ class ExportService:
                         f"可直接讲的一句话：{card.get('teachable_one_liner', '')}\n"
                         f"判断理由：{(card['judgement'] or {}).get('reason', '')}\n"
                     )
-                    for evidence in card["evidence"]:
-                        block += f"证据原文（EN）：{evidence['quote']}\n"
-                        block += f"证据译文（ZH）：{evidence.get('quote_zh', '')}\n"
-                        if evidence.get("analysis"):
-                            block += f"为什么值得教：{evidence['analysis']}\n"
+                    block += f"{quote_first_markdown}\n"
                     block += "\n"
                     requests.extend(self._insert_text(current_index, block))
                     current_index += len(block)

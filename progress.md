@@ -6,6 +6,52 @@ Main sections: completed work, pending work, known issues, and next starting poi
 
 ## 本次做了什么
 
+- 已完成本轮 `card plan binding + quote-first shape` 收口，并补回被打断期间暴露的 PDF 解析基线：
+  - 本轮继续追加 `evidence must be full paragraph` 硬约束：
+    - `app/llm.py` 不再用 `extract_relevant_evidence_excerpt()` 裁剪 evidence
+    - extraction normalization 现直接保留完整 `section["paragraph_text"]`
+    - 已新增超长段落回归测试，禁止 future regression 再把 evidence 变回相关摘录
+  - `app/llm.py`：
+    - extraction 现正式接收 `planned_cards`
+    - extraction prompt payload 现显式下发 `planned_card_slots`
+    - extraction/judgement 结果现透传：
+      - `source_plan_id`
+      - `planned_object_label`
+      - `planned_why_valuable`
+    - prompt 版本已推进到：
+      - `llm-shared-policy-v3-plain-english`
+      - `llm-card-plan-v5-plain-english`
+      - `llm-card-extract-v7-plain-english-zh`
+      - `llm-card-judge-v8-plain-english-zh`
+      - `llm-card-rubric-v7-plain-english`
+  - `app/services.py`：
+    - plan 对齐现同时依赖：
+      - `source_plan_id`
+      - plan/card object 文本匹配分数
+      - must-have evidence / figure overlap
+    - final card 现新增：
+      - `body_format = quote_first_interleaved_analysis`
+      - `quote_first_blocks`
+      - `quote_first_markdown`
+    - 单篇验证报告与导出 markdown 已切到 `原文（穿插分析）` 形状
+    - 修复 PDF 解析回归：
+      - `fitz` 若抽到截断文本，不再直接判死
+      - 会退回既有 BT/ET raw extraction fallback
+      - 已恢复最小 PDF、caption-only、reactivation、本地 PDF 主链测试
+  - `tests/test_app.py`：
+    - 新增 plan 对齐优先级测试
+    - 新增 quote-first final card 渲染测试
+    - export 集成测试现校验新契约 `原文（穿插分析） + *→`
+    - 当前全量 `python -m pytest tests/test_app.py` 通过，合计 94 个测试
+  - 已完成一次真实单篇验证复跑：
+    - run_id: `run_56a6ea38de664028a74d0feb93deb762`
+    - artifacts: `data/validation/run_56a6ea38de664028a74d0feb93deb762_paper_dad4d44180d24040992b5dec6f99d9d2_topic_cdc4a00ed5fd41e19e6eef5f5b9e88a6/`
+    - 结果：`card_count=3`、`excluded_count=8`
+    - 关键确认：
+      - 旧 run 中 `plan_obj_2=Self-consistency CoT -> final card 变成 DECKARD` 的漂移未再出现
+      - 新 run 的 3 张 final card 都与各自 produce plan slot 一一对应
+      - final cards 已稳定带出 `quote_first_markdown`
+
 - 已按 `ROOT_CAUSE_REMEDIATION_PLAN.md` 落地“先单篇测通，再谈 saturation”的根治主链（不再只靠后置门禁）：
   - Stage A（全文理解记录）已持久化：
     - `app/db.py` 新增表：`paper_understanding_records`
@@ -835,6 +881,10 @@ Main sections: completed work, pending work, known issues, and next starting poi
 
 ## 已知的问题和 bug
 
+- quote-first 形状已经进入最终 card/export/report，但 `draft_body` 仍保留为一个较长的桥接段落；如果后续要继续收紧 `CONCEPT.md` 对齐，可以再把下游消费端进一步切到“默认显示 quote_first_markdown，弱化 draft_body”的模式。
+- 当前已确保 final evidence 不再被后端裁成相关摘录；但若上游 parser 把 PDF/HTML 切段本身切坏了，仍会得到“完整但不理想的段落”。后续若继续提高卡片质量，应优先优化 parser 的段落边界，而不是再做 evidence 裁剪。
+- 当前单篇真实验证跑通一次约耗时 153 秒；如果后续要高频迭代 prompt，最好增加更轻量的 smoke 论文或做 stage 级缓存，否则回归成本偏高。
+- 2026-03-08 新触发的 live 单篇验证 `run_ec365308488a4f3282ac015a6d6333eb` 长时间停留在 `pending`，工件未落盘；当前更像 provider 侧卡顿，而不是本次 evidence 改动导致的本地回归。
 - 单篇验证 API 默认会触发当前 LLM 链路；若本地未配置可用 LLM provider，验证会按既有逻辑返回无卡或失败信息，需要先确认 `.env` provider 可用性。
 - 新治理链路只对新生成卡片生效；历史库里已入库的弱卡与重复卡不会自动重写，需要 rerun 或人工清理。
 - 当前环境是否可直接联网访问论文源，仍未在这里完成 live 验证。
@@ -848,7 +898,13 @@ Main sections: completed work, pending work, known issues, and next starting poi
 
 ## 下次开始时应该先做什么
 
-- 先跑一遍 `python -m pytest tests/test_app.py`，当前基线应为 80 个测试全部通过。
+- 先跑一遍 `python -m pytest tests/test_app.py`，当前基线应为 94 个测试全部通过。
+- 先打开并人工审阅最新单篇验证产物：
+  - `data/validation/run_56a6ea38de664028a74d0feb93deb762_paper_dad4d44180d24040992b5dec6f99d9d2_topic_cdc4a00ed5fd41e19e6eef5f5b9e88a6/final_cards.json`
+  - `data/validation/run_56a6ea38de664028a74d0feb93deb762_paper_dad4d44180d24040992b5dec6f99d9d2_topic_cdc4a00ed5fd41e19e6eef5f5b9e88a6/single_paper_validation_report.md`
+- 优先检查两件事：
+  - final card 是否继续严格继承各自 plan slot 的具体对象
+  - quote-first body 是否已经足够接近 `CONCEPT.md` few-shot，可否进一步压缩 `draft_body`
 - 先选 1 篇真实论文执行单篇验证：
   - `POST /api/papers/{paper_id}/validate-single`
   - 人工审阅生成的 `single_paper_validation_report.md`
