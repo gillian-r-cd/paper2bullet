@@ -2522,12 +2522,24 @@ class Repository:
             "same_paper_siblings": sibling_rows,
         }
 
-    def list_cards(self, run_id: Optional[str] = None, topic: str = "") -> list[dict]:
+    def list_cards(
+        self,
+        run_id: Optional[str] = None,
+        topic: str = "",
+        paper_id: Optional[str] = None,
+        topic_id: Optional[str] = None,
+    ) -> list[dict]:
         params: list[str] = []
         filters = []
         if run_id:
             filters.append("candidate_cards.run_id = ?")
             params.append(run_id)
+        if paper_id:
+            filters.append("candidate_cards.paper_id = ?")
+            params.append(paper_id)
+        if topic_id:
+            filters.append("candidate_cards.topic_id = ?")
+            params.append(topic_id)
         if topic:
             filters.append("lower(topics.name) = lower(?)")
             params.append(topic)

@@ -166,8 +166,18 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         return {"evaluation_run": evaluation_run}
 
     @app.get("/api/cards")
-    def list_cards(run_id: str = Query(default=""), topic: str = Query(default="")) -> dict:
-        cards = repository.list_cards(run_id=run_id or None, topic=topic)
+    def list_cards(
+        run_id: str = Query(default=""),
+        topic: str = Query(default=""),
+        paper_id: str = Query(default=""),
+        topic_id: str = Query(default=""),
+    ) -> dict:
+        cards = repository.list_cards(
+            run_id=run_id or None,
+            topic=topic,
+            paper_id=paper_id or None,
+            topic_id=topic_id or None,
+        )
         return {"cards": cards}
 
     @app.post("/api/papers/{paper_id}/validate-single")

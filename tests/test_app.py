@@ -996,6 +996,143 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(review_items.status_code, 200, review_items.text)
         self.assertEqual(review_items.json()["items"][0]["paper_url"], "https://example.com/paper-link")
 
+    def test_cards_api_supports_paper_and_topic_id_filters(self) -> None:
+        run = self.repository.create_run("Validation Topic A\nValidation Topic B", {"operator": "tester"})
+        topic_a = self.repository.create_or_get_topic("Validation Topic A")
+        topic_b = self.repository.create_or_get_topic("Validation Topic B")
+        paper_a = self.repository.create_or_get_paper(
+            title="Validation Paper A",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id="paper::validation-filter-a",
+            source_type="local",
+            local_path="",
+            original_url="",
+            access_status="open_fulltext",
+            ingestion_status="ready",
+            parse_status="parsed",
+            artifact_path="",
+        )
+        paper_b = self.repository.create_or_get_paper(
+            title="Validation Paper B",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id="paper::validation-filter-b",
+            source_type="local",
+            local_path="",
+            original_url="",
+            access_status="open_fulltext",
+            ingestion_status="ready",
+            parse_status="parsed",
+            artifact_path="",
+        )
+        self.repository.link_paper_to_topic(paper_a["id"], topic_a["id"], run["id"], "local_pdf")
+        self.repository.link_paper_to_topic(paper_b["id"], topic_b["id"], run["id"], "local_pdf")
+        self.repository.replace_sections(
+            paper_a["id"],
+            [
+                {
+                    "id": "section_validation_filter_a",
+                    "section_order": 1,
+                    "section_title": "Results",
+                    "paragraph_text": "Topic A result.",
+                    "page_number": 1,
+                    "embedding": [0.0] * 64,
+                }
+            ],
+        )
+        self.repository.replace_sections(
+            paper_b["id"],
+            [
+                {
+                    "id": "section_validation_filter_b",
+                    "section_order": 1,
+                    "section_title": "Results",
+                    "paragraph_text": "Topic B result.",
+                    "page_number": 1,
+                    "embedding": [0.0] * 64,
+                }
+            ],
+        )
+        self.repository.replace_generation_outputs_for_paper_topic(
+            paper_a["id"],
+            topic_a["id"],
+            run["id"],
+            [
+                {
+                    "id": "card_validation_filter_a",
+                    "title": "Validation filter A",
+                    "granularity_level": "detail",
+                    "course_transformation": "A",
+                    "teachable_one_liner": "A",
+                    "draft_body": "A",
+                    "evidence": [
+                        {
+                            "section_id": "section_validation_filter_a",
+                            "quote": "Topic A result.",
+                            "page_number": 1,
+                            "analysis": "A",
+                        }
+                    ],
+                    "figure_ids": [],
+                    "status": "candidate",
+                    "embedding": [0.0] * 64,
+                    "created_at": "2026-03-06T00:00:03+00:00",
+                    "judgement": {
+                        "color": "green",
+                        "reason": "A",
+                        "model_version": "stub-model",
+                        "prompt_version": JUDGEMENT_PROMPT_VERSION,
+                        "rubric_version": CARD_RUBRIC_VERSION,
+                    },
+                }
+            ],
+            [],
+        )
+        self.repository.replace_generation_outputs_for_paper_topic(
+            paper_b["id"],
+            topic_b["id"],
+            run["id"],
+            [
+                {
+                    "id": "card_validation_filter_b",
+                    "title": "Validation filter B",
+                    "granularity_level": "detail",
+                    "course_transformation": "B",
+                    "teachable_one_liner": "B",
+                    "draft_body": "B",
+                    "evidence": [
+                        {
+                            "section_id": "section_validation_filter_b",
+                            "quote": "Topic B result.",
+                            "page_number": 1,
+                            "analysis": "B",
+                        }
+                    ],
+                    "figure_ids": [],
+                    "status": "candidate",
+                    "embedding": [0.0] * 64,
+                    "created_at": "2026-03-06T00:00:04+00:00",
+                    "judgement": {
+                        "color": "yellow",
+                        "reason": "B",
+                        "model_version": "stub-model",
+                        "prompt_version": JUDGEMENT_PROMPT_VERSION,
+                        "rubric_version": CARD_RUBRIC_VERSION,
+                    },
+                }
+            ],
+            [],
+        )
+
+        response = self.client.get(
+            "/api/cards",
+            params={"run_id": run["id"], "paper_id": paper_a["id"], "topic_id": topic_a["id"]},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        cards = response.json()["cards"]
+        self.assertEqual([card["id"] for card in cards], ["card_validation_filter_a"])
+
     def test_promote_excluded_item_creates_linked_candidate_card(self) -> None:
         self._create_excluded_review_fixture()
         test_case = self

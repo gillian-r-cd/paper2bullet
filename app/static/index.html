@@ -134,6 +134,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     <div style="display: flex; gap: 12px; margin-top: 10px;">
       <button id="load-understanding">Load Understanding</button>
       <button id="load-card-plan">Load Card Plan</button>
+      <button id="load-stored-cards">Load Stored Cards</button>
     </div>
     <div id="single-validation-result" class="details"></div>
   </div>
@@ -647,6 +648,16 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       };
     }
 
+    async function fetchStoredValidationCards(paperId, topicId, runId) {
+      const params = new URLSearchParams({ run_id: runId, paper_id: paperId, topic_id: topicId });
+      const payload = await readJson(`/api/cards?${params.toString()}`);
+      return (payload.cards || []).map(card => {
+        const compactCard = { ...card };
+        delete compactCard.embedding;
+        return compactCard;
+      });
+    }
+
     async function runSingleValidation() {
       const output = document.getElementById("single-validation-result");
       output.textContent = "";
@@ -661,7 +672,11 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ topic_id: topicId, run_id: runId })
         });
-        output.textContent = JSON.stringify(payload.validation || payload, null, 2);
+        const storedCards = await fetchStoredValidationCards(paperId, topicId, runId);
+        output.textContent = JSON.stringify({
+          validation: payload.validation || payload,
+          stored_cards: storedCards
+        }, null, 2);
       } catch (error) {
         output.textContent = `Single validation failed: ${error.message}`;
       }
@@ -698,6 +713,28 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         output.textContent = JSON.stringify(payload.card_plan || payload, null, 2);
       } catch (error) {
         output.textContent = `Load card plan failed: ${error.message}`;
+      }
+    }
+
+    async function loadStoredValidationCards() {
+      const output = document.getElementById("single-validation-result");
+      output.textContent = "";
+      const { paperId, topicId, runId } = getSingleValidationInput();
+      if (!paperId || !topicId || !runId) {
+        output.textContent = "paper_id / topic_id / run_id are required.";
+        return;
+      }
+      try {
+        const storedCards = await fetchStoredValidationCards(paperId, topicId, runId);
+        output.textContent = JSON.stringify({
+          paper_id: paperId,
+          topic_id: topicId,
+          run_id: runId,
+          stored_card_count: storedCards.length,
+          stored_cards: storedCards
+        }, null, 2);
+      } catch (error) {
+        output.textContent = `Load stored cards failed: ${error.message}`;
       }
     }
 
@@ -895,6 +932,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     document.getElementById("run-single-validation").addEventListener("click", runSingleValidation);
     document.getElementById("load-understanding").addEventListener("click", loadPaperUnderstanding);
     document.getElementById("load-card-plan").addEventListener("click", loadCardPlan);
+    document.getElementById("load-stored-cards").addEventListener("click", loadStoredValidationCards);
     document.getElementById("export-run-id").addEventListener("change", refreshExportOptions);
 
     document.getElementById("export-doc").addEventListener("click", async () => {
