@@ -117,13 +117,13 @@ P2B_LLM_MODE=disabled
 ### 3. 启动服务
 
 ```bash
-uvicorn app.main:app --reload --port 908
+uvicorn app.main:app --reload --port 1908
 ```
 
 默认地址：
 
-- UI: [http://127.0.0.1:908/](http://127.0.0.1:908/)
-- 健康检查: [http://127.0.0.1:908/api/health](http://127.0.0.1:908/api/health)
+- UI: [http://127.0.0.1:1908/](http://127.0.0.1:1908/)
+- 健康检查: [http://127.0.0.1:1908/api/health](http://127.0.0.1:1908/api/health)
 
 ## 日常操作入口
 
