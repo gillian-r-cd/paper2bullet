@@ -3544,8 +3544,12 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                     test_case.assertEqual(payload["figures"][0]["caption"], "Legacy migration curve")
                     test_case.assertEqual(payload["calibration_examples"][0]["source_text"], "Old standards can outlive their replacements in practice.")
                     test_case.assertIn("shared_policy", payload)
+                    test_case.assertIn("ideal_aha_definition", payload)
+                    test_case.assertIn("four_conditions", payload)
+                    test_case.assertEqual(payload["four_conditions"][0]["name"], "causal_reconstruction")
                     test_case.assertIn("stage_spec", payload)
                     test_case.assertIn("stage_examples", payload)
+                    test_case.assertIn("ontology_lesson", payload["stage_examples"][0])
                     return {
                         "cards": [
                             {
@@ -3630,9 +3634,65 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertIn("shared_policy", client.calls[1])
         self.assertIn("stage_spec", client.calls[1])
         self.assertIn("stage_examples", client.calls[1])
+        self.assertIn("ideal_aha_definition", client.calls[1])
+        self.assertIn("four_conditions", client.calls[1])
+        self.assertEqual(client.calls[1]["four_conditions"][0]["name"], "causal_reconstruction")
+        self.assertIn("evaluation_split", client.calls[1])
+        self.assertIn("old causal model", client.calls[1]["required_judgement_questions"][3])
         self.assertIn(
             "complete Simplified Chinese translation",
             client.calls[1]["judgement_rules"]["evidence_translation_rules"][0],
+        )
+
+    def test_render_system_prompt_includes_ideal_aha_ontology(self) -> None:
+        class StubClient:
+            model = "stub-model"
+
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def chat_json(self, system_prompt: str, user_prompt: str) -> dict:
+                self.calls.append(json.loads(user_prompt))
+                return {"planned_cards": [], "coverage_report": {}}
+
+        client = StubClient()
+        engine = LLMCardEngine(self.settings, client=client)
+        prompt = engine._render_system_prompt("candidate_judgement")
+        policy = engine._shared_prompt_policy()
+        engine.build_card_plan(
+            topic_name="Demo Topic",
+            paper_title="Demo Paper",
+            understanding={
+                "paper_relevance_verdict": "on_topic",
+                "paper_relevance_reason": "demo",
+                "relevance_failure_type": "",
+                "global_contribution_objects": [],
+            },
+            calibration_examples=[],
+        )
+        card_plan_payload = client.calls[0]
+        judgement_payload = engine._build_judgement_prompt_payload(
+            topic_name="Demo Topic",
+            paper_title="Demo Paper",
+            prompt_candidates=[],
+            calibration_examples=[],
+            stage_examples=[],
+            calibration_set_name="",
+        )
+
+        self.assertIn("Ideal aha definition:", prompt)
+        self.assertIn("causal reconstruction", prompt)
+        self.assertIn("Named dilemma as proxy:", prompt)
+        self.assertIn("Information gain vs causal reconstruction:", prompt)
+        self.assertIn("Evaluation split: stage A =", prompt)
+        self.assertIn("Evaluation split: stage B =", prompt)
+        self.assertIn(
+            "A result card or evidence card is not a second aha by default",
+            "\n".join(card_plan_payload["requirements"]["planning_rules"]),
+        )
+        self.assertIn(
+            "metrics-only, benchmark-only, or evidence-only card is usually support",
+            "\n".join(judgement_payload["judgement_rules"]["must_be_true_for_a_card"]),
         )
 
     def test_prompt_version_records_include_understanding_and_planning_stages(self) -> None:
@@ -3642,7 +3702,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertIn("paper_understanding", stages)
         self.assertIn("card_planning", stages)
         extraction_record = next(record for record in records if record["stage"] == "candidate_extraction")
-        self.assertEqual(extraction_record["details"]["shared_policy_version"], "llm-shared-policy-v4-off-topic-gate")
+        self.assertEqual(extraction_record["details"]["shared_policy_version"], "llm-shared-policy-v6-causal-reconstruction")
 
     def test_discovery_service_deduplicates_cross_provider_candidates(self) -> None:
         class OpenAlexProvider:

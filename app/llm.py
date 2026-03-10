@@ -17,12 +17,12 @@ from typing import Any, Callable, Optional
 
 from .config import LLMProviderConfig, Settings
 
-SHARED_PROMPT_POLICY_VERSION = "llm-shared-policy-v4-off-topic-gate"
-EXTRACTION_PROMPT_VERSION = "llm-card-extract-v8-off-topic-gate-zh"
-JUDGEMENT_PROMPT_VERSION = "llm-card-judge-v8-plain-english-zh"
-CARD_RUBRIC_VERSION = "llm-card-rubric-v7-plain-english"
-UNDERSTANDING_PROMPT_VERSION = "llm-paper-understanding-v5-off-topic-gate"
-CARD_PLAN_PROMPT_VERSION = "llm-card-plan-v6-off-topic-gate"
+SHARED_PROMPT_POLICY_VERSION = "llm-shared-policy-v6-causal-reconstruction"
+EXTRACTION_PROMPT_VERSION = "llm-card-extract-v9-causal-reconstruction-zh"
+JUDGEMENT_PROMPT_VERSION = "llm-card-judge-v10-causal-reconstruction-zh"
+CARD_RUBRIC_VERSION = "llm-card-rubric-v8-causal-reconstruction"
+UNDERSTANDING_PROMPT_VERSION = "llm-paper-understanding-v6-causal-reconstruction"
+CARD_PLAN_PROMPT_VERSION = "llm-card-plan-v8-causal-reconstruction"
 MAX_PROMPT_SECTIONS = 14
 MAX_PROMPT_FIGURES = 4
 MAX_CALIBRATION_EXAMPLES = 6
@@ -31,32 +31,34 @@ PROMPT_VERSION_RECORDS = [
     {
         "version": UNDERSTANDING_PROMPT_VERSION,
         "stage": "paper_understanding",
-        "summary": "Understanding stage that decides paper-level course worthiness by asking whether the paper contains a reportable aha, not just topic overlap.",
+        "summary": "Understanding stage that decides paper worthiness by checking whether the paper contains a real causal-reconstruction aha before any course packaging.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "uses_figures": True,
             "uses_stage_examples": False,
-            "stage_contract": "paper_worthiness_then_identify_objects",
+            "stage_contract": "conditions_1_to_3_then_identify_objects",
             "prefers_direct_transfer_patterns": True,
             "reportable_aha_gate": True,
+            "ontology_primary_axis": "causal_reconstruction",
         },
     },
     {
         "version": CARD_PLAN_PROMPT_VERSION,
         "stage": "card_planning",
-        "summary": "Planning stage that inherits the paper verdict and selects the strongest one or two reportable aha objects instead of listing all possible cards.",
+        "summary": "Planning stage that inherits the causal-reconstruction verdict and decides whether the surviving aha can be operationalized into the course.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "uses_stage_examples": True,
-            "stage_contract": "inherit_paper_verdict_then_produce_or_exclude",
+            "stage_contract": "condition_4_operationalization_planning",
             "max_cards_hint_is_soft": True,
             "defaults_to_single_strong_aha": True,
+            "ontology_primary_axis": "course_operationalizability_after_true_aha",
         },
     },
     {
         "version": EXTRACTION_PROMPT_VERSION,
         "stage": "candidate_extraction",
-        "summary": "Chinese extraction that assembles quote-first cards only for the strongest planned aha slots and logs explicit exclusions for the rest.",
+        "summary": "Chinese extraction that assembles quote-first cards only for planned causal-reconstruction objects and logs explicit exclusions for everything else.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "language": "zh-CN learner-facing output",
@@ -66,6 +68,7 @@ PROMPT_VERSION_RECORDS = [
             "requires_paper_specific_object": True,
             "prefers_direct_transfer_patterns": True,
             "suppresses_weaker_same_paper_rephrasings": True,
+            "ontology_primary_axis": "evidence_for_causal_reconstruction",
             "max_sections": MAX_PROMPT_SECTIONS,
             "max_figures": MAX_PROMPT_FIGURES,
         },
@@ -73,7 +76,7 @@ PROMPT_VERSION_RECORDS = [
     {
         "version": JUDGEMENT_PROMPT_VERSION,
         "stage": "candidate_judgement",
-        "summary": "Final card judgement with plan-slot fidelity, reportable-aha ranking, full evidence translation, and direct green/yellow/red decisions.",
+        "summary": "Final card judgement with causal-reconstruction-first reasoning, plan-slot fidelity, full evidence translation, and green/yellow/red decisions.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "language": "zh-CN learner-facing output",
@@ -83,6 +86,7 @@ PROMPT_VERSION_RECORDS = [
             "requires_duplicate_distinction": True,
             "checks_source_object_fidelity": True,
             "checks_reportable_aha_strength": True,
+            "ontology_primary_axis": "old_model_to_new_model_then_course_use",
             "max_calibration_examples": MAX_CALIBRATION_EXAMPLES,
         },
     },
@@ -92,17 +96,17 @@ RUBRIC_VERSION_RECORDS = [
     {
         "version": CARD_RUBRIC_VERSION,
         "name": "card_judgement_rubric",
-        "summary": "Rubric for deciding whether a planned concrete paper object deserves to survive as a usable course card.",
+        "summary": "Rubric for deciding whether a planned concrete paper object is a real causal-reconstruction aha and, only then, a usable course card.",
         "details": {
-            "green": "clear learner-facing aha insight with direct course transfer, strong learner shift, and low technical overhang",
-            "yellow": "boundary-case insight that may need reviewer judgment, stronger operationalization, or stronger ranking against sibling candidates",
-            "red": "summary, background, weak-transfer, duplicate-framing, or technical-but-not-reportable content that should not become a card",
+            "green": "clear causal reconstruction for an active learner prior, credible evidence, and direct course transfer with low technical overhang",
+            "yellow": "boundary-case insight that may have partial causal reconstruction, uncertain active prior, or weaker operationalization and still needs reviewer judgment",
+            "red": "information gain, summary, background, weak-transfer, duplicate-framing, or technical-but-not-reportable content that should not become a card",
             "hard_gates": [
                 "paper_specific_object must be present",
                 "body evidence must support the claim whenever body sections exist",
                 "framing-only variants should be suppressed",
                 "course naming must stay close to the source object",
-                "technical specificity alone is not enough without a reportable learner shift",
+                "technical specificity alone is not enough without a real causal reconstruction",
             ],
         },
     }
@@ -751,21 +755,78 @@ class LLMCardEngine:
         self._provider_routes_by_stage[stage] = self._last_provider_route
         return self.client.chat_json(system_prompt, user_prompt)
 
+    def _ideal_aha_ontology(self) -> dict[str, Any]:
+        return {
+            "ideal_aha_definition": (
+                "A true Aha is not merely a useful insight or a good course card. "
+                "It happens when a learner's causal explanation of an already-lived experience gets reconstructed by the paper's evidence."
+            ),
+            "essence": "causal reconstruction of an already-lived learner experience",
+            "four_conditions": [
+                {
+                    "id": 1,
+                    "name": "causal_reconstruction",
+                    "definition": "The learner had a prior causal explanation for something they have actually experienced, and the paper replaces or reorganizes that explanation.",
+                },
+                {
+                    "id": 2,
+                    "name": "methodological_credibility",
+                    "definition": "The new causal model has enough evidence strength that it can beat the learner's old explanation rather than merely sounding interesting.",
+                },
+                {
+                    "id": 3,
+                    "name": "active_prior_belief",
+                    "definition": "The old belief is still alive for the target learner in 2026; reconstructing a dead prior does not create a real aha.",
+                },
+                {
+                    "id": 4,
+                    "name": "course_operationalizability",
+                    "definition": "After the aha is real, the new model can still become a teachable course object such as a tool, framework, reconstructive narrative, or evidence-backed talking point.",
+                },
+            ],
+            "named_dilemma_as_proxy": [
+                "A named dilemma is a strong proxy for a true aha because it usually implies lived experience, an insufficient old explanation, and a newly clarified structure.",
+                "But named dilemma is still a proxy; the essence remains causal reconstruction.",
+            ],
+            "information_gain_vs_causal_reconstruction": [
+                "Classification, taxonomy, landscape description, and theory compilation add information but do not create aha unless they replace a causal explanation the learner was using.",
+                "Knowing more categories is not the same as understanding a familiar experience differently.",
+            ],
+            "evaluation_split": {
+                "stage_a": "Conditions 1-3 decide whether this is a true aha at all.",
+                "stage_b": "Condition 4 decides whether the true aha survives into the course pipeline.",
+            },
+            "operationalization_modes": [
+                "method_or_tool",
+                "evidence_or_argument",
+                "reconstructive_narrative",
+                "framework_or_model",
+            ],
+        }
+
     def _shared_prompt_policy(self) -> dict[str, Any]:
+        ontology = self._ideal_aha_ontology()
         return {
             "policy_version": SHARED_PROMPT_POLICY_VERSION,
             "target_learner": "a practical AI literacy learner with limited technical depth, real work experience, and low patience for abstract theory",
-            "core_objective": "turn paper evidence into card-worthy aha candidates without drifting away from the paper",
+            "core_objective": "find evidence-backed causal-reconstruction aha candidates that can later survive course operationalization without drifting away from the paper",
+            "ideal_aha_definition": ontology["ideal_aha_definition"],
+            "four_conditions": ontology["four_conditions"],
+            "named_dilemma_as_proxy": ontology["named_dilemma_as_proxy"],
+            "information_gain_vs_causal_reconstruction": ontology["information_gain_vs_causal_reconstruction"],
+            "evaluation_split": ontology["evaluation_split"],
+            "operationalization_modes": ontology["operationalization_modes"],
             "top_level_rules": [
                 "A card is one atomic pattern or one atomic data finding, not a summary, topic label, or outline slot.",
-                "Start from the paper's concrete object and stay close to it before doing any course naming.",
-                "Treat a paper as invalid for this pipeline when it cannot yield a concrete course object, not only when topic words mismatch.",
-                "A card survives only if it can create a real learner shift and has short distance to course use.",
-                "The shift should come from a deeper mechanism, a counterintuitive claim, or something learners feel but cannot name clearly.",
-                "Every surviving card must be actionable in understanding, attitude, or method.",
+                "A true aha is causal reconstruction first and course packaging second.",
+                "Start from the learner's already-lived experience and the paper's concrete source object before doing any course naming.",
+                "Treat a paper as invalid for this pipeline when it cannot reconstruct an active learner causal model, not only when topic words mismatch.",
+                "A card survives only if it first creates a real old-model-to-new-model shift and then has short enough distance to course use.",
+                "The shift should come from a better causal explanation: deeper mechanism, counterintuitive structure, or something learners feel but cannot name clearly.",
+                "Every surviving card must be actionable in understanding, attitude, or method, but actionability alone does not make it a true aha.",
                 "Use body evidence as the main material whenever body evidence exists.",
                 "Keep the original figure when the figure is needed to understand the point.",
-                "Reject recap, taxonomy, survey framing, generic advice, obvious 2026 claims, weak evidence, and wording that drifts above the source object.",
+                "Reject recap, taxonomy, survey framing, generic advice, obvious 2026 claims, weak evidence, and wording that drifts above the source object or above the causal reconstruction.",
                 "Do not treat repeated keyword hits or repeated topic attachment for the same paper as evidence that the paper is more important.",
                 "Default to preserving the strongest single aha in a paper; a second one survives only when it is clearly independent in object, learner shift, and course use.",
                 "Downgrade or reject content that is technically specific yet still feels like an internal architecture part, benchmark detail, or framework component rather than a tellable learner shift.",
@@ -777,28 +838,31 @@ class LLMCardEngine:
     def _stage_spec(self, stage: str) -> dict[str, Any]:
         specs = {
             "paper_understanding": {
-                "stage_goal": "Judge whether the paper is worth entering this course pipeline by asking whether it contains a reportable aha, then find concrete objects only when it does.",
+                "stage_goal": "Judge whether the paper contains a true aha under conditions 1-3, then identify only the source objects that anchor that causal reconstruction.",
                 "must_do": [
                     "Return a paper-level verdict before proposing any object: on_topic, borderline_reject, or off_topic_hard.",
                     "Name the exact failure type when the paper should not continue.",
+                    "Identify the learner's already-lived experience, the likely old causal model, and the new causal model supplied by the paper.",
+                    "Judge methodological credibility and active-prior plausibility before letting course use influence the verdict.",
                     "Map each object to section evidence and figure evidence.",
-                    "Prefer a single complete pattern or data finding over a broad umbrella label.",
+                    "Prefer a single complete causal-reconstruction pattern or data finding over a broad umbrella label.",
                     "Mark the object at the right size: overall, local, or detail.",
-                    "Identify the strongest reportable aha candidate in the paper before considering a second one.",
+                    "Identify the strongest true aha candidate in the paper before considering a second one.",
                 ],
                 "must_not_do": [
                     "Do not decide course naming or green/yellow/red here.",
                     "Do not turn literature structure, survey framing, or broad themes into objects.",
-                    "Do not rescue a topic-adjacent paper if you still cannot say what it becomes in the course.",
+                    "Do not rescue a topic-adjacent paper just because you can imagine a course angle if the causal reconstruction is missing.",
                     "Do not keep a paper alive just because it is technically rich, benchmark-heavy, or attached to many overlapping topics.",
                 ],
             },
             "card_planning": {
-                "stage_goal": "Inherit the paper-level verdict and plan only the strongest one or two reportable aha cards that are worth carrying forward.",
+                "stage_goal": "Inherit the paper-level causal-reconstruction verdict and decide whether the strongest surviving aha can be operationalized into the course under condition 4.",
                 "must_do": [
                     "Respect the understanding verdict before planning any card.",
-                    "Answer what each produced object becomes in the course.",
-                    "State the learner shift that makes the card worth keeping.",
+                    "Assume conditions 1-3 were screened upstream and use this stage to test condition 4: course operationalizability.",
+                    "Answer what each produced object becomes in the course and which operationalization mode it belongs to.",
+                    "State the learner shift that makes the card worth keeping and keep it tied to the old-model-to-new-model change.",
                     "Require must-have section ids and figure ids when they are central.",
                     "Rank sibling candidates and prefer the strongest single aha by default.",
                 ],
@@ -806,13 +870,15 @@ class LLMCardEngine:
                     "Do not write final learner-facing card text.",
                     "Do not force card counts.",
                     "Do not keep a card plan that still sounds like a theme bucket instead of one card.",
+                    "Do not let course usefulness rescue an object that was not a true aha upstream.",
                     "Do not let the same paper spawn multiple planned cards that merely restate the same core insight in different framings.",
                 ],
             },
             "candidate_extraction": {
-                "stage_goal": "Assemble candidate cards from approved objects and explicit exclusions.",
+                "stage_goal": "Extract evidence-backed candidate cards from approved causal-reconstruction objects and log explicit exclusions for everything else.",
                 "must_do": [
                     "Keep the candidate close to the paper-specific object.",
+                    "Preserve the already-identified causal reconstruction instead of turning it into a cleaner but looser principle.",
                     "Use quotes and source evidence as the main body material.",
                     "Add only brief analysis instead of rewriting the paper into a cleaner doctrine.",
                     "When no planned slots survive, emit zero cards and log explicit exclusions only.",
@@ -825,18 +891,18 @@ class LLMCardEngine:
                 ],
             },
             "candidate_judgement": {
-                "stage_goal": "Make the final keep or border call, rank reportable aha strength, finalize course naming, and translate evidence faithfully.",
+                "stage_goal": "Make the final keep or border call by judging causal reconstruction first, then course survivability, while finalizing course naming and translating evidence faithfully.",
                 "must_do": [
-                    "Explain the color decision with source fidelity, learner shift, and transfer distance in mind.",
+                    "Explain the color decision with old model, new model, source fidelity, evidence credibility, active prior, and transfer distance in mind.",
                     "Provide full Chinese localization for primary evidence.",
                     "Check that the card still names one concrete object instead of a vague lesson.",
-                    "Check whether this is the strongest tellable aha in the paper rather than merely a valid technical object.",
+                    "Check whether this is the strongest tellable true aha in the paper rather than merely a valid technical object.",
                 ],
                 "must_not_do": [
                     "Do not invent missing evidence or figures.",
                     "Do not rescue weak cards with prettier wording.",
                     "Do not let course naming drift above the source object.",
-                    "Do not keep a candidate just because it is technically correct if the aha is weak, over-technical, or duplicated by a stronger sibling candidate.",
+                    "Do not keep a candidate just because it is technically correct or operationally useful if the causal reconstruction is weak, over-technical, or duplicated by a stronger sibling candidate.",
                 ],
             },
         }
@@ -845,14 +911,24 @@ class LLMCardEngine:
     def _render_system_prompt(self, stage: str) -> str:
         policy = self._shared_prompt_policy()
         spec = self._stage_spec(stage)
+        ontology = self._ideal_aha_ontology()
         lines = [
             f"You are the {stage} stage in a paper-to-course pipeline.",
             "Return strict JSON only.",
             f"Shared policy version: {policy['policy_version']}.",
             f"Target learner: {policy['target_learner']}.",
             f"Core objective: {policy['core_objective']}.",
-            "Shared rules:",
+            f"Ideal aha definition: {ontology['ideal_aha_definition']}",
+            "Ideal aha conditions:",
         ]
+        lines.extend(f"- {item['name']}: {item['definition']}" for item in ontology["four_conditions"])
+        lines.append("Named dilemma as proxy:")
+        lines.extend(f"- {item}" for item in ontology["named_dilemma_as_proxy"])
+        lines.append("Information gain vs causal reconstruction:")
+        lines.extend(f"- {item}" for item in ontology["information_gain_vs_causal_reconstruction"])
+        lines.append(f"Evaluation split: stage A = {ontology['evaluation_split']['stage_a']}")
+        lines.append(f"Evaluation split: stage B = {ontology['evaluation_split']['stage_b']}")
+        lines.append("Shared rules:")
         lines.extend(f"- {rule}" for rule in policy["top_level_rules"])
         lines.append(f"Stage goal: {spec['stage_goal']}")
         lines.append("Stage must do:")
@@ -874,6 +950,7 @@ class LLMCardEngine:
                     "source_object": example.get("title", ""),
                     "should_produce": bool(example.get("expected_cards")),
                     "why": example.get("rationale", ""),
+                    "ontology_lesson": self._build_example_ontology_lesson(example),
                     "expected_course_objects": [
                         card.get("course_transformation", "")
                         for card in example.get("expected_cards", [])
@@ -893,6 +970,7 @@ class LLMCardEngine:
                     "example_type": example.get("example_type", ""),
                     "topic_name": example.get("topic_name", ""),
                     "source_text": example.get("source_text", ""),
+                    "ontology_lesson": self._build_example_ontology_lesson(example),
                     "expected_cards": [
                         {
                             "title": card.get("title", ""),
@@ -920,10 +998,32 @@ class LLMCardEngine:
                     ],
                     "expected_exclusions": example.get("expected_exclusions", [])[:2],
                     "rationale": example.get("rationale", ""),
+                    "ontology_lesson": self._build_example_ontology_lesson(example),
                 }
                 for example in selected[:MAX_CALIBRATION_EXAMPLES]
             ]
         return []
+
+    def _build_example_ontology_lesson(self, example: dict[str, Any]) -> str:
+        example_type = str(example.get("example_type", "")).strip().lower()
+        expected_cards = example.get("expected_cards", []) or []
+        expected_exclusions = example.get("expected_exclusions", []) or []
+        exclusion_types = {
+            str(item.get("exclusion_type", "")).strip().lower()
+            for item in expected_exclusions
+            if isinstance(item, dict)
+        }
+        if expected_cards and example_type == "positive":
+            return "Positive example: the paper replaces an old causal explanation with a better new one, and the result can later be operationalized in the course."
+        if example_type == "boundary":
+            return "Boundary example: check whether this is true causal reconstruction with enough evidence and an active prior, or merely useful packaging / partial insight."
+        if exclusion_types.intersection({"taxonomy_not_insight", "summary", "background"}):
+            return "Negative example: this adds information or structure without replacing the learner's causal explanation."
+        if exclusion_types.intersection({"weak_method_or_data", "low_hanging_fruit"}):
+            return "Negative example: a possible causal claim exists, but it fails because the evidence is too weak or the old prior is no longer active."
+        if expected_exclusions:
+            return "Negative example: this may be interesting or useful, but it should not survive because it is not a true course-worthy aha under the causal-reconstruction ontology."
+        return "Use this example to distinguish true causal reconstruction from mere information gain or generic course packaging."
 
     def extract_candidates(
         self,
@@ -1111,6 +1211,7 @@ class LLMCardEngine:
     ) -> dict[str, Any]:
         if not self.client:
             return {}
+        ontology = self._ideal_aha_ontology()
         prompt_sections = []
         for section in sections[:40]:
             prompt_sections.append(
@@ -1132,34 +1233,40 @@ class LLMCardEngine:
                 "topic": topic_name,
                 "paper_title": paper_title,
                 "shared_policy": self._shared_prompt_policy(),
+                "ideal_aha_definition": ontology["ideal_aha_definition"],
+                "four_conditions": ontology["four_conditions"],
+                "named_dilemma_as_proxy": ontology["named_dilemma_as_proxy"],
+                "information_gain_vs_causal_reconstruction": ontology["information_gain_vs_causal_reconstruction"],
                 "stage_spec": self._stage_spec("paper_understanding"),
                 "sections": prompt_sections,
                 "figures": prompt_figures,
                 "requirements": {
                     "paper_relevance_rules": [
-                        "First decide whether this paper is worth entering this course pipeline, not just whether topic words overlap.",
+                        "First decide whether this paper contains a true aha under conditions 1-3, not just whether topic words overlap.",
+                        "Ask what lived learner experience this paper speaks to, what old causal model the learner likely holds, and what new causal model the paper supplies.",
+                        "Reject papers that provide information gain without replacing a learner's causal explanation.",
                         "Use off_topic_hard only for clear cases: pure technical mismatch, obvious topic-word-overlap-only, or clearly unusable input for this learner and topic.",
-                        "Use borderline_reject for close-but-not-worth-it cases where the paper seems related yet still cannot cleanly become a course object.",
-                        "Treat a paper as not worth keeping when it is technically detailed yet still fails to produce one reportable aha for this learner.",
+                        "Use borderline_reject for close-but-not-worth-it cases where the paper seems related yet still does not create a convincing causal reconstruction or still fails active-prior / credibility checks.",
+                        "Treat a paper as not worth keeping when it is technically detailed yet still fails to produce one true aha for this learner.",
                         "Do not let repeated keyword overlap or multi-topic attachment rescue a paper whose strongest candidate still feels internal, over-technical, or weakly teachable.",
                         "If verdict is not on_topic, return global_contribution_objects as an empty list.",
                     ],
                     "object_requirements": [
                         "Object labels must be concrete and plain, not generic section names like 'Markdown Extraction'.",
-                        "Each object should be one atomic pattern or one atomic data finding, not a mixed basket.",
+                        "Each object should be one atomic pattern or one atomic data finding that anchors the causal reconstruction, not a mixed basket.",
                         "Each object must map to evidence section ids.",
                         "Use level_hint among overall/local/detail.",
-                        "Prefer objects that a practical learner can picture as a workflow, decision point, failure mode, comparison, reusable pattern, or data point.",
+                        "Prefer objects that a practical learner can picture as a workflow, decision point, failure mode, comparison, reusable pattern, or data point tied to the new causal model.",
                         "When a figure is central to understanding the object, include evidence_figure_ids.",
                     ],
                     "quality_requirements": [
-                        "Prefer paper-specific mechanism, model, method, result, workflow, comparison, or failure-mode objects.",
+                        "Prefer paper-specific mechanism, model, method, result, workflow, comparison, or failure-mode objects that explain why a familiar experience happens differently than the learner assumed.",
                         "Avoid framing-only objects when body evidence exists.",
                         "Prefer source-native workflow and decision structures over broad principles.",
                         "Do not rewrite technical content into generic management or life advice.",
                         "If a concrete sub-pattern is directly teachable, prefer it over a more abstract umbrella label.",
                         "If the object would still need heavy unpacking before a learner can picture it, leave it out.",
-                        "Look for the strongest single learner shift in the paper before preserving additional objects.",
+                        "Look for the strongest single old-model-to-new-model shift in the paper before preserving additional objects.",
                         "Downgrade framework components, benchmark internals, or architecture parts when they are technically valid but not naturally reportable as an aha.",
                     ],
                 },
@@ -1221,6 +1328,7 @@ class LLMCardEngine:
     ) -> dict[str, Any]:
         if not self.client:
             return {}
+        ontology = self._ideal_aha_ontology()
         system_prompt = self._render_system_prompt("card_planning")
         user_prompt = json.dumps(
             {
@@ -1230,6 +1338,11 @@ class LLMCardEngine:
                 "paper_title": paper_title,
                 "max_cards_hint": max_cards,
                 "shared_policy": self._shared_prompt_policy(),
+                "ideal_aha_definition": ontology["ideal_aha_definition"],
+                "four_conditions": ontology["four_conditions"],
+                "named_dilemma_as_proxy": ontology["named_dilemma_as_proxy"],
+                "information_gain_vs_causal_reconstruction": ontology["information_gain_vs_causal_reconstruction"],
+                "operationalization_modes": ontology["operationalization_modes"],
                 "stage_spec": self._stage_spec("card_planning"),
                 "active_calibration_set": calibration_set_name,
                 "stage_examples": self._build_stage_examples("card_planning", calibration_examples or [], topic_name),
@@ -1240,17 +1353,23 @@ class LLMCardEngine:
                         "If paper_relevance_verdict is off_topic_hard, produce zero cards.",
                         "If paper_relevance_verdict is borderline_reject, default to zero cards unless the understanding payload already contains a clearly teachable concrete object with short transfer distance.",
                         "Do not force card counts; 0 card is allowed when no object is teachable.",
+                        "Treat this stage as condition 4 only: ask how a true aha becomes a course object after conditions 1-3 were screened upstream.",
                         "A planned card must be one card, not a theme bucket or a paper recap.",
                         "A planned card should center on one atomic pattern or one atomic data finding.",
                         "A produce item is valid only if you can state both the learner shift and what it becomes in the course.",
                         "A produce item is strong only if you can also say why a leader or practical learner would care in one sentence.",
                         "Default to one strong aha per paper; produce a second one only if its object, learner shift, and course use are clearly independent from the first.",
+                        "If a second candidate is only a submechanism, applied slice, or zoomed-in restatement of the main causal chain, exclude it instead of producing a second card.",
+                        "A second card is independent only when the lived experience, old model, new model, and course action each remain meaningfully distinct from the first card.",
+                        "A result card or evidence card is not a second aha by default; keep it only when the result itself changes a different active learner explanation rather than merely adding proof or numbers to the main mechanism card.",
                         "Prefer the smallest object that is complete enough to teach well.",
                         "Use overall/local/detail only when it matches the real size of the object, not to fill slots.",
                         "Each produce item must specify must_have_evidence_ids.",
-                        "Prefer source-faithful workflow steps, decision rules, failure modes, comparison structures, mechanisms, and data findings that a practical learner can grasp quickly.",
+                        "Prefer source-faithful workflow steps, decision rules, failure modes, comparison structures, mechanisms, and data findings that preserve the paper's causal reconstruction and that a practical learner can grasp quickly.",
+                        "Choose an operationalization mode mentally: method_or_tool, evidence_or_argument, reconstructive_narrative, or framework_or_model.",
                         "Do not exclude an object merely because it is technical if the evidence describes a concrete workflow or decision process with short transfer distance.",
                         "Do not promote a high-level umbrella object when a more concrete child object is more directly teachable for the target learner.",
+                        "Do not let course usefulness rescue an object that still does not feel like a true causal reconstruction.",
                         "Reject background theory, taxonomy recap, old obvious claims, weak-transfer details, and anything that still needs heavy unpacking before use.",
                         "When a figure is central to the object, require it explicitly with must_have_figure_ids.",
                         "Explicitly compare sibling candidates and suppress weaker same-paper rephrasings.",
@@ -1369,6 +1488,7 @@ class LLMCardEngine:
         context_sections = [section for section in prompt_sections if section.get("role_hint") == "context"]
         primary_sections = [section for section in prompt_sections if section.get("role_hint") == "primary"]
         supporting_sections = [section for section in prompt_sections if section.get("role_hint") == "supporting"]
+        ontology = self._ideal_aha_ontology()
         paper_relevance_verdict = normalize_paper_relevance_verdict(
             planning_context.get("paper_relevance_verdict"),
             default="on_topic",
@@ -1386,6 +1506,11 @@ class LLMCardEngine:
             "output_language": "zh-CN",
             "active_calibration_set": calibration_set_name,
             "shared_policy": self._shared_prompt_policy(),
+            "ideal_aha_definition": ontology["ideal_aha_definition"],
+            "four_conditions": ontology["four_conditions"],
+            "named_dilemma_as_proxy": ontology["named_dilemma_as_proxy"],
+            "information_gain_vs_causal_reconstruction": ontology["information_gain_vs_causal_reconstruction"],
+            "evaluation_split": ontology["evaluation_split"],
             "stage_spec": self._stage_spec("candidate_extraction"),
             "stage_examples": stage_examples,
             "calibration_examples": calibration_examples,
@@ -1413,10 +1538,10 @@ class LLMCardEngine:
             ],
             "content_rules": {
                 "candidate_should_look_like": [
-                    "A learner-facing aha candidate that stays faithful to one concrete paper object.",
+                    "A learner-facing aha candidate that stays faithful to one concrete paper object and one causal reconstruction.",
                     "One card should focus on one atomic pattern or one atomic data finding.",
                     "The card should be teachable with short transfer distance, not a summary or a generalized life principle.",
-                    "Prefer a workflow, decision point, failure mode, comparison structure, mechanism, or evidence-backed data point that the learner can picture directly.",
+                    "Prefer a workflow, decision point, failure mode, comparison structure, mechanism, or evidence-backed data point that the learner can picture directly as the new explanation for a familiar experience.",
                     "Ground the card in the provided section_ids, and include figure_ids when a figure materially supports or anchors the idea.",
                     "If planned_card_slots are provided, each surviving candidate must clearly match exactly one slot.",
                     "If planned_card_slots are empty, emit zero cards.",
@@ -1430,16 +1555,16 @@ class LLMCardEngine:
                     "Primary evidence should come from mechanism, model, method, result, failure-mode, or data sections; abstract or framing sections can only be supporting context.",
                     "If body evidence is available in sections, do not use abstract or front matter as the only primary evidence.",
                     "If you cannot name the paper-specific object being taught, emit no card.",
-                    "If you cannot state the learner shift in plain words, emit no card.",
+                    "If you cannot state the learner's old model and the paper's new model in plain words, emit no card.",
                     "Do not convert technical evidence into broad management slogans, motivational advice, or generic productivity principles.",
                     "If a candidate requires multiple layers of explanation before a practical learner can use it, reject it in extraction.",
                     "course_transformation will later name how the source object is presented in the course; do not abstract the object upward here.",
                 ],
                 "judgement_boundary_hints": [
-                    "Look for a clear learner shift: deeper mechanism, counterintuitive claim, tacit-to-explicit explanation, or strong action value.",
+                    "Look for a clear learner shift: deeper mechanism, counterintuitive claim, tacit-to-explicit explanation, or strong action value, but remember the ontology is causal reconstruction first.",
                     "Prefer ideas with business relevance and presentation usefulness, not only academic validity.",
                     "Keep direct-transfer source patterns even when they are not flashy, as long as a practical learner can understand and reuse them quickly.",
-                    "A mere taxonomy recap, literature background, or weak-transfer technical detail should be rejected here.",
+                    "A mere taxonomy recap, literature background, or weak-transfer technical detail should be rejected here because it is information gain without causal reconstruction.",
                 ],
                 "should_be_rejected_here": [
                     "Background theory or literature review context.",
@@ -1503,6 +1628,7 @@ class LLMCardEngine:
         stage_examples: list[dict],
         calibration_set_name: str,
     ) -> dict[str, Any]:
+        ontology = self._ideal_aha_ontology()
         return {
             "topic": topic_name,
             "paper_title": paper_title,
@@ -1511,6 +1637,11 @@ class LLMCardEngine:
             "output_language": "zh-CN",
             "active_calibration_set": calibration_set_name,
             "shared_policy": self._shared_prompt_policy(),
+            "ideal_aha_definition": ontology["ideal_aha_definition"],
+            "four_conditions": ontology["four_conditions"],
+            "named_dilemma_as_proxy": ontology["named_dilemma_as_proxy"],
+            "information_gain_vs_causal_reconstruction": ontology["information_gain_vs_causal_reconstruction"],
+            "evaluation_split": ontology["evaluation_split"],
             "stage_spec": self._stage_spec("candidate_judgement"),
             "stage_examples": stage_examples,
             "calibration_examples": calibration_examples,
@@ -1518,19 +1649,25 @@ class LLMCardEngine:
             "judgement_rules": {
                 "must_be_true_for_a_card": [
                     "The candidate expresses a real learner-facing shift instead of a paper takeaway.",
+                    "The shift is a causal reconstruction of an already-lived learner experience, not just an interesting observation.",
                     "The candidate names one paper-specific object: model, mechanism, method, result, failure mode, framework, or data finding.",
-                    "The card can be named as a concrete course object, pattern, story, exercise, comparison, or evidence-backed talking point.",
-                    "The transfer distance to course use is short enough to teach.",
+                    "The candidate lets you state the learner's old causal model and the paper's new causal model in plain language.",
                     "The evidence strength matches the claim strength.",
+                    "The target learner plausibly still holds the old model in 2026; otherwise the aha is weak even if the paper is correct.",
                     "At least one of these is clearly present: deeper mechanism, counterintuitive claim, tacit-to-explicit explanation, or strong action value.",
                     "The card stays close to the paper's source object instead of drifting into a broader principle.",
                     "If the candidate came from a planned slot, it still matches that planned object instead of sliding to a sibling object from the same section.",
+                    "Only after the aha is real should the card be named as a concrete course object, pattern, story, exercise, comparison, or evidence-backed talking point.",
+                    "The transfer distance to course use is short enough to teach.",
                     "A practical learner should be able to understand what to picture, say, or do after one slide of explanation.",
                     "The candidate is not merely a technically correct structure; it produces a reportable learner shift for a low-patience non-specialist audience.",
                     "Among sibling candidates from the same paper, this candidate is one of the strongest tellable ahas rather than a weaker rephrasing.",
+                    "A same-paper child mechanism, sub-step, or local slice of the main causal chain is not an independent aha unless it changes a different lived experience with a different old model and a different course use.",
+                    "A metrics-only, benchmark-only, or evidence-only card is usually support for a mechanism card, not a separate aha, unless it independently reconstructs a different active learner belief.",
                 ],
                 "business_and_teaching_rules": [
                     "Judge from the learner and course-buying perspective, not only from academic importance.",
+                    "Business usefulness and one-slide clarity are secondary filters after the causal reconstruction is already real.",
                     "Prefer ideas that work on one slide with one strong line and, when available, one supporting figure.",
                     "If you cannot say what this becomes in the course, the card should not pass as green.",
                     "If you cannot say why a leader would care in one sentence, the card should not pass as green.",
@@ -1548,33 +1685,41 @@ class LLMCardEngine:
                     "Preserve informational scope, caveats, enumerations, and logical structure from the English quote.",
                 ],
                 "color_rules": {
-                    "green": "Clear learner shift, strong evidence, and clear course use.",
-                    "yellow": "Possibly valuable but still a border case: learner prior is uncertain, evidence is partial, or course use needs human judgement.",
-                    "red": "Mostly obvious, generic, wrong for the audience, or too indirect to teach.",
+                    "green": "Clear old-model-to-new-model reconstruction, strong evidence, active prior, and clear course use.",
+                    "yellow": "Possibly valuable but still a border case: learner prior is uncertain, evidence is partial, or course operationalization still needs human judgement.",
+                    "red": "Mostly information gain, obviousness, genericity, wrong-audience fit, or too-indirect-to-teach content.",
                 },
                 "must_be_downgraded_or_rejected": [
                     "The candidate is merely background, summary, taxonomy, or weak-transfer detail.",
                     "The audience fit is wrong.",
+                    "The idea is academically valid but does not reconstruct a learner's causal explanation.",
                     "The idea is academically valid but not teachable for the target learner.",
                     "The claim feels outdated or already obvious to the target learner.",
                     "The candidate is a framing variant that overlaps with a sibling candidate from the same paper and evidence.",
+                    "The candidate is only a child mechanism or zoomed-in subpattern of a stronger same-paper causal chain.",
+                    "The candidate mainly adds metrics, benchmark wins, or proof strength to a stronger mechanism card without creating a distinct old-model-to-new-model shift.",
                     "The card relies on principle drift: it sounds smoother after being generalized away from the source evidence.",
                     "The technical-overhang is too high: the learner would need long specialist unpacking before caring.",
                     "The candidate is a same-paper rephrasing of a stronger sibling card.",
-                    "The framework or architecture is clear, but the learner shock is weak.",
+                    "The framework or architecture is clear, but the causal reconstruction is weak.",
                     "The benchmark or result is specific but still not naturally teachable to this audience.",
                 ],
             },
             "required_judgement_questions": [
                 "What is the concrete paper object here?",
                 "If a planned slot exists, does this card still match that specific planned object?",
+                "What already-lived learner experience is this card about?",
+                "What old causal model would the learner likely use here?",
+                "What new causal model does the paper supply instead?",
                 "Is this claim grounded in body evidence or only paper framing?",
+                "Is the learner's old model still active in 2026 for this audience?",
                 "What learner belief or vague intuition does this card change or clarify?",
                 "Does this candidate remain distinct from sibling candidates within the same paper or topic?",
+                "Is this candidate a truly independent aha, or only a submechanism / zoomed-in slice of a stronger same-paper causal chain?",
                 "Is the evidence strength proportional to the claim strength?",
                 "Would a practical learner still understand the source object without extra technical unpacking?",
                 "Has the course naming stayed close to the source object instead of abstracting it upward?",
-                "Is this one of the strongest reportable ahas in the paper, or just a technically valid leftover candidate?",
+                "Is this one of the strongest true ahas in the paper, or just a technically valid leftover candidate?",
             ],
             "output_schema": {
                 "cards": [

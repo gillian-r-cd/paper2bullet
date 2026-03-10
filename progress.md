@@ -6,6 +6,89 @@ Main sections: completed work, pending work, known issues, and next starting poi
 
 ## 本次做了什么
 
+- 已完成一轮专门针对“工程论文里的结果卡”泄漏的 10 篇对抗样本校准，结论是：**当前残余问题已可继续用 prompt 压住，暂时不需要新增 post-judgement suppression rule**：
+  - 样本选择原则：
+    - 优先选 engineering-heavy / benchmark-heavy / survey / position / production 系论文
+    - 优先覆盖容易长出“主机制卡 + 结果/指标卡”结构的 topic：
+      - `long-term memory in AI agents`
+      - `coding agents`
+      - `Vibe coding`
+  - 本轮实际跑过的 10 篇 paper：
+    - `paper_3ed1c8f151fe46399cf3dcb9183be6c2` `Mem0`
+    - `paper_a45b3522a29042978b882e622cc3ff74` `KARMA`
+    - `paper_a1464b8ba6944a6cb3b5ccc4219e9012` `DA-Code`
+    - `paper_2ca816da71784faf950d903f7bd8abc7` `AlphaEvolve`
+    - `paper_6f9662635ad2481d90cdd5d47cccc6b2` `CodeAgent`
+    - `paper_f5c418e5427843ebbf661e9f906884c3` `Vibe Code Bench`
+    - `paper_20321b6f91324efa81d20fe954232fbc` `Vibe Reasoning Position`
+    - `paper_77c75713328d4afcaa288171844d7308` `AppWorld`
+    - `paper_431b7249af8343b898b580237c728602` `Vibe coding: programming through conversation`
+    - `paper_0c70d0dee825464484c4c3e9c30e3134` `A Survey of Vibe Coding with Large Language Models`
+  - 10 篇 sweep 的结果摘要：
+    - `0 card`: `KARMA`, `DA-Code`, `CodeAgent`, `Vibe Reasoning Position`, `Vibe coding: programming through conversation`, `A Survey of Vibe Coding with LLMs`
+    - `1 card`: `AlphaEvolve`, `Vibe Code Bench`, `AppWorld`
+    - `2 cards`: 仅剩 `Mem0`
+  - 关键判断结果：
+    - 这 10 篇中，**没有一篇再保留 `claim_type=result` 的独立结果卡**
+    - 也没有再出现“纯 benchmark / metrics / evidence-only card 作为第二张 ahа 存活”的现象
+    - `Vibe Code Bench` 保留的是 `data_finding`，但其 learner shift 是“不是多改几轮，而是边做边测”，属于行为解释重构，不是单纯汇报数字
+    - `AppWorld` 保留的是 `failure_mode/framework`，是“强交互需求”导致代理失败的机制卡，不是结果卡
+    - `Mem0` 仍保留 2 张卡，但第二张已从先前的 result/evidence card 转成“图记忆不是必胜”的边界/选型卡：
+      - 旧信念：结构化图记忆一定更强
+      - 新信念：图记忆在时间/开放域更占优，但多跳整合未必增益
+      - 这张卡更接近独立的边界条件 aha，而不是主机制卡的数字支撑
+  - 因此本轮决策为：
+    - **不新增 post-judgement suppression rule**
+    - 原因：当前对抗样本上，prompt-first 方案已经把“结果卡泄漏”压到 0；若再加后置 suppression，反而有较高概率误杀像 `Vibe Code Bench` / `Mem0 graph-memory boundary` 这种确实独立的 data-finding / boundary aha
+  - 本轮验证补充：
+    - 之前新增的 prompt regression 仍保持通过：
+      - `python3 -m pytest tests/test_app.py -k "judgement_prompt_uses_calibration_examples or render_system_prompt_includes_ideal_aha_ontology or prompt_version_records_include_understanding_and_planning_stages"`
+    - 本轮 live sweep 中个别 paper 需要 `P2B_LLM_TIMEOUT_SECONDS=180` 才能稳定完成；这是 provider latency 问题，不是 ontology 逻辑问题
+
+- 已完成一轮“3 篇真实论文 single-paper validation + prompt 自迭代”，目标是验证 `causal reconstruction` judging ontology 是否真的落到 live 结果里，而不只是 prompt 文案：
+  - 启动前已按工作流先检查：
+    - 读 `progress.md`
+    - 查看最近 `git log`
+    - 跑基础回归：`python3 -m pytest tests/test_app.py -k "judgement_prompt_uses_calibration_examples or render_system_prompt_includes_ideal_aha_ontology or prompt_version_records_include_understanding_and_planning_stages"` 通过
+  - 确认本机真实 provider 可用：
+    - `.env` 中 `P2B_LLM_MODE=openai_compatible`
+    - 主模型为 `gpt-5.2`
+    - 另有 anthropic / gemini provider 备用
+  - 选取并实际复跑 3 篇真实论文：
+    - `paper_3e4bf6b4c2214f06ade1fa060b7e2129` / `Vibe coding`
+      - 初次结果：`card_count=2`
+      - 发现偏差：主卡已是正确的 old-model -> new-model 因果重构，但同纸子机制卡仍以 `yellow` 存活，说明“同纸 sibling 必须是独立 aha”约束还不够硬
+      - 第 1 次 prompt 收紧后复跑：`card_count=1`, `excluded_count=3`
+      - 结论：对子机制/zoomed-in sibling 的抑制明显改善
+    - `paper_20321b6f91324efa81d20fe954232fbc` / `Vibe coding`
+      - 结果：`card_count=1`, `excluded_count=1`
+      - 结论：输出已明显偏向“先判真实因果重构，再看课程存活性”，没有重新滑回 course-card-first
+    - `paper_3ed1c8f151fe46399cf3dcb9183be6c2` / `long-term memory in AI agents`
+      - 第一次因 openai read timeout 失败；随后用 `P2B_LLM_TIMEOUT_SECONDS=180` 复跑成功
+      - 初次成功结果：`card_count=2`, `excluded_count=2`
+      - 暴露偏差：主机制卡正确，但一张 `metrics / benchmark evidence card` 仍以 `yellow` 保留，说明“证据卡默认不是独立 aha”约束还不够硬
+      - 第 2 次 prompt 收紧后复跑：仍为 `card_count=2`, `excluded_count=2`
+      - 结论：当前 ontology 已能把这类卡压到 `yellow` 而不是 `green`，但尚不能稳定把它完全并回主机制卡
+  - 本轮 prompt 自迭代仅做最小修改，未改 gate topology：
+    - 在 `app/llm.py` 的 card planning 规则里新增：
+      - 第二张卡只有在 `lived experience / old model / new model / course action` 都与第一张卡显著独立时才可保留
+      - 子机制、局部切片、zoomed-in restatement 默认排除
+      - `result/evidence card` 默认不是第二个 aha，除非它独立重构另一条活跃旧解释
+    - 在 judgement 规则里新增：
+      - `metrics-only / benchmark-only / evidence-only` 通常只是主机制卡的支撑，而不是独立 aha
+      - 对同纸 child mechanism / support card 的降级理由更显式
+  - 已同步推进 prompt version，方便后续区分新旧验证结果：
+    - `llm-shared-policy-v6-causal-reconstruction`
+    - `llm-card-plan-v8-causal-reconstruction`
+    - `llm-card-judge-v10-causal-reconstruction-zh`
+  - 已补测试锁定本轮规则与版本：
+    - `tests/test_app.py` 现校验：
+      - card planning payload 含 “evidence card 默认不是第二个 aha” 规则
+      - candidate judgement payload 含 “metrics/evidence-only 通常只是 support” 规则
+      - prompt version records 反映新 shared policy 版本
+  - 当前验证状态：
+    - `python3 -m pytest tests/test_app.py -k "judgement_prompt_uses_calibration_examples or render_system_prompt_includes_ideal_aha_ontology or prompt_version_records_include_understanding_and_planning_stages"` 通过
+
 - 已完成 `Prompt-Only Off-Topic Gate` 落地，且没有改 pipeline 核心流程，只收紧 prompt contract、normalization 和 zero-slot 承接：
   - `app/llm.py`：
     - prompt 版本已推进到：
