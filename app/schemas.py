@@ -32,6 +32,11 @@ class PromoteExcludedRequest(BaseModel):
     note: str = Field(default="")
 
 
+class ReviewCommentRequest(BaseModel):
+    reviewer: str = Field(default="internal")
+    comment: str = Field(default="")
+
+
 class ExportRequest(BaseModel):
     run_id: str
     card_ids: List[str]

@@ -5,12 +5,14 @@ Data structures: app state wiring settings, repository, coordinator, and export 
 """
 from __future__ import annotations
 
+import csv
+import io
 import json
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 from .config import Settings, get_settings
 from .db import init_db
@@ -20,6 +22,7 @@ from .schemas import (
     EvaluationRunRequest,
     ExportRequest,
     PromoteExcludedRequest,
+    ReviewCommentRequest,
     ReviewRequest,
     RunCreateRequest,
     SinglePaperValidationRequest,
@@ -30,6 +33,19 @@ from .services import AccessQueueService, EvaluationService, ExportService, Repo
 
 def build_index_html(static_path: Path) -> str:
     return static_path.read_text(encoding="utf-8")
+
+
+def build_csv_response(filename: str, fieldnames: list[str], rows: list[dict]) -> Response:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: row.get(key, "") for key in fieldnames})
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
@@ -243,6 +259,46 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             )
         }
 
+    @app.get("/api/review-items/export.csv")
+    def export_review_items_csv(
+        run_id: str = Query(default=""),
+        topic: str = Query(default=""),
+        item_type: str = Query(default="cards"),
+        review_status: str = Query(default=""),
+        exclusion_type: str = Query(default=""),
+    ) -> Response:
+        rows = repository.list_review_items(
+            run_id=run_id or None,
+            topic=topic,
+            item_type=item_type,
+            review_status=review_status,
+            exclusion_type=exclusion_type,
+        )
+        return build_csv_response(
+            "review_items.csv",
+            [
+                "object_type",
+                "object_id",
+                "run_id",
+                "topic_name",
+                "paper_title",
+                "paper_url",
+                "display_title",
+                "color",
+                "course_transformation",
+                "teachable_one_liner",
+                "review_status",
+                "comment_text",
+                "comment_updated_at",
+                "exclusion_type",
+                "export_eligible",
+                "promoted_card_id",
+                "promoted_card_title",
+                "created_at",
+            ],
+            rows,
+        )
+
     @app.get("/api/review-items/{target_type}/{target_id}")
     def get_review_item(target_type: str, target_id: str) -> dict:
         item = repository.get_review_item(target_type, target_id)
@@ -290,6 +346,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {"status": "ok", "target_type": target_type, "target_id": target_id}
 
+    @app.post("/api/review-items/{target_type}/{target_id}/comment")
+    def save_review_item_comment(target_type: str, target_id: str, payload: ReviewCommentRequest) -> dict:
+        try:
+            item = reviewer.save_comment(target_type, target_id, payload.reviewer, payload.comment)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return {"status": "ok", "item": item}
+
     @app.post("/api/review-items/excluded/{target_id}/promote")
     def promote_excluded_item(target_id: str, payload: PromoteExcludedRequest) -> dict:
         try:
@@ -323,6 +387,26 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.get("/api/access-queue")
     def list_access_queue(run_id: str = Query(default="")) -> dict:
         return {"items": repository.list_access_queue(run_id or None)}
+
+    @app.get("/api/access-queue/export.csv")
+    def export_access_queue_csv(run_id: str = Query(default="")) -> Response:
+        rows = repository.list_access_queue(run_id or None)
+        return build_csv_response(
+            "access_queue.csv",
+            [
+                "id",
+                "paper_id",
+                "run_id",
+                "paper_title",
+                "reason",
+                "priority",
+                "owner",
+                "status",
+                "original_url",
+                "created_at",
+            ],
+            rows,
+        )
 
     @app.post("/api/access-queue/{queue_item_id}/reactivate")
     def reactivate_access_queue_item(queue_item_id: str, payload: AccessQueueReactivateRequest) -> dict:

@@ -6,6 +6,90 @@ Main sections: completed work, pending work, known issues, and next starting poi
 
 ## 本次做了什么
 
+- 已补项目级 `README.md`，用于给新接手者和未来会话提供统一入口，而不是每次都从 `PRD.md` / `progress.md` / 零散治理文档里重新拼上下文：
+  - 新增文件：`README.md`
+  - 内容覆盖：
+    - 项目目标与定位
+    - 当前能力边界
+    - `causal reconstruction` judging ontology 的简述
+    - 系统形状与目录结构
+    - 本地启动方式
+    - 常用脚本
+    - 核心数据对象
+    - 测试入口
+    - 文档导航
+  - README 明确把新读者引导到：
+    - `progress.md`
+    - `PRD.md`
+    - `AHA.md`
+    - `CONCEPT.md`
+    - 以及 UI / prompt 相关代码入口
+  - 这次是文档改动，没有改业务逻辑，也没有额外跑功能测试
+
+- 已完成一轮最小化 UI 可用性改造，目标是不改整体风格，只解决“列表太长无法收起/导出”和“review detail 太难读”这类真实使用问题：
+  - 相关代码落点：
+    - `app/static/index.html`
+    - `app/main.py`
+    - `app/services.py`
+    - `app/db.py`
+    - `app/schemas.py`
+    - `tests/test_app.py`
+  - 已新增 `persistent review comments`，且**与 review decision history 解耦**：
+    - 新表：`review_item_comments`
+    - 主键仍是单行记录，但按 `target_type + target_id` 唯一约束，代表每个 review item 当前的持续备注
+    - 没复用旧的 `review_decisions.note`，避免把“操作记录”误当成“长期评论”
+    - 新 API：
+      - `POST /api/review-items/{target_type}/{target_id}/comment`
+    - `list_review_items()` 和 `get_review_item()` 现在都会带出 comment 信息
+    - UI 中 comments 支持：
+      - 在 expanded detail 中查看
+      - inline textarea 编辑
+      - `Save Comment`
+      - `Clear Comment`
+  - 已新增 operator list CSV 导出：
+    - `GET /api/review-items/export.csv`
+    - `GET /api/access-queue/export.csv`
+    - 当前实现会复用页面上同一套 filter 参数：
+      - `Review List` CSV 会尊重 `run/topic/item_type/review_status/exclusion_type`
+      - `Access Queue` CSV 会尊重 `run_id`
+  - 已把以下长列表改成可折叠，并在打开时限制内部滚动高度：
+    - `Run Status`
+    - `Review List`
+    - `Access Queue`
+    - `Saturation Trends`
+    - `Single Paper Validation`
+  - 已把 review/card detail 改成更可读的结构，而不是一整块长文本：
+    - `Summary`
+    - `Grounding`
+    - `Persistent Comment`
+    - `Evidence`（默认展开）
+    - `Figures`
+    - `Same-Paper Siblings`
+    - `Potential Dedupe Assistance`
+    - `Excluded Content`
+    - `Diagnostics`
+    - `Review List` 主表中也新增了 comment preview 列，便于不展开先扫一眼
+  - 自动化验证结果：
+    - 新增测试覆盖：
+      - persistent comment 持久化与清空
+      - review-items CSV 导出尊重 filters
+      - access-queue CSV 导出尊重 run filter
+    - 定向回归：
+      - `python3 -m pytest tests/test_app.py -k "review_items_api_supports_card_and_excluded_targets or review_item_comments_persist_separately_from_review_decisions or review_items_csv_export_respects_filters or access_queue_csv_export_uses_run_filter or access_queue_reactivation_reprocesses_paper_into_main_pipeline or card_and_review_items_expose_paper_link or review_item_detail_includes_grounding_diagnostics or review_item_detail_includes_linked_figures"` 通过
+    - 全量 `python3 -m pytest tests/test_app.py` 结果：
+      - `100 passed, 1 skipped, 2 failed`
+      - 两个失败仍是环境缺少 `PIL` 的老问题，不是本轮 UI 改动引入
+    - 另外做了轻量 HTML smoke check：
+      - 通过 `FastAPI TestClient` 确认首页已实际包含：
+        - `export-review-items-csv`
+        - `export-queue-csv`
+        - `saveReviewComment`
+        - `Show / Hide Review List`
+        - `Persistent Comment`
+  - 当前已知限制：
+    - 还没有真正用浏览器做端到端点击回放；目前只完成了 API + served HTML smoke check
+    - `Run Status` / `Topic Jobs` 还没有 CSV 导出；本轮按需求优先只做了 `Review List` 和 `Access Queue`
+
 - 已完成一轮专门针对“工程论文里的结果卡”泄漏的 10 篇对抗样本校准，结论是：**当前残余问题已可继续用 prompt 压住，暂时不需要新增 post-judgement suppression rule**：
   - 样本选择原则：
     - 优先选 engineering-heavy / benchmark-heavy / survey / position / production 系论文

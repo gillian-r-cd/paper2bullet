@@ -953,6 +953,34 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         refreshed_excluded = self.client.get("/api/review-items/excluded/excluded_review").json()["item"]
         self.assertEqual(refreshed_excluded["review"]["decision"], "accepted")
 
+    def test_review_item_comments_persist_separately_from_review_decisions(self) -> None:
+        fixture = self._create_export_card_fixture(card_id="card_comment", review_decision="accepted")
+
+        response = self.client.post(
+            f"/api/review-items/card/{fixture['card_id']}/comment",
+            json={"reviewer": "tester", "comment": "Need a stronger real-world example."},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        detail = self.client.get(f"/api/review-items/card/{fixture['card_id']}")
+        self.assertEqual(detail.status_code, 200, detail.text)
+        item = detail.json()["item"]
+        self.assertEqual(item["review"]["decision"], "accepted")
+        self.assertEqual(item["comment"]["comment"], "Need a stronger real-world example.")
+        self.assertEqual(item["comment"]["reviewer"], "tester")
+
+        list_response = self.client.get("/api/review-items", params={"run_id": fixture["run"]["id"], "item_type": "cards"})
+        self.assertEqual(list_response.status_code, 200, list_response.text)
+        self.assertEqual(list_response.json()["items"][0]["comment_text"], "Need a stronger real-world example.")
+
+        clear_response = self.client.post(
+            f"/api/review-items/card/{fixture['card_id']}/comment",
+            json={"reviewer": "tester", "comment": "   "},
+        )
+        self.assertEqual(clear_response.status_code, 200, clear_response.text)
+        cleared = self.client.get(f"/api/review-items/card/{fixture['card_id']}").json()["item"]
+        self.assertIsNone(cleared["comment"])
+
     def test_card_review_rejects_excluded_only_decision(self) -> None:
         fixture = self._create_export_card_fixture(card_id="card_review_enum", review_decision=None)
         response = self.client.post(
@@ -995,6 +1023,66 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(review_items.status_code, 200, review_items.text)
         self.assertEqual(review_items.json()["items"][0]["paper_url"], "https://example.com/paper-link")
+
+    def test_review_items_csv_export_respects_filters(self) -> None:
+        accepted = self._create_export_card_fixture(card_id="card_csv_accepted", review_decision="accepted")
+        self._create_export_card_fixture(card_id="card_csv_rejected", review_decision="rejected", run=accepted["run"])
+        self.client.post(
+            f"/api/review-items/card/{accepted['card_id']}/comment",
+            json={"reviewer": "tester", "comment": "Export me"},
+        )
+
+        response = self.client.get(
+            "/api/review-items/export.csv",
+            params={"run_id": accepted["run"]["id"], "item_type": "cards", "review_status": "accepted"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("text/csv", response.headers["content-type"])
+        self.assertIn("attachment; filename=\"review_items.csv\"", response.headers["content-disposition"])
+        self.assertIn("card_csv_accepted", response.text)
+        self.assertIn("Export me", response.text)
+        self.assertNotIn("card_csv_rejected", response.text)
+
+    def test_access_queue_csv_export_uses_run_filter(self) -> None:
+        run = self.repository.create_run("queue csv", {"operator": "tester"})
+        other_run = self.repository.create_run("queue csv other", {"operator": "tester"})
+        topic = self.repository.create_or_get_topic("queue csv")
+        paper = self.repository.create_or_get_paper(
+            title="Queue CSV Paper",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id="paper::queue-csv",
+            source_type="local",
+            local_path="",
+            original_url="https://example.com/queue-csv",
+            access_status="manual_needed",
+            ingestion_status="queued",
+            parse_status="pending",
+            artifact_path="",
+        )
+        other_paper = self.repository.create_or_get_paper(
+            title="Queue CSV Other Paper",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id="paper::queue-csv-other",
+            source_type="local",
+            local_path="",
+            original_url="https://example.com/queue-csv-other",
+            access_status="manual_needed",
+            ingestion_status="queued",
+            parse_status="pending",
+            artifact_path="",
+        )
+        self.repository.link_paper_to_topic(paper["id"], topic["id"], run["id"], "search")
+        self.repository.link_paper_to_topic(other_paper["id"], topic["id"], other_run["id"], "search")
+        self.repository.create_access_queue_item(paper["id"], run["id"], "Need full text")
+        self.repository.create_access_queue_item(other_paper["id"], other_run["id"], "Need full text")
+
+        response = self.client.get("/api/access-queue/export.csv", params={"run_id": run["id"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("attachment; filename=\"access_queue.csv\"", response.headers["content-disposition"])
+        self.assertIn("Queue CSV Paper", response.text)
+        self.assertNotIn("Queue CSV Other Paper", response.text)
 
     def test_cards_api_supports_paper_and_topic_id_filters(self) -> None:
         run = self.repository.create_run("Validation Topic A\nValidation Topic B", {"operator": "tester"})

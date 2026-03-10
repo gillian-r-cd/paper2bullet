@@ -40,6 +40,26 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     .figure-card { border: 1px solid #ddd; border-radius: 6px; padding: 10px; background: #fff; }
     .figure-card img { max-width: 100%; max-height: 180px; display: block; margin-top: 8px; border: 1px solid #eee; }
     .figure-card a { display: inline-block; margin-top: 6px; }
+    .panel-collapse { margin-top: 12px; }
+    .panel-collapse > summary { cursor: pointer; font-weight: bold; }
+    .panel-collapse[open] > summary { margin-bottom: 12px; }
+    .toolbar { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; }
+    .toolbar-actions { display: flex; gap: 8px; align-items: center; }
+    .list-surface { max-height: 560px; overflow: auto; }
+    .table-wrap { overflow: auto; max-height: 520px; }
+    .muted { color: #666; font-size: 12px; }
+    .comment-preview { max-width: 220px; white-space: pre-wrap; }
+    .detail-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin-bottom: 14px; }
+    .detail-box { border: 1px solid #e5e5e5; border-radius: 6px; padding: 10px; background: #fff; }
+    .detail-box h4 { margin: 0 0 8px 0; }
+    .detail-box .detail-line { margin: 4px 0; }
+    .detail-subsection { margin-top: 10px; }
+    .detail-subsection > summary { cursor: pointer; font-weight: bold; }
+    .evidence-card { border: 1px solid #e5e5e5; border-radius: 6px; padding: 10px; background: #fff; margin-bottom: 8px; }
+    .evidence-card:last-child { margin-bottom: 0; }
+    .comment-editor textarea { min-height: 88px; }
+    .comment-actions { display: flex; gap: 8px; margin-top: 8px; }
+    .result-scroll { max-height: 320px; overflow: auto; }
   </style>
 </head>
 <body>
@@ -65,14 +85,19 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
 
     <div class="panel">
       <h2>Run Status</h2>
-      <button id="refresh-runs">Refresh Runs</button>
-      <div id="runs"></div>
+      <details class="panel-collapse" open>
+        <summary>Show / Hide Run Tables</summary>
+        <button id="refresh-runs">Refresh Runs</button>
+        <div id="runs" class="list-surface"></div>
+      </details>
     </div>
   </div>
 
   <div class="panel" style="margin-top: 20px;">
     <h2>Review List</h2>
-    <div style="display: flex; gap: 12px; align-items: end;">
+    <details class="panel-collapse" open>
+      <summary>Show / Hide Review List</summary>
+    <div class="toolbar">
       <div style="flex: 1;">
         <label for="filter-run">Filter by Run ID</label>
         <input id="filter-run" type="text" placeholder="run_xxx">
@@ -97,9 +122,13 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         <label for="filter-exclusion-type">Exclusion Type</label>
         <input id="filter-exclusion-type" type="text" placeholder="summary">
       </div>
-      <button id="refresh-review-items">Refresh Review Items</button>
+      <div class="toolbar-actions">
+        <button id="refresh-review-items">Refresh Review Items</button>
+        <button id="export-review-items-csv">Export Review CSV</button>
+      </div>
     </div>
-    <div id="review-items"></div>
+    <div id="review-items" class="list-surface"></div>
+    </details>
   </div>
 
   <div class="panel" style="margin-top: 20px;">
@@ -116,6 +145,8 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
 
   <div class="panel" style="margin-top: 20px;">
     <h2>Single Paper Validation</h2>
+    <details class="panel-collapse">
+      <summary>Show / Hide Single Paper Validation</summary>
     <div style="display: flex; gap: 12px; align-items: end;">
       <div style="flex: 1;">
         <label for="single-validation-paper-id">Paper ID</label>
@@ -136,11 +167,14 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       <button id="load-card-plan">Load Card Plan</button>
       <button id="load-stored-cards">Load Stored Cards</button>
     </div>
-    <div id="single-validation-result" class="details"></div>
+    <div id="single-validation-result" class="details result-scroll"></div>
+    </details>
   </div>
 
   <div class="panel" style="margin-top: 20px;">
     <h2>Saturation Trends</h2>
+    <details class="panel-collapse">
+      <summary>Show / Hide Saturation Trends</summary>
     <div style="display: flex; gap: 12px; align-items: end;">
       <div style="flex: 1;">
         <label for="saturation-topic-filter">Filter by Topic (optional)</label>
@@ -148,14 +182,21 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       </div>
       <button id="refresh-saturation-trends">Refresh Saturation Trends</button>
     </div>
-    <div id="saturation-trends"></div>
+    <div id="saturation-trends" class="list-surface"></div>
+    </details>
   </div>
 
   <div class="grid" style="margin-top: 20px;">
     <div class="panel">
       <h2>Access Queue</h2>
-      <button id="refresh-queue">Refresh Access Queue</button>
-      <div id="queue"></div>
+      <details class="panel-collapse" open>
+        <summary>Show / Hide Access Queue</summary>
+        <div class="toolbar-actions">
+          <button id="refresh-queue">Refresh Access Queue</button>
+          <button id="export-queue-csv">Export Queue CSV</button>
+        </div>
+        <div id="queue" class="list-surface"></div>
+      </details>
     </div>
     <div class="panel">
       <h2>Export</h2>
@@ -205,6 +246,10 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       return `${targetType}:${targetId}`;
     }
 
+    function reviewCommentInputId(targetType, targetId) {
+      return `comment-${targetType}-${String(targetId).replaceAll(/[^a-zA-Z0-9_-]/g, "_")}`;
+    }
+
     function escapeHtml(value) {
       return String(value ?? "")
         .replaceAll("&", "&amp;")
@@ -212,6 +257,44 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#39;");
+    }
+
+    function summarizeText(value, maxLength = 96) {
+      const text = String(value || "").trim();
+      if (!text) return "";
+      if (text.length <= maxLength) return text;
+      return `${text.slice(0, maxLength - 1)}...`;
+    }
+
+    function buildReviewFilterParams() {
+      const params = new URLSearchParams();
+      const runId = document.getElementById("filter-run").value.trim();
+      const topic = document.getElementById("filter-topic").value.trim();
+      const itemType = document.getElementById("filter-item-type").value;
+      const reviewStatus = document.getElementById("filter-review-status").value.trim();
+      const exclusionType = document.getElementById("filter-exclusion-type").value.trim();
+      if (runId) params.set("run_id", runId);
+      if (topic) params.set("topic", topic);
+      if (itemType) params.set("item_type", itemType);
+      if (reviewStatus) params.set("review_status", reviewStatus);
+      if (exclusionType) params.set("exclusion_type", exclusionType);
+      return params;
+    }
+
+    function buildAccessQueueFilterParams() {
+      const params = new URLSearchParams();
+      const runId = document.getElementById("filter-run").value.trim();
+      if (runId) params.set("run_id", runId);
+      return params;
+    }
+
+    function downloadCsv(url) {
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.rel = "noreferrer";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
     }
 
     function figureAssetUrl(figure) {
@@ -417,9 +500,9 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       }).join("");
       document.getElementById("runs").innerHTML = `
         <h3>Runs</h3>
-        <table><tr><th>Run</th><th>Status</th><th>Topics</th><th>Progress Summary</th></tr>${runRows}</table>
+        <div class="table-wrap"><table><tr><th>Run</th><th>Status</th><th>Topics</th><th>Progress Summary</th></tr>${runRows}</table></div>
         <h3>Topic Jobs</h3>
-        <table><tr><th>Run</th><th>Topic</th><th>Status</th><th>Stage</th><th>Elapsed</th><th>Stats</th><th>Actions</th></tr>${topicRows}</table>
+        <div class="table-wrap"><table><tr><th>Run</th><th>Topic</th><th>Status</th><th>Stage</th><th>Elapsed</th><th>Stats</th><th>Actions</th></tr>${topicRows}</table></div>
       `;
       updateExportRunOptions(runs);
     }
@@ -453,6 +536,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         const displayTitle = item.object_type === "excluded" && item.promoted_card_id
           ? `${item.display_title} -> ${item.promoted_card_title}`
           : item.display_title;
+        const commentPreview = summarizeText(item.comment_text || "", 72);
         const mainRow = `
           <tr>
             <td>${selectable ? `<input type="checkbox" class="export-select" value="${item.object_id}" ${exportSelectedCardIds.has(item.object_id) ? "checked" : ""}>` : ""}</td>
@@ -465,6 +549,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
             <td>${item.course_transformation || ""}</td>
             <td>${item.exclusion_type || ""}</td>
             <td>${review}</td>
+            <td class="comment-preview">${escapeHtml(commentPreview)}</td>
             <td>${item.export_eligible ? "yes" : ""}</td>
             <td>${actionButtons}</td>
           </tr>
@@ -475,17 +560,17 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         const detailContent = expandedItem ? renderReviewItemDetail(expandedItem) : "Loading...";
         return `${mainRow}
           <tr>
-            <td colspan="12"><div class="inline-details">${detailContent}</div></td>
+            <td colspan="13"><div class="inline-details">${detailContent}</div></td>
           </tr>
         `;
       }).join("");
       document.getElementById("review-items").innerHTML = `
-        <table>
+        <div class="table-wrap"><table>
           <tr>
-            <th></th><th>Type</th><th>ID</th><th>Topic</th><th>Paper</th><th>Title</th><th>Color</th><th>Course Use</th><th>Exclusion Type</th><th>Review</th><th>Export</th><th>Actions</th>
+            <th></th><th>Type</th><th>ID</th><th>Topic</th><th>Paper</th><th>Title</th><th>Color</th><th>Course Use</th><th>Exclusion Type</th><th>Review</th><th>Comment</th><th>Export</th><th>Actions</th>
           </tr>
           ${rows}
-        </table>
+        </table></div>
       `;
     }
 
@@ -502,10 +587,10 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         </tr>
       `).join("");
       document.getElementById("queue").innerHTML = `
-        <table>
+        <div class="table-wrap"><table>
           <tr><th>Queue ID</th><th>Paper</th><th>Reason</th><th>Priority</th><th>Status</th><th>URL</th><th>Action</th></tr>
           ${rows}
-        </table>
+        </table></div>
       `;
     }
 
@@ -516,25 +601,13 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     }
 
     async function refreshReviewItems() {
-      const runId = document.getElementById("filter-run").value.trim();
-      const topic = document.getElementById("filter-topic").value.trim();
-      const itemType = document.getElementById("filter-item-type").value;
-      const reviewStatus = document.getElementById("filter-review-status").value.trim();
-      const exclusionType = document.getElementById("filter-exclusion-type").value.trim();
-      const params = new URLSearchParams();
-      if (runId) params.set("run_id", runId);
-      if (topic) params.set("topic", topic);
-      if (itemType) params.set("item_type", itemType);
-      if (reviewStatus) params.set("review_status", reviewStatus);
-      if (exclusionType) params.set("exclusion_type", exclusionType);
+      const params = buildReviewFilterParams();
       const payload = await readJson(`/api/review-items?${params.toString()}`);
       renderReviewItems(payload.items);
     }
 
     async function refreshQueue() {
-      const runId = document.getElementById("filter-run").value.trim();
-      const params = new URLSearchParams();
-      if (runId) params.set("run_id", runId);
+      const params = buildAccessQueueFilterParams();
       const payload = await readJson(`/api/access-queue?${params.toString()}`);
       renderQueue(payload.items);
     }
@@ -615,12 +688,12 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         return;
       }
       document.getElementById("saturation-trends").innerHTML = `
-        <table>
+        <div class="table-wrap"><table>
           <tr>
             <th>Topic</th><th>Latest Run</th><th>Cards</th><th>Dup Ratio</th><th>Delta</th><th>Flattening</th><th>Stop</th><th>Reason</th><th>Tail</th><th>History</th>
           </tr>
           ${rows}
-        </table>
+        </table></div>
       `;
     }
 
@@ -739,32 +812,52 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     }
 
     function renderReviewItemDetail(item) {
+      const targetType = item.object_type;
+      const targetId = item.object_id;
+      const comment = item.comment || {};
+      const commentInputId = reviewCommentInputId(targetType, targetId);
+      const commentText = comment.comment || "";
+      const commentMeta = comment.updated_at
+        ? `${comment.reviewer || ""} | ${comment.updated_at}`
+        : "(none)";
       if (item.object_type === "excluded") {
         const evidenceSections = (item.evidence_sections || []).map(section => `
-          <li><strong>${escapeHtml(section.section_title || "Section")}:</strong> ${escapeHtml(section.paragraph_text || "")}</li>
+          <li class="evidence-card"><strong>${escapeHtml(section.section_title || "Section")}:</strong><br>${escapeHtml(section.paragraph_text || "")}</li>
         `).join("");
         const promotedCard = item.promoted_card
           ? `${escapeHtml(item.promoted_card.id)} | ${escapeHtml(item.promoted_card.title)} | ${escapeHtml(item.promoted_card.review_status || "")}`
           : "(none)";
         return `
-          <div class="detail-section">
-            <div class="detail-line"><strong>Excluded:</strong> ${escapeHtml(item.label || "")}</div>
-            <div class="detail-line"><strong>Paper:</strong> ${escapeHtml(item.paper_title || "")}</div>
-            <div class="detail-line"><strong>Paper link:</strong> ${escapeHtml(item.paper_url || "")}</div>
-            <div class="detail-line"><strong>Type:</strong> ${escapeHtml(item.exclusion_type || "")}</div>
-            <div class="detail-line"><strong>Reason:</strong> ${escapeHtml(item.reason || "")}</div>
-            <div class="detail-line"><strong>Review:</strong> ${escapeHtml(((item.review || {}).decision) || "")} | ${escapeHtml(((item.review || {}).note) || "")}</div>
-            <div class="detail-line"><strong>Promoted card:</strong> ${promotedCard}</div>
+          <div class="detail-summary">
+            <div class="detail-box">
+              <h4>Summary</h4>
+              <div class="detail-line"><strong>Excluded:</strong> ${escapeHtml(item.label || "")}</div>
+              <div class="detail-line"><strong>Paper:</strong> ${escapeHtml(item.paper_title || "")}</div>
+              <div class="detail-line"><strong>Paper link:</strong> ${escapeHtml(item.paper_url || "")}</div>
+              <div class="detail-line"><strong>Type:</strong> ${escapeHtml(item.exclusion_type || "")}</div>
+              <div class="detail-line"><strong>Reason:</strong> ${escapeHtml(item.reason || "")}</div>
+              <div class="detail-line"><strong>Review:</strong> ${escapeHtml(((item.review || {}).decision) || "")} | ${escapeHtml(((item.review || {}).note) || "")}</div>
+              <div class="detail-line"><strong>Promoted card:</strong> ${promotedCard}</div>
+            </div>
+            <div class="detail-box comment-editor">
+              <h4>Persistent Comment</h4>
+              <div class="muted">Last saved: ${escapeHtml(commentMeta)}</div>
+              <textarea id="${commentInputId}" placeholder="Write your ongoing reviewer note here...">${escapeHtml(commentText)}</textarea>
+              <div class="comment-actions">
+                <button onclick="saveReviewComment('${targetType}', '${targetId}')">Save Comment</button>
+                <button onclick="clearReviewComment('${targetType}', '${targetId}')">Clear Comment</button>
+              </div>
+            </div>
           </div>
-          <div class="detail-section">
-            <h4>Evidence</h4>
+          <details class="detail-subsection" open>
+            <summary>Evidence</summary>
             <ul class="detail-list">${evidenceSections || "<li>(none)</li>"}</ul>
-          </div>
+          </details>
         `;
       }
 
       const evidenceBlock = (item.evidence || []).map(entry => `
-        <li>
+        <li class="evidence-card">
           <div><strong>Evidence (EN):</strong> ${escapeHtml(entry.quote || "")}</div>
           <div><strong>Evidence (ZH):</strong> ${escapeHtml(entry.quote_zh || "")}</div>
           <div><strong>Why it matters:</strong> ${escapeHtml(entry.analysis || "")}</div>
@@ -785,43 +878,63 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         <li>${escapeHtml(sibling.id || "")} | ${escapeHtml(sibling.title || "")} | cluster=${escapeHtml(sibling.duplicate_cluster_id || "(none)")} | rank=${escapeHtml(sibling.duplicate_rank || 0)} | disposition=${escapeHtml(sibling.duplicate_disposition || "")}</li>
       `).join("");
       return `
-        <div class="detail-section">
-          <div class="detail-line"><strong>Card:</strong> ${escapeHtml(item.title || "")}</div>
-          <div class="detail-line"><strong>Paper:</strong> ${escapeHtml(item.paper_title || "")}</div>
-          <div class="detail-line"><strong>Paper link:</strong> ${escapeHtml(item.paper_url || "")}</div>
-          <div class="detail-line"><strong>Teach it as:</strong> ${escapeHtml(item.teachable_one_liner || "")}</div>
-          <div class="detail-line"><strong>Course use:</strong> ${escapeHtml(item.course_transformation || "")}</div>
-          <div class="detail-line"><strong>Judgement:</strong> ${escapeHtml((item.judgement || {}).color || "")} | ${escapeHtml((item.judgement || {}).reason || "")}</div>
-          <div class="detail-line"><strong>Review:</strong> ${escapeHtml(((item.review || {}).decision) || "")} | ${escapeHtml(((item.review || {}).note) || "")}</div>
-          <div class="detail-line"><strong>Paper-specific object:</strong> ${escapeHtml(item.paper_specific_object || diagnostics.paper_specific_object || "")}</div>
-          <div class="detail-line"><strong>Claim type:</strong> ${escapeHtml(item.claim_type || diagnostics.claim_type || "")}</div>
-          <div class="detail-line"><strong>Evidence level:</strong> ${escapeHtml(item.evidence_level || diagnostics.evidence_level || "")}</div>
-          <div class="detail-line"><strong>Grounding quality:</strong> ${escapeHtml(item.grounding_quality || diagnostics.grounding_quality || "")}</div>
-          <div class="detail-line"><strong>Body grounding reason:</strong> ${escapeHtml(item.body_grounding_reason || diagnostics.body_grounding_reason || "")}</div>
-          <div class="detail-line"><strong>Primary evidence source type mix:</strong> body=${escapeHtml(mix.body || 0)}, abstract=${escapeHtml(mix.abstract || 0)}, front=${escapeHtml(mix.front_matter || 0)}</div>
-          <div class="detail-line"><strong>Duplicate cluster:</strong> ${escapeHtml(item.duplicate_cluster_id || diagnostics.duplicate_cluster_id || "")} | rank=${escapeHtml(item.duplicate_rank || diagnostics.duplicate_rank || 0)} | disposition=${escapeHtml(item.duplicate_disposition || diagnostics.duplicate_disposition || "")}</div>
-          <div class="detail-line"><strong>Promoted from excluded:</strong> ${sourceExcludedBlock}</div>
+        <div class="detail-summary">
+          <div class="detail-box">
+            <h4>Summary</h4>
+            <div class="detail-line"><strong>Card:</strong> ${escapeHtml(item.title || "")}</div>
+            <div class="detail-line"><strong>Paper:</strong> ${escapeHtml(item.paper_title || "")}</div>
+            <div class="detail-line"><strong>Paper link:</strong> ${escapeHtml(item.paper_url || "")}</div>
+            <div class="detail-line"><strong>Teach it as:</strong> ${escapeHtml(item.teachable_one_liner || "")}</div>
+            <div class="detail-line"><strong>Course use:</strong> ${escapeHtml(item.course_transformation || "")}</div>
+            <div class="detail-line"><strong>Judgement:</strong> ${escapeHtml((item.judgement || {}).color || "")} | ${escapeHtml((item.judgement || {}).reason || "")}</div>
+            <div class="detail-line"><strong>Review:</strong> ${escapeHtml(((item.review || {}).decision) || "")} | ${escapeHtml(((item.review || {}).note) || "")}</div>
+          </div>
+          <div class="detail-box">
+            <h4>Grounding</h4>
+            <div class="detail-line"><strong>Paper-specific object:</strong> ${escapeHtml(item.paper_specific_object || diagnostics.paper_specific_object || "")}</div>
+            <div class="detail-line"><strong>Claim type:</strong> ${escapeHtml(item.claim_type || diagnostics.claim_type || "")}</div>
+            <div class="detail-line"><strong>Evidence level:</strong> ${escapeHtml(item.evidence_level || diagnostics.evidence_level || "")}</div>
+            <div class="detail-line"><strong>Grounding quality:</strong> ${escapeHtml(item.grounding_quality || diagnostics.grounding_quality || "")}</div>
+            <div class="detail-line"><strong>Body grounding reason:</strong> ${escapeHtml(item.body_grounding_reason || diagnostics.body_grounding_reason || "")}</div>
+            <div class="detail-line"><strong>Source type mix:</strong> body=${escapeHtml(mix.body || 0)}, abstract=${escapeHtml(mix.abstract || 0)}, front=${escapeHtml(mix.front_matter || 0)}</div>
+          </div>
+          <div class="detail-box comment-editor">
+            <h4>Persistent Comment</h4>
+            <div class="muted">Last saved: ${escapeHtml(commentMeta)}</div>
+            <textarea id="${commentInputId}" placeholder="Write your ongoing reviewer note here...">${escapeHtml(commentText)}</textarea>
+            <div class="comment-actions">
+              <button onclick="saveReviewComment('${targetType}', '${targetId}')">Save Comment</button>
+              <button onclick="clearReviewComment('${targetType}', '${targetId}')">Clear Comment</button>
+            </div>
+          </div>
         </div>
-        <div class="detail-section">
-          <h4>Figures</h4>
-          ${renderFigureBlock(item.figures || [])}
-        </div>
-        <div class="detail-section">
-          <h4>Evidence</h4>
+        <details class="detail-subsection" open>
+          <summary>Evidence</summary>
           <ul class="detail-list">${evidenceBlock || "<li>(none)</li>"}</ul>
-        </div>
-        <div class="detail-section">
-          <h4>Same-Paper Siblings</h4>
+        </details>
+        <details class="detail-subsection">
+          <summary>Figures</summary>
+          ${renderFigureBlock(item.figures || [])}
+        </details>
+        <details class="detail-subsection">
+          <summary>Same-Paper Siblings</summary>
           <ul class="detail-list">${siblingBlock || "<li>(none)</li>"}</ul>
-        </div>
-        <div class="detail-section">
-          <h4>Potential Dedupe Assistance</h4>
+        </details>
+        <details class="detail-subsection">
+          <summary>Potential Dedupe Assistance</summary>
           <ul class="detail-list">${neighborBlock || "<li>(none)</li>"}</ul>
-        </div>
-        <div class="detail-section">
-          <h4>Excluded Content From This Paper</h4>
+        </details>
+        <details class="detail-subsection">
+          <summary>Excluded Content From This Paper</summary>
           <ul class="detail-list">${excludedBlock || "<li>(none)</li>"}</ul>
-        </div>
+        </details>
+        <details class="detail-subsection">
+          <summary>Diagnostics</summary>
+          <div class="detail-box">
+            <div class="detail-line"><strong>Duplicate cluster:</strong> ${escapeHtml(item.duplicate_cluster_id || diagnostics.duplicate_cluster_id || "")} | rank=${escapeHtml(item.duplicate_rank || diagnostics.duplicate_rank || 0)} | disposition=${escapeHtml(item.duplicate_disposition || diagnostics.duplicate_disposition || "")}</div>
+            <div class="detail-line"><strong>Promoted from excluded:</strong> ${sourceExcludedBlock}</div>
+          </div>
+        </details>
       `;
     }
 
@@ -852,6 +965,29 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       await refreshReviewItems();
       await refreshExportOptions();
       await loadReviewItem(targetType, targetId);
+    }
+
+    async function saveReviewComment(targetType, targetId) {
+      const input = document.getElementById(reviewCommentInputId(targetType, targetId));
+      const comment = input ? input.value : "";
+      const payload = await readJson(`/api/review-items/${targetType}/${targetId}/comment`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reviewer: "internal-ui", comment })
+      });
+      const key = reviewItemKey(targetType, targetId);
+      reviewItemDetailsByKey[key] = payload.item;
+      expandedReviewItemKey = key;
+      await refreshReviewItems();
+      renderReviewItems(reviewItemsState);
+    }
+
+    async function clearReviewComment(targetType, targetId) {
+      const input = document.getElementById(reviewCommentInputId(targetType, targetId));
+      if (input) {
+        input.value = "";
+      }
+      await saveReviewComment(targetType, targetId);
     }
 
     async function promoteExcludedItem(targetId) {
@@ -926,6 +1062,12 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     document.getElementById("refresh-runs").addEventListener("click", refreshRuns);
     document.getElementById("refresh-review-items").addEventListener("click", refreshReviewItems);
     document.getElementById("refresh-queue").addEventListener("click", refreshQueue);
+    document.getElementById("export-review-items-csv").addEventListener("click", () => {
+      downloadCsv(`/api/review-items/export.csv?${buildReviewFilterParams().toString()}`);
+    });
+    document.getElementById("export-queue-csv").addEventListener("click", () => {
+      downloadCsv(`/api/access-queue/export.csv?${buildAccessQueueFilterParams().toString()}`);
+    });
     document.getElementById("refresh-calibration-status").addEventListener("click", refreshCalibrationStatus);
     document.getElementById("refresh-quality-metrics").addEventListener("click", refreshQualityMetrics);
     document.getElementById("refresh-saturation-trends").addEventListener("click", refreshSaturationTrends);

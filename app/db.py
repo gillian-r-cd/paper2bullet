@@ -298,6 +298,17 @@ CREATE TABLE IF NOT EXISTS review_decisions (
     FOREIGN KEY (card_id) REFERENCES candidate_cards(id)
 );
 
+CREATE TABLE IF NOT EXISTS review_item_comments (
+    id TEXT PRIMARY KEY,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    comment TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(target_type, target_id)
+);
+
 CREATE TABLE IF NOT EXISTS paper_excluded_content (
     id TEXT PRIMARY KEY,
     paper_id TEXT NOT NULL,
@@ -519,6 +530,7 @@ def ensure_migrations(connection: sqlite3.Connection) -> None:
     ensure_column(connection, "candidate_cards", "duplicate_disposition", "TEXT NOT NULL DEFAULT ''")
     ensure_promoted_linkage_index(connection)
     ensure_review_decisions_target_schema(connection)
+    ensure_review_item_comment_indexes(connection)
     ensure_discovery_indexes(connection)
 
 
@@ -581,6 +593,33 @@ def ensure_review_decisions_target_schema(connection: sqlite3.Connection) -> Non
         connection.execute("DROP TABLE review_decisions_legacy")
     finally:
         connection.execute("PRAGMA foreign_keys = ON;")
+
+
+def ensure_review_item_comment_indexes(connection: sqlite3.Connection) -> None:
+    table_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'review_item_comments'"
+    ).fetchone()
+    if not table_exists:
+        connection.execute(
+            """
+            CREATE TABLE review_item_comments (
+                id TEXT PRIMARY KEY,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                reviewer TEXT NOT NULL,
+                comment TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(target_type, target_id)
+            )
+            """
+        )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_review_item_comments_target
+        ON review_item_comments(target_type, target_id)
+        """
+    )
 
 
 def ensure_promoted_linkage_index(connection: sqlite3.Connection) -> None:

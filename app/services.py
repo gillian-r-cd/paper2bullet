@@ -2204,6 +2204,54 @@ class Repository:
                 (new_id("review"), target_type, target_id, card_id, reviewer, decision, note, utc_now()),
             )
 
+    def get_review_item_comment(self, target_type: str, target_id: str) -> Optional[dict]:
+        return self._fetchone(
+            """
+            SELECT * FROM review_item_comments
+            WHERE target_type = ? AND target_id = ?
+            LIMIT 1
+            """,
+            (target_type, target_id),
+        )
+
+    def upsert_review_item_comment(self, target_type: str, target_id: str, reviewer: str, comment: str) -> Optional[dict]:
+        normalized_comment = comment.strip()
+        with db_cursor(self.settings.db_path) as connection:
+            if not normalized_comment:
+                connection.execute(
+                    "DELETE FROM review_item_comments WHERE target_type = ? AND target_id = ?",
+                    (target_type, target_id),
+                )
+                return None
+            existing = connection.execute(
+                """
+                SELECT id, created_at
+                FROM review_item_comments
+                WHERE target_type = ? AND target_id = ?
+                LIMIT 1
+                """,
+                (target_type, target_id),
+            ).fetchone()
+            now = utc_now()
+            if existing:
+                connection.execute(
+                    """
+                    UPDATE review_item_comments
+                    SET reviewer = ?, comment = ?, updated_at = ?
+                    WHERE target_type = ? AND target_id = ?
+                    """,
+                    (reviewer, normalized_comment, now, target_type, target_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO review_item_comments(id, target_type, target_id, reviewer, comment, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (new_id("comment"), target_type, target_id, reviewer, normalized_comment, now, now),
+                )
+        return self.get_review_item_comment(target_type, target_id)
+
     def create_promoted_candidate_card(self, excluded_content_id: str, card: dict) -> dict:
         excluded_item = self.get_excluded_content_summary(excluded_content_id)
         if not excluded_item:
@@ -2548,6 +2596,7 @@ class Repository:
             (card_id,),
         )
         row["review"] = self.get_latest_review_decision("card", card_id)
+        row["comment"] = self.get_review_item_comment("card", card_id)
         row["excluded_content"] = self.list_excluded_content(
             paper_id=row["paper_id"],
             topic_id=row["topic_id"],
@@ -2738,6 +2787,7 @@ class Repository:
             return None
         row = self._hydrate_excluded_row(row)
         row["review"] = self.get_latest_review_decision("excluded", excluded_content_id)
+        row["comment"] = self.get_review_item_comment("excluded", excluded_content_id)
         return row
 
     def list_excluded_content(
@@ -2773,6 +2823,7 @@ class Repository:
         for row in rows:
             self._hydrate_excluded_row(row)
             row["review"] = self.get_latest_review_decision("excluded", row["id"])
+            row["comment"] = self.get_review_item_comment("excluded", row["id"])
             row["promoted_card"] = self.get_promoted_card_summary(row["id"])
         return rows
 
@@ -2807,6 +2858,7 @@ class Repository:
             for card in self.list_cards(run_id=run_id, topic=topic):
                 if review_status and (card.get("review_decision") or "") != review_status:
                     continue
+                comment = self.get_review_item_comment("card", card["id"]) or {}
                 items.append(
                     {
                         "object_type": "card",
@@ -2820,6 +2872,8 @@ class Repository:
                         "course_transformation": card.get("course_transformation", ""),
                         "teachable_one_liner": card.get("teachable_one_liner", ""),
                         "review_status": card.get("review_decision", ""),
+                        "comment_text": comment.get("comment", ""),
+                        "comment_updated_at": comment.get("updated_at", ""),
                         "exclusion_type": "",
                         "export_eligible": is_card_export_eligible(card.get("review_decision") or ""),
                         "source_excluded_content_id": card.get("source_excluded_content_id"),
@@ -2838,6 +2892,7 @@ class Repository:
                     continue
                 if exclusion_type and item["exclusion_type"] != exclusion_type:
                     continue
+                comment = item.get("comment") or {}
                 items.append(
                     {
                         "object_type": "excluded",
@@ -2851,6 +2906,8 @@ class Repository:
                         "course_transformation": "",
                         "teachable_one_liner": "",
                         "review_status": latest_review.get("decision", ""),
+                        "comment_text": comment.get("comment", ""),
+                        "comment_updated_at": comment.get("updated_at", ""),
                         "exclusion_type": item["exclusion_type"],
                         "export_eligible": False,
                         "promoted_card_id": (item.get("promoted_card") or {}).get("id", ""),
@@ -5235,6 +5292,13 @@ class ReviewService:
             choices = ", ".join(sorted(allowed_decisions)) or "(none)"
             raise ValueError(f"Unsupported decision for {target_type}: {decision}. Allowed values: {choices}")
         self.repository.create_review_decision(target_type, target_id, reviewer, decision, note)
+        return self.repository.get_review_item(target_type, target_id) or item
+
+    def save_comment(self, target_type: str, target_id: str, reviewer: str, comment: str) -> dict:
+        item = self.repository.get_review_item(target_type, target_id)
+        if not item:
+            raise LookupError("Review item not found")
+        self.repository.upsert_review_item_comment(target_type, target_id, reviewer, comment)
         return self.repository.get_review_item(target_type, target_id) or item
 
     def promote_excluded_item(self, excluded_content_id: str, reviewer: str, note: str) -> dict:

@@ -259,7 +259,7 @@ class Settings:
     anthropic_version: str = os.environ.get("P2B_ANTHROPIC_VERSION", "2023-06-01")
     gemini_api_version: str = os.environ.get("P2B_GEMINI_API_VERSION", "v1beta")
     host: str = os.environ.get("P2B_HOST", "127.0.0.1")
-    port: int = int(os.environ.get("P2B_PORT", "8000"))
+    port: int = int(os.environ.get("P2B_PORT", "908"))
 
     @property
     def artifacts_dir(self) -> Path:
