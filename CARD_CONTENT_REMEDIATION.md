@@ -37,6 +37,7 @@ Derived from `CONCEPT.md`, the remediation must preserve these invariants:
   - concrete data finding
 - A card must stay atomic.
 - Atomicity does not justify letting the same core evidence spawn multiple framing variants.
+- Atomicity also does not justify letting the same paper resurface across multiple overlapping topics as if those were separate discoveries.
 - `它在课程里变成什么` remains a hard gate.
 - Review should focus on real boundary cases, not on repeatedly cleaning up systematic upstream defects.
 - Dedupe, saturation, calibration, and evidence quality must be connected into one governance surface.
@@ -46,8 +47,9 @@ Derived from `CONCEPT.md`, the remediation must preserve these invariants:
 The quality failures currently cluster into three linked problem families:
 
 1. `Same-evidence near-duplicate cards`
-2. `Abstract/front-matter evidence bias`
-3. `Paper-specific value and mechanism loss`
+2. `Same-paper cross-topic resurfacing`
+3. `Abstract/front-matter evidence bias`
+4. `Paper-specific value and mechanism loss`
 
 These are recorded in `PROBLEMS.md`.
 
@@ -103,12 +105,15 @@ The system is currently failing upstream, before judgement.
 ```mermaid
 flowchart TD
     sectionParsing[SectionParsing] --> structureLoss[StructureLoss]
+    structureLoss --> topicOverlap[OverlappingTopicAttachment]
     structureLoss --> earlyTruncation[EarlyPromptTruncation]
+    topicOverlap --> repeatedPaperEntry[SamePaperReappearsAcrossTopics]
     earlyTruncation --> frontMatterBias[FrontMatterDominatesContext]
     frontMatterBias --> extractionMisgrounding[ExtractionSelectsWeakSections]
     extractionMisgrounding --> evidenceFreeze[EvidenceIsFrozenFromSelectedSections]
     evidenceFreeze --> judgementCannotRecover[JudgementCannotRecoverMissingBodyEvidence]
     judgementCannotRecover --> duplicateAngles[SameEvidenceAngleSplits]
+    repeatedPaperEntry --> duplicateAngles
     duplicateAngles --> weakCards[WeakCardsEnterReview]
 ```
 
@@ -197,6 +202,18 @@ Current duplicate assistance is mostly post-persistence:
 
 This is useful for review, but too late to stop the system from generating and storing multiple cards from the same core evidence.
 
+### Root Cause 7: Paper-Level Dedupe Is Weaker Than Topic Fan-Out
+
+The pipeline can attach one paper to many overlapping topics before it has committed to the paper's strongest reportable aha.
+
+That creates a bad multiplication effect:
+
+- one paper enters multiple topic lanes
+- each lane can independently generate cards
+- the same core paper object gets reframed several times
+
+This is not true discovery diversity. It is resurfacing caused by topic overlap.
+
 ## Target Architecture
 
 The target pipeline must be:
@@ -220,8 +237,27 @@ This architecture introduces three missing first-class concepts:
 1. `section structure recovery`
 2. `evidence packet assembly before prompting`
 3. `pre-persist grounding and duplicate gates`
+4. `paper-level strongest-aha selection before topic-level resurfacing`
 
 ## Remediation Tracks
+
+## Track 0: Paper-Level Dedupe Before Topic Multiplication
+
+### Goal
+
+Prevent one paper from gaining false importance simply because it matched multiple overlapping topics.
+
+### Required changes
+
+- add a paper-level strongest-aha decision before allowing repeated topic-specific card generation
+- treat topic as a routing lens, not as an independent reason to keep another card
+- suppress same-paper resurfacing unless the second candidate is clearly independent in object, learner shift, and course use
+
+### Acceptance criteria
+
+- same paper appearing in many topic buckets no longer increases its card count by default
+- the default behavior becomes `one strongest aha per paper`
+- additional cards require explicit evidence of independence, not merely different framing
 
 ## Track 1: Section Structure Recovery
 

@@ -4130,6 +4130,37 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertTrue(decision["checks"]["duplication_met"])
         self.assertEqual(metrics["stop_decision"]["decision"], "candidate_stop")
 
+    def test_run_level_primary_topic_routing_suppresses_cross_topic_repeat_cards(self) -> None:
+        run = self.repository.create_run("alpha topic\nbeta topic", {"operator": "tester"})
+        alpha = self.repository.create_or_get_topic("alpha topic")
+        beta = self.repository.create_or_get_topic("beta topic")
+        self.repository.create_topic_run(run["id"], alpha["id"])
+        self.repository.create_topic_run(run["id"], beta["id"])
+        paper = self.repository.create_or_get_paper(
+            title="Shared Paper",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id="paper::shared-primary-routing",
+            source_type="local",
+            local_path="",
+            original_url="",
+            access_status="open_fulltext",
+            ingestion_status="artifact_ready",
+            parse_status="parsed",
+            artifact_path="",
+        )
+        self.repository.link_paper_to_topic(paper["id"], alpha["id"], run["id"], "discovery")
+        self.repository.link_paper_to_topic(paper["id"], beta["id"], run["id"], "discovery")
+
+        coordinator = services_module.RunCoordinator(self.settings, self.repository)
+        with patch.object(coordinator.pipeline, "build_cards", return_value=1) as mocked_build_cards:
+            built_for_primary = coordinator._build_cards_for_paper(paper, alpha, run["id"])
+            built_for_secondary = coordinator._build_cards_for_paper(paper, beta, run["id"])
+
+        self.assertEqual(built_for_primary, 1)
+        self.assertEqual(built_for_secondary, 0)
+        self.assertEqual(mocked_build_cards.call_count, 1)
+
     def test_card_detail_exposes_structured_dedupe_assistance(self) -> None:
         run = self.repository.create_run("Verifier Topic", {"operator": "tester"})
         topic = self.repository.create_or_get_topic("Verifier Topic")
@@ -4317,11 +4348,16 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(metrics["near_duplicate_cards"], 2)
         self.assertEqual(metrics["novel_cards"], 0)
         self.assertGreater(metrics["semantic_duplication_ratio"], 0.9)
+        self.assertEqual(metrics["independent_aha_class_count"], 1)
+        self.assertEqual(metrics["reportable_aha_class_count"], 1)
+        self.assertGreater(metrics["aha_class_duplication_ratio"], 0.4)
         self.assertEqual(len(metrics["search_strategy_comparison"]), 2)
         self.assertEqual({item["yielded_cards"] for item in metrics["search_strategy_comparison"]}, {1})
         self.assertEqual({item["incremental_new_cards"] for item in metrics["search_strategy_comparison"]}, {1})
+        self.assertEqual([item["incremental_new_aha_classes"] for item in metrics["search_strategy_comparison"]], [1, 0])
         self.assertEqual({item["strategy_order"] for item in metrics["search_strategy_comparison"]}, {1})
         self.assertFalse(metrics["flattening_signal"]["likely_flattening"])
+        self.assertEqual(metrics["flattening_signal"]["tail_incremental_new_aha_classes"], [1, 0])
         stats = coordinator._attach_topic_stop_decision(topic, stats)
         self.assertIn("saturation_stop", stats)
         self.assertEqual(stats["saturation_stop"]["decision"], "insufficient_history")

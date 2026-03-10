@@ -6,6 +6,7 @@
 - Scope: `CARD_CONTENT_REMEDIATION` execution in pipeline, schema, prompt contract, deterministic gates, duplicate governance, review diagnostics, and quality metrics.
 - Current state after implementation:
   - `Same-Evidence Near-Duplicate Cards`: `mitigated_with_monitoring`
+  - `Same-Paper Cross-Topic Resurfacing`: `reported_needs_remediation`
   - `Abstract-Level Evidence Bias`: `mitigated_with_monitoring`
   - `Paper-Specific Value And Mechanism Loss`: `mitigated_with_monitoring`
 - Notes:
@@ -78,6 +79,53 @@ This indicates the issue is not isolated.
 - Add stronger near-duplicate detection inside the same `paper + topic + run` scope.
 - Surface nearest-neighbor / duplicate-cluster hints in review workflows.
 - Preserve atomic-card behavior, but distinguish true separate insights from simple framing variants of the same core evidence.
+
+## Same-Paper Cross-Topic Resurfacing
+
+- Reported at: `2026-03-09`
+- Status: `reported_needs_remediation`
+- Severity: `critical`
+
+### Symptom
+
+The same paper can enter a run under multiple overlapping topics, then generate cards repeatedly across those topics even when the underlying paper object or learner shift is the same.
+
+This is not a formatting issue. It happens upstream in retrieval, topic attachment, and card generation.
+
+### Why This Is A Problem
+
+- It inflates the apparent evidence base because one paper looks like several independent discoveries.
+- It biases review attention toward papers that simply matched more overlapping keywords.
+- It makes medium-quality technical papers feel more important than they are because they resurface repeatedly.
+- It weakens the product goal of curating distinct `aha` candidates rather than repeating the same paper under different topic shells.
+
+### Observed Pattern
+
+In the analyzed run on `2026-03-09`, the same paper repeatedly attached to multiple topics before and during card generation. This included cases where:
+
+- one paper appeared in several overlapping AI-agent / memory / workflow topics
+- one paper later produced multiple cards across different topics despite centering on the same core paper object
+- keyword overlap increased exposure without increasing true `aha` diversity
+
+### Assessment Against Project Goals
+
+- Topic multiplicity is a retrieval artifact, not a value signal.
+- A paper should not gain priority merely because it matched many neighboring topics.
+- Topic assignment should help routing and analysis, but it must not become a license for repeated card generation.
+
+### Suspected Root Cause
+
+- Topic sets are currently broad and semantically overlapping.
+- Paper-topic attachment happens before a stronger paper-level dedupe and strongest-aha selection step.
+- Prompt/rubric logic historically focused on `paper + topic + card` quality, but not enough on `same paper across topics`.
+- The system lacks a paper-level rule that says: default to the strongest single aha before allowing additional topic-specific framings.
+
+### Desired Direction
+
+- Dedupe at the paper level before topic-level resurfacing can multiply cards.
+- Treat topic as a routing lens, not as independent evidence that the paper deserves more cards.
+- Prefer the strongest single aha from a paper by default; require clear independence before preserving a second one.
+- Extend duplicate governance from `same-evidence near-duplicate` to `same-paper cross-topic resurfacing`.
 
 ## Abstract-Level Evidence Bias
 

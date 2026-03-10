@@ -31,30 +31,32 @@ PROMPT_VERSION_RECORDS = [
     {
         "version": UNDERSTANDING_PROMPT_VERSION,
         "stage": "paper_understanding",
-        "summary": "Understanding stage that decides paper-level course worthiness before extracting concrete card-worthy objects.",
+        "summary": "Understanding stage that decides paper-level course worthiness by asking whether the paper contains a reportable aha, not just topic overlap.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "uses_figures": True,
             "uses_stage_examples": False,
             "stage_contract": "paper_worthiness_then_identify_objects",
             "prefers_direct_transfer_patterns": True,
+            "reportable_aha_gate": True,
         },
     },
     {
         "version": CARD_PLAN_PROMPT_VERSION,
         "stage": "card_planning",
-        "summary": "Planning stage that inherits the paper verdict and only plans cards for on-topic concrete objects.",
+        "summary": "Planning stage that inherits the paper verdict and selects the strongest one or two reportable aha objects instead of listing all possible cards.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "uses_stage_examples": True,
             "stage_contract": "inherit_paper_verdict_then_produce_or_exclude",
             "max_cards_hint_is_soft": True,
+            "defaults_to_single_strong_aha": True,
         },
     },
     {
         "version": EXTRACTION_PROMPT_VERSION,
         "stage": "candidate_extraction",
-        "summary": "Chinese extraction that assembles quote-first cards for explicit planned slots and logs zero-slot exclusions.",
+        "summary": "Chinese extraction that assembles quote-first cards only for the strongest planned aha slots and logs explicit exclusions for the rest.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "language": "zh-CN learner-facing output",
@@ -63,6 +65,7 @@ PROMPT_VERSION_RECORDS = [
             "enforces_primary_vs_supporting_evidence": True,
             "requires_paper_specific_object": True,
             "prefers_direct_transfer_patterns": True,
+            "suppresses_weaker_same_paper_rephrasings": True,
             "max_sections": MAX_PROMPT_SECTIONS,
             "max_figures": MAX_PROMPT_FIGURES,
         },
@@ -70,7 +73,7 @@ PROMPT_VERSION_RECORDS = [
     {
         "version": JUDGEMENT_PROMPT_VERSION,
         "stage": "candidate_judgement",
-        "summary": "Final card judgement with plan-slot fidelity, full evidence translation, and direct green/yellow/red decisions.",
+        "summary": "Final card judgement with plan-slot fidelity, reportable-aha ranking, full evidence translation, and direct green/yellow/red decisions.",
         "details": {
             "shared_policy_version": SHARED_PROMPT_POLICY_VERSION,
             "language": "zh-CN learner-facing output",
@@ -79,6 +82,7 @@ PROMPT_VERSION_RECORDS = [
             "requires_grounding_decision": True,
             "requires_duplicate_distinction": True,
             "checks_source_object_fidelity": True,
+            "checks_reportable_aha_strength": True,
             "max_calibration_examples": MAX_CALIBRATION_EXAMPLES,
         },
     },
@@ -90,14 +94,15 @@ RUBRIC_VERSION_RECORDS = [
         "name": "card_judgement_rubric",
         "summary": "Rubric for deciding whether a planned concrete paper object deserves to survive as a usable course card.",
         "details": {
-            "green": "clear learner-facing aha insight with direct course transfer",
-            "yellow": "boundary-case insight that may need reviewer judgment or stronger operationalization",
-            "red": "summary, background, or weak-transfer content that should not become a card",
+            "green": "clear learner-facing aha insight with direct course transfer, strong learner shift, and low technical overhang",
+            "yellow": "boundary-case insight that may need reviewer judgment, stronger operationalization, or stronger ranking against sibling candidates",
+            "red": "summary, background, weak-transfer, duplicate-framing, or technical-but-not-reportable content that should not become a card",
             "hard_gates": [
                 "paper_specific_object must be present",
                 "body evidence must support the claim whenever body sections exist",
                 "framing-only variants should be suppressed",
                 "course naming must stay close to the source object",
+                "technical specificity alone is not enough without a reportable learner shift",
             ],
         },
     }
@@ -761,38 +766,47 @@ class LLMCardEngine:
                 "Use body evidence as the main material whenever body evidence exists.",
                 "Keep the original figure when the figure is needed to understand the point.",
                 "Reject recap, taxonomy, survey framing, generic advice, obvious 2026 claims, weak evidence, and wording that drifts above the source object.",
+                "Do not treat repeated keyword hits or repeated topic attachment for the same paper as evidence that the paper is more important.",
+                "Default to preserving the strongest single aha in a paper; a second one survives only when it is clearly independent in object, learner shift, and course use.",
+                "Downgrade or reject content that is technically specific yet still feels like an internal architecture part, benchmark detail, or framework component rather than a tellable learner shift.",
+                "Downgrade or reject content that needs long technical unpacking before a practical learner would care.",
+                "Prefer candidates that can be expressed as 'the learner thought A, this paper makes them realize B' rather than as an internal paper takeaway.",
             ],
         }
 
     def _stage_spec(self, stage: str) -> dict[str, Any]:
         specs = {
             "paper_understanding": {
-                "stage_goal": "Judge whether the paper is worth entering this course pipeline, then find concrete objects only when it is.",
+                "stage_goal": "Judge whether the paper is worth entering this course pipeline by asking whether it contains a reportable aha, then find concrete objects only when it does.",
                 "must_do": [
                     "Return a paper-level verdict before proposing any object: on_topic, borderline_reject, or off_topic_hard.",
                     "Name the exact failure type when the paper should not continue.",
                     "Map each object to section evidence and figure evidence.",
                     "Prefer a single complete pattern or data finding over a broad umbrella label.",
                     "Mark the object at the right size: overall, local, or detail.",
+                    "Identify the strongest reportable aha candidate in the paper before considering a second one.",
                 ],
                 "must_not_do": [
                     "Do not decide course naming or green/yellow/red here.",
                     "Do not turn literature structure, survey framing, or broad themes into objects.",
                     "Do not rescue a topic-adjacent paper if you still cannot say what it becomes in the course.",
+                    "Do not keep a paper alive just because it is technically rich, benchmark-heavy, or attached to many overlapping topics.",
                 ],
             },
             "card_planning": {
-                "stage_goal": "Inherit the paper-level verdict and plan cards only for objects that are worth carrying forward.",
+                "stage_goal": "Inherit the paper-level verdict and plan only the strongest one or two reportable aha cards that are worth carrying forward.",
                 "must_do": [
                     "Respect the understanding verdict before planning any card.",
                     "Answer what each produced object becomes in the course.",
                     "State the learner shift that makes the card worth keeping.",
                     "Require must-have section ids and figure ids when they are central.",
+                    "Rank sibling candidates and prefer the strongest single aha by default.",
                 ],
                 "must_not_do": [
                     "Do not write final learner-facing card text.",
                     "Do not force card counts.",
                     "Do not keep a card plan that still sounds like a theme bucket instead of one card.",
+                    "Do not let the same paper spawn multiple planned cards that merely restate the same core insight in different framings.",
                 ],
             },
             "candidate_extraction": {
@@ -802,6 +816,7 @@ class LLMCardEngine:
                     "Use quotes and source evidence as the main body material.",
                     "Add only brief analysis instead of rewriting the paper into a cleaner doctrine.",
                     "When no planned slots survive, emit zero cards and log explicit exclusions only.",
+                    "Extract only the planned strongest aha objects, not weaker same-paper rephrasings.",
                 ],
                 "must_not_do": [
                     "Do not do final color judgement here.",
@@ -810,16 +825,18 @@ class LLMCardEngine:
                 ],
             },
             "candidate_judgement": {
-                "stage_goal": "Make the final keep or border call, finalize course naming, and translate evidence faithfully.",
+                "stage_goal": "Make the final keep or border call, rank reportable aha strength, finalize course naming, and translate evidence faithfully.",
                 "must_do": [
                     "Explain the color decision with source fidelity, learner shift, and transfer distance in mind.",
                     "Provide full Chinese localization for primary evidence.",
                     "Check that the card still names one concrete object instead of a vague lesson.",
+                    "Check whether this is the strongest tellable aha in the paper rather than merely a valid technical object.",
                 ],
                 "must_not_do": [
                     "Do not invent missing evidence or figures.",
                     "Do not rescue weak cards with prettier wording.",
                     "Do not let course naming drift above the source object.",
+                    "Do not keep a candidate just because it is technically correct if the aha is weak, over-technical, or duplicated by a stronger sibling candidate.",
                 ],
             },
         }
@@ -1123,6 +1140,8 @@ class LLMCardEngine:
                         "First decide whether this paper is worth entering this course pipeline, not just whether topic words overlap.",
                         "Use off_topic_hard only for clear cases: pure technical mismatch, obvious topic-word-overlap-only, or clearly unusable input for this learner and topic.",
                         "Use borderline_reject for close-but-not-worth-it cases where the paper seems related yet still cannot cleanly become a course object.",
+                        "Treat a paper as not worth keeping when it is technically detailed yet still fails to produce one reportable aha for this learner.",
+                        "Do not let repeated keyword overlap or multi-topic attachment rescue a paper whose strongest candidate still feels internal, over-technical, or weakly teachable.",
                         "If verdict is not on_topic, return global_contribution_objects as an empty list.",
                     ],
                     "object_requirements": [
@@ -1140,12 +1159,14 @@ class LLMCardEngine:
                         "Do not rewrite technical content into generic management or life advice.",
                         "If a concrete sub-pattern is directly teachable, prefer it over a more abstract umbrella label.",
                         "If the object would still need heavy unpacking before a learner can picture it, leave it out.",
+                        "Look for the strongest single learner shift in the paper before preserving additional objects.",
+                        "Downgrade framework components, benchmark internals, or architecture parts when they are technically valid but not naturally reportable as an aha.",
                     ],
                 },
                 "output_schema": {
                     "paper_relevance_verdict": "on_topic|borderline_reject|off_topic_hard",
                     "paper_relevance_reason": "一句话说明为什么这篇论文值得继续或不值得继续",
-                    "relevance_failure_type": "pure_technical_mismatch|cannot_name_course_object|long_transfer_distance|taxonomy_not_insight|weak_method_or_data|low_hanging_fruit|topic_word_overlap_only|other",
+                    "relevance_failure_type": "pure_technical_mismatch|cannot_name_course_object|long_transfer_distance|taxonomy_not_insight|weak_method_or_data|low_hanging_fruit|topic_word_overlap_only|technical_but_not_reportable|same_paper_multi_topic_overlap|framework_without_shift|benchmark_without_teachable_delta|other",
                     "global_contribution_objects": [
                         {
                             "id": "obj_1",
@@ -1156,6 +1177,7 @@ class LLMCardEngine:
                             "evidence_figure_ids": ["figure_id"],
                             "summary": "一到两句说明，讲清这到底是什么对象",
                             "importance_score": 0.0,
+                            "reportable_aha_rank": 1,
                         }
                     ],
                     "contribution_graph": [{"from": "obj_1", "to": "obj_2", "relation": "supports|depends_on|contrasts_with"}],
@@ -1221,6 +1243,8 @@ class LLMCardEngine:
                         "A planned card must be one card, not a theme bucket or a paper recap.",
                         "A planned card should center on one atomic pattern or one atomic data finding.",
                         "A produce item is valid only if you can state both the learner shift and what it becomes in the course.",
+                        "A produce item is strong only if you can also say why a leader or practical learner would care in one sentence.",
+                        "Default to one strong aha per paper; produce a second one only if its object, learner shift, and course use are clearly independent from the first.",
                         "Prefer the smallest object that is complete enough to teach well.",
                         "Use overall/local/detail only when it matches the real size of the object, not to fill slots.",
                         "Each produce item must specify must_have_evidence_ids.",
@@ -1229,12 +1253,13 @@ class LLMCardEngine:
                         "Do not promote a high-level umbrella object when a more concrete child object is more directly teachable for the target learner.",
                         "Reject background theory, taxonomy recap, old obvious claims, weak-transfer details, and anything that still needs heavy unpacking before use.",
                         "When a figure is central to the object, require it explicitly with must_have_figure_ids.",
+                        "Explicitly compare sibling candidates and suppress weaker same-paper rephrasings.",
                     ]
                 },
                 "output_schema": {
                     "paper_relevance_verdict": "on_topic|borderline_reject|off_topic_hard",
                     "paper_relevance_reason": "沿用或补充 paper-level verdict 的原因",
-                    "relevance_failure_type": "pure_technical_mismatch|cannot_name_course_object|long_transfer_distance|taxonomy_not_insight|weak_method_or_data|low_hanging_fruit|topic_word_overlap_only|other",
+                    "relevance_failure_type": "pure_technical_mismatch|cannot_name_course_object|long_transfer_distance|taxonomy_not_insight|weak_method_or_data|low_hanging_fruit|topic_word_overlap_only|technical_but_not_reportable|same_paper_multi_topic_overlap|framework_without_shift|benchmark_without_teachable_delta|other",
                     "planned_cards": [
                         {
                             "plan_id": "plan_obj_1",
@@ -1242,6 +1267,7 @@ class LLMCardEngine:
                             "target_object_id": "obj_1",
                             "target_object_label": "对象名，必须具体到一个卡片对象",
                             "why_valuable_for_course": "课程价值说明，讲清 learner shift 和课程用法",
+                            "why_leader_would_care": "一句话说明为什么这个对象值得被最终汇报保留",
                             "must_have_evidence_ids": ["section_id"],
                             "optional_supporting_ids": ["section_id"],
                             "must_have_figure_ids": ["figure_id"],
@@ -1500,11 +1526,14 @@ class LLMCardEngine:
                     "The card stays close to the paper's source object instead of drifting into a broader principle.",
                     "If the candidate came from a planned slot, it still matches that planned object instead of sliding to a sibling object from the same section.",
                     "A practical learner should be able to understand what to picture, say, or do after one slide of explanation.",
+                    "The candidate is not merely a technically correct structure; it produces a reportable learner shift for a low-patience non-specialist audience.",
+                    "Among sibling candidates from the same paper, this candidate is one of the strongest tellable ahas rather than a weaker rephrasing.",
                 ],
                 "business_and_teaching_rules": [
                     "Judge from the learner and course-buying perspective, not only from academic importance.",
                     "Prefer ideas that work on one slide with one strong line and, when available, one supporting figure.",
                     "If you cannot say what this becomes in the course, the card should not pass as green.",
+                    "If you cannot say why a leader would care in one sentence, the card should not pass as green.",
                     "Explicitly state whether primary evidence is body evidence or merely abstract or front-matter framing.",
                     "course_transformation should name the course form of the source object, not rewrite it into a more generic doctrine.",
                     "If the strongest version of the card sounds like a principle that could have been written without this paper, downgrade or reject it.",
@@ -1530,6 +1559,10 @@ class LLMCardEngine:
                     "The claim feels outdated or already obvious to the target learner.",
                     "The candidate is a framing variant that overlaps with a sibling candidate from the same paper and evidence.",
                     "The card relies on principle drift: it sounds smoother after being generalized away from the source evidence.",
+                    "The technical-overhang is too high: the learner would need long specialist unpacking before caring.",
+                    "The candidate is a same-paper rephrasing of a stronger sibling card.",
+                    "The framework or architecture is clear, but the learner shock is weak.",
+                    "The benchmark or result is specific but still not naturally teachable to this audience.",
                 ],
             },
             "required_judgement_questions": [
@@ -1541,6 +1574,7 @@ class LLMCardEngine:
                 "Is the evidence strength proportional to the claim strength?",
                 "Would a practical learner still understand the source object without extra technical unpacking?",
                 "Has the course naming stayed close to the source object instead of abstracting it upward?",
+                "Is this one of the strongest reportable ahas in the paper, or just a technically valid leftover candidate?",
             ],
             "output_schema": {
                 "cards": [

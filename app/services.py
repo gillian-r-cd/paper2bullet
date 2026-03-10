@@ -392,10 +392,25 @@ def evaluate_saturation_stop(
 ) -> dict[str, Any]:
     resolved_policy = policy or default_saturation_stop_policy()
     flattening = current_metrics.get("flattening_signal", {}) if isinstance(current_metrics, dict) else {}
-    tail = flattening.get("tail_incremental_new_cards", []) if isinstance(flattening, dict) else []
-    latest_duplication_ratio = float(current_metrics.get("semantic_duplication_ratio", 0.0) or 0.0)
+    tail = []
+    if isinstance(flattening, dict):
+        tail = flattening.get("tail_incremental_new_aha_classes", []) or flattening.get("tail_incremental_new_cards", [])
+    latest_duplication_ratio = float(
+        current_metrics.get("aha_class_duplication_ratio", current_metrics.get("semantic_duplication_ratio", 0.0)) or 0.0
+    )
     previous_snapshot = previous_snapshots[0] if previous_snapshots else {}
-    previous_duplication_ratio = float(previous_snapshot.get("semantic_duplication_ratio", 0.0) or 0.0)
+    previous_saturation_metrics = previous_snapshot.get("saturation_metrics", {}) if isinstance(previous_snapshot, dict) else {}
+    previous_duplication_ratio = float(
+        (
+            previous_saturation_metrics.get(
+                "aha_class_duplication_ratio",
+                previous_snapshot.get("semantic_duplication_ratio", 0.0),
+            )
+            if isinstance(previous_saturation_metrics, dict)
+            else previous_snapshot.get("semantic_duplication_ratio", 0.0)
+        )
+        or 0.0
+    )
     duplication_ratio_delta = round(latest_duplication_ratio - previous_duplication_ratio, 4) if previous_snapshots else 0.0
     snapshot_count = len(previous_snapshots) + 1
     enough_history = snapshot_count >= int(resolved_policy.get("minimum_snapshot_count", 2))
@@ -416,6 +431,7 @@ def evaluate_saturation_stop(
         "previous_duplication_ratio": previous_duplication_ratio,
         "duplication_ratio_delta": duplication_ratio_delta,
         "tail_incremental_new_cards": tail,
+        "tail_metric": "incremental_new_aha_classes" if flattening.get("tail_incremental_new_aha_classes") else "incremental_new_cards",
     }
     current_metrics["stop_policy"] = resolved_policy
     current_metrics["stop_checks"] = checks
@@ -430,7 +446,7 @@ def evaluate_saturation_stop(
         and stable_duplication_met
     ):
         decision = "candidate_stop"
-        reason = "Recent strategies yielded no new cards while duplication stayed high and stable."
+        reason = "Recent strategies yielded no new independent aha classes while duplication stayed high and stable."
     else:
         decision = "continue_search"
         blockers = []
@@ -439,7 +455,7 @@ def evaluate_saturation_stop(
         if not duplication_met:
             blockers.append("duplication ratio still below threshold")
         if resolved_policy.get("require_zero_tail", True) and not zero_tail_met:
-            blockers.append("recent tail still produced new cards")
+            blockers.append("recent tail still produced new aha classes")
         if not stable_duplication_met:
             blockers.append("duplication ratio dropped too much versus previous run")
         reason = "; ".join(blockers) if blockers else "Signals still suggest further retrieval may pay off."
@@ -506,6 +522,75 @@ def neighbor_relationship_reason(relationship: str) -> str:
     if relationship == "same_pattern":
         return "Likely covers the same underlying pattern with different evidence or phrasing."
     return "Related card worth checking, but not an obvious duplicate."
+
+
+def _aha_signal_text(card: dict[str, Any]) -> str:
+    return " ".join(
+        [
+            str(card.get("paper_specific_object", "")).strip(),
+            str(card.get("course_transformation", "")).strip(),
+            str(card.get("teachable_one_liner", "")).strip(),
+            str(card.get("title", "")).strip(),
+        ]
+    ).strip()
+
+
+def _aha_shared_signal_score(left: dict[str, Any], right: dict[str, Any]) -> int:
+    left_grams = _signal_ngrams(_aha_signal_text(left))
+    right_grams = _signal_ngrams(_aha_signal_text(right))
+    if not left_grams or not right_grams:
+        return 0
+    return len(left_grams.intersection(right_grams))
+
+
+def cards_share_aha_class(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    similarity = cosine_similarity(left.get("embedding", []), right.get("embedding", []))
+    shared_signal_score = _aha_shared_signal_score(left, right)
+    left_object = _normalized_signal_text(left.get("paper_specific_object", ""))
+    right_object = _normalized_signal_text(right.get("paper_specific_object", ""))
+    left_course = _normalized_signal_text(left.get("course_transformation", ""))
+    right_course = _normalized_signal_text(right.get("course_transformation", ""))
+    same_object = bool(left_object and left_object == right_object)
+    same_course_form = bool(left_course and left_course == right_course)
+    if similarity >= 0.94:
+        return True
+    if similarity >= 0.88 and shared_signal_score >= 2:
+        return True
+    if similarity >= 0.82 and same_object and same_course_form:
+        return True
+    return False
+
+
+def _aha_class_representative_sort_key(card: dict[str, Any]) -> tuple[int, int, int, int]:
+    judgement = card.get("judgement") or {}
+    return (
+        {"green": 3, "yellow": 2, "red": 1}.get(str(judgement.get("color", "yellow")).strip().lower(), 2),
+        {"strong": 3, "medium": 2, "weak": 1}.get(str(card.get("evidence_level", "medium")).strip().lower(), 2),
+        len(card.get("primary_section_ids", [])),
+        len(card.get("evidence", [])),
+    )
+
+
+def cluster_cards_into_aha_classes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    clusters: list[dict[str, Any]] = []
+    ordered_cards = sorted(cards, key=_aha_class_representative_sort_key, reverse=True)
+    for card in ordered_cards:
+        target_cluster = None
+        for cluster in clusters:
+            if cards_share_aha_class(cluster["representative"], card):
+                target_cluster = cluster
+                break
+        if target_cluster is None:
+            target_cluster = {
+                "aha_class_id": f"aha_class_{len(clusters) + 1}",
+                "representative": card,
+                "members": [],
+            }
+            clusters.append(target_cluster)
+        target_cluster["members"].append(card)
+        if _aha_class_representative_sort_key(card) > _aha_class_representative_sort_key(target_cluster["representative"]):
+            target_cluster["representative"] = card
+    return clusters
 
 
 def normalize_topics(topics_text: str) -> list[str]:
@@ -5837,7 +5922,50 @@ class RunCoordinator:
         if not current or current["parse_status"] != "parsed":
             self.repository.replace_cards_for_paper_topic(current["id"] if current else paper["id"], topic["id"], run_id, [])
             return 0
+        primary_topic = self._resolve_primary_topic_for_paper_run(paper["id"], run_id)
+        if primary_topic and primary_topic["id"] != topic["id"]:
+            self.repository.replace_cards_for_paper_topic(current["id"], topic["id"], run_id, [])
+            return 0
         return self.pipeline.build_cards(current, topic, run_id)
+
+    def _build_run_topic_priority(self, run_id: str) -> dict[str, int]:
+        run = self.repository.get_run(run_id)
+        if not run:
+            return {}
+        priority = {name.lower(): index for index, name in enumerate(normalize_topics(run.get("topics_text", "")), start=1)}
+        if "manual-import" not in priority:
+            priority["manual-import"] = max(priority.values(), default=0) + 1
+        return priority
+
+    def _resolve_primary_topic_from_routes(self, run_id: str, topic_routes: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not topic_routes:
+            return None
+        priority = self._build_run_topic_priority(run_id)
+        unique_routes: dict[str, dict[str, Any]] = {}
+        for route in topic_routes:
+            unique_routes.setdefault(route["topic_id"], route)
+        ordered = sorted(
+            unique_routes.values(),
+            key=lambda item: (
+                priority.get(str(item.get("topic_name", "")).lower(), 10_000),
+                str(item.get("topic_name", "")).lower(),
+                str(item.get("topic_id", "")),
+            ),
+        )
+        if not ordered:
+            return None
+        chosen = ordered[0]
+        return {
+            "id": chosen["topic_id"],
+            "name": chosen.get("topic_name", ""),
+            "topic_count": len(unique_routes),
+        }
+
+    def _resolve_primary_topic_for_paper_run(self, paper_id: str, run_id: str) -> Optional[dict[str, Any]]:
+        return self._resolve_primary_topic_from_routes(
+            run_id,
+            self.repository.list_topic_runs_for_paper_run(paper_id, run_id),
+        )
 
     def _refresh_run_status_from_topics(self, run_id: str) -> None:
         topic_runs = self.repository.list_topic_runs(run_id)
@@ -5926,6 +6054,21 @@ class RunCoordinator:
         strategies = self.repository.list_discovery_strategies(topic_run_id=topic_run["id"])
         discovery_results = self.repository.list_discovery_results(topic_run_id=topic_run["id"])
         papers = {paper["id"]: paper for paper in self.repository.list_papers_for_topic_run(run_id, topic["id"])}
+        cross_topic_resurfaced_papers = 0
+        suppressed_cross_topic_papers = 0
+        primary_topic_papers = 0
+        max_topic_fanout = 0
+        for paper_id in papers:
+            topic_routes = self.repository.list_topic_runs_for_paper_run(paper_id, run_id)
+            primary_topic = self._resolve_primary_topic_from_routes(run_id, topic_routes)
+            topic_count = len({item["topic_id"] for item in topic_routes})
+            max_topic_fanout = max(max_topic_fanout, topic_count)
+            if topic_count >= 2:
+                cross_topic_resurfaced_papers += 1
+            if primary_topic and primary_topic["id"] == topic["id"]:
+                primary_topic_papers += 1
+            elif topic_count >= 2:
+                suppressed_cross_topic_papers += 1
 
         near_duplicate_cards = 0
         same_pattern_cards = 0
@@ -5944,9 +6087,25 @@ class RunCoordinator:
                 novel_cards += 1
 
         semantic_duplicate_cards = near_duplicate_cards + same_pattern_cards
+        aha_class_clusters = cluster_cards_into_aha_classes(cards)
+        card_to_aha_class_id: dict[str, str] = {}
+        reportable_aha_class_count = 0
+        for cluster in aha_class_clusters:
+            representative = cluster["representative"]
+            representative_color = str((representative.get("judgement") or {}).get("color", "yellow")).strip().lower()
+            if representative_color in {"green", "yellow"}:
+                reportable_aha_class_count += 1
+            for member in cluster["members"]:
+                card_to_aha_class_id[member["id"]] = cluster["aha_class_id"]
+        independent_aha_class_count = len(aha_class_clusters)
+        aha_class_duplication_ratio = round(
+            max(len(cards) - independent_aha_class_count, 0) / max(len(cards), 1),
+            4,
+        )
         strategy_comparison = []
         seen_paper_ids: set[str] = set()
         seen_card_ids: set[str] = set()
+        seen_aha_class_ids: set[str] = set()
         ordered_strategies = sorted(
             strategies,
             key=lambda item: (
@@ -5967,11 +6126,18 @@ class RunCoordinator:
                 1 for paper_id in canonical_paper_ids if (papers.get(paper_id) or {}).get("access_status") == "open_fulltext"
             )
             strategy_card_ids = {card["id"] for card in cards if card["paper_id"] in canonical_paper_ids}
+            strategy_aha_class_ids = {
+                card_to_aha_class_id[card_id]
+                for card_id in strategy_card_ids
+                if card_id in card_to_aha_class_id
+            }
             yielded_cards = len(strategy_card_ids)
             incremental_new_papers = len(canonical_paper_ids - seen_paper_ids)
             incremental_new_cards = len(strategy_card_ids - seen_card_ids)
+            incremental_new_aha_classes = len(strategy_aha_class_ids - seen_aha_class_ids)
             seen_paper_ids.update(canonical_paper_ids)
             seen_card_ids.update(strategy_card_ids)
+            seen_aha_class_ids.update(strategy_aha_class_ids)
             strategy_comparison.append(
                 {
                     "strategy_id": strategy["id"],
@@ -5984,15 +6150,17 @@ class RunCoordinator:
                     "canonical_candidates": len(canonical_paper_ids),
                     "accessible_papers": accessible_papers,
                     "yielded_cards": yielded_cards,
+                    "yielded_aha_classes": len(strategy_aha_class_ids),
                     "incremental_new_papers": incremental_new_papers,
                     "incremental_new_cards": incremental_new_cards,
+                    "incremental_new_aha_classes": incremental_new_aha_classes,
                 }
             )
         comparison_tail = strategy_comparison[-3:] if len(strategy_comparison) >= 3 else strategy_comparison
         flattening_likely = (
             bool(comparison_tail)
-            and all(item["incremental_new_cards"] == 0 for item in comparison_tail)
-            and (semantic_duplicate_cards > 0)
+            and all(item["incremental_new_aha_classes"] == 0 for item in comparison_tail)
+            and (aha_class_duplication_ratio > 0)
         )
 
         stats["saturation_metrics"] = {
@@ -6002,12 +6170,30 @@ class RunCoordinator:
             "near_duplicate_cards": near_duplicate_cards,
             "semantic_duplicate_cards": semantic_duplicate_cards,
             "semantic_duplication_ratio": round(semantic_duplicate_cards / max(len(cards), 1), 4),
+            "independent_aha_class_count": independent_aha_class_count,
+            "reportable_aha_class_count": reportable_aha_class_count,
+            "aha_class_duplication_ratio": aha_class_duplication_ratio,
+            "cross_topic_resurfaced_papers": cross_topic_resurfaced_papers,
+            "suppressed_cross_topic_papers": suppressed_cross_topic_papers,
+            "primary_topic_papers": primary_topic_papers,
+            "max_topic_fanout": max_topic_fanout,
             "search_strategy_comparison": strategy_comparison,
             "flattening_signal": {
                 "tail_size": len(comparison_tail),
                 "tail_incremental_new_cards": [item["incremental_new_cards"] for item in comparison_tail],
+                "tail_incremental_new_aha_classes": [item["incremental_new_aha_classes"] for item in comparison_tail],
                 "likely_flattening": flattening_likely,
             },
+            "aha_class_shadow_summary": [
+                {
+                    "aha_class_id": cluster["aha_class_id"],
+                    "representative_card_id": cluster["representative"]["id"],
+                    "representative_title": cluster["representative"]["title"],
+                    "member_card_ids": [member["id"] for member in cluster["members"]],
+                    "member_paper_ids": sorted({member["paper_id"] for member in cluster["members"]}),
+                }
+                for cluster in aha_class_clusters
+            ],
         }
         return stats
 
