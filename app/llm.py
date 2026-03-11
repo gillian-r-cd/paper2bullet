@@ -1472,6 +1472,92 @@ class LLMCardEngine:
             "excluded_content": outputs["excluded_content"],
         }
 
+    def recommend_search_terms(self, research_goal: str, *, max_terms: int = 6) -> dict[str, Any]:
+        if not self.is_enabled():
+            raise LLMGenerationError("LLM provider is not enabled")
+        normalized_goal = str(research_goal or "").strip()
+        if not normalized_goal:
+            raise ValueError("research_goal is required")
+        bounded_max_terms = max(1, min(int(max_terms or 6), 12))
+        system_prompt = "\n".join(
+            [
+                "You help an internal research operator turn one research goal into practical academic topic anchors for literature discovery.",
+                "Return strict JSON only.",
+                "Do not output any explanation, rationale, summary, priority, or metadata.",
+                "Output only a flat list of short topic phrases that can be pasted directly into the Topics textarea.",
+                "The current system will later expand each topic into mechanism/application/recency discovery variants, so the topic itself must stay short and central.",
+                "Prefer mid-level academic anchors that are broad enough to retrieve papers but specific enough to stay on the intended problem.",
+                "Prefer 1-4 words per topic phrase; 2-3 words is ideal.",
+                "Avoid long-tail compositional phrases, full claims, full questions, or phrases that already include too much context.",
+                "Avoid weak peripheral directions that are only loosely related to the user's goal.",
+                "Do not include boolean operators, quotation marks, site filters, or provider-specific search syntax.",
+                "Avoid near-duplicate phrasings that only swap one synonym or add one modifier.",
+                "Prefer terms that are likely to work across common academic search providers.",
+                "Output schema:",
+                "{",
+                '  "recommended_topics": ["string"]',
+                "}",
+            ]
+        )
+        user_prompt = json.dumps(
+            {
+                "stage": "search_term_recommendation",
+                "research_goal": normalized_goal,
+                "max_terms": bounded_max_terms,
+                "operator_context": {
+                    "downstream_use": "Each returned topic will later be expanded by the system into core / mechanism / application / recency search strategies.",
+                    "preferred_shape": "short paste-ready academic topic phrases for the Topics box",
+                },
+                "requirements": [
+                    "Return 4 to max_terms recommended topics unless the goal is extremely narrow.",
+                    "Each topic should be 1-4 words whenever possible, and must not exceed 4 words unless the phrase is impossible to shorten without losing the topic.",
+                    "Prefer central search anchors over detailed long-tail variants.",
+                    "Do not explain the terms; just output the terms.",
+                    "If the goal contains many ideas, choose the few highest-leverage search anchors instead of trying to cover everything.",
+                    "If the goal is ambiguous, resolve it into likely academic topic anchors instead of asking a follow-up question.",
+                ],
+            },
+            ensure_ascii=False,
+        )
+        payload = self._chat_json(
+            stage="search_term_recommendation",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+        raw_topics = payload.get("recommended_topics", [])
+        if not isinstance(raw_topics, list):
+            raw_topics = []
+        normalized_topics: list[str] = []
+        seen_topics: set[str] = set()
+        for item in raw_topics:
+            if isinstance(item, dict):
+                topic = str(item.get("topic", "")).strip()
+            else:
+                topic = str(item or "").strip()
+            if not topic:
+                continue
+            topic = topic.strip().strip("\"'`")
+            topic = re.sub(r"\s+", " ", topic)
+            topic = re.sub(r"\b(and|or|not|site)\b", " ", topic, flags=re.IGNORECASE)
+            topic = re.sub(r"[,:;!?()\[\]{}]+", " ", topic)
+            topic = re.sub(r"\s+", " ", topic).strip()
+            word_count = len(re.findall(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?", topic))
+            if word_count > 4:
+                continue
+            normalized_key = re.sub(r"\s+", " ", topic.lower())
+            if normalized_key in seen_topics:
+                continue
+            seen_topics.add(normalized_key)
+            normalized_topics.append(topic)
+            if len(normalized_topics) >= bounded_max_terms:
+                break
+        return {
+            "research_goal": normalized_goal,
+            "recommended_topics": normalized_topics,
+            "suggested_topics_text": "\n".join(normalized_topics),
+            "provider_route": self._last_provider_route,
+        }
+
     def _build_extraction_prompt_payload(
         self,
         *,

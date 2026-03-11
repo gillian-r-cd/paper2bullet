@@ -1906,6 +1906,9 @@ class Repository:
         paper_key = external_id or stable_hash(f"{title}|{publication_year}|{source_type}")
         existing = self._fetchone("SELECT * FROM papers WHERE external_id = ?", (paper_key,))
         if existing:
+            if existing.get("publication_year") is None and publication_year is not None:
+                self.update_paper(existing["id"], publication_year=publication_year)
+                existing["publication_year"] = publication_year
             return existing
         paper = {
             "id": new_id("paper"),
@@ -1964,6 +1967,28 @@ class Repository:
         values = list(fields.values()) + [paper_id]
         with db_cursor(self.settings.db_path) as connection:
             connection.execute(f"UPDATE papers SET {assignments} WHERE id = ?", values)
+
+    def backfill_missing_publication_years(self) -> int:
+        with db_cursor(self.settings.db_path) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE papers
+                SET publication_year = (
+                    SELECT MAX(discovery_results.publication_year)
+                    FROM discovery_results
+                    WHERE discovery_results.paper_id = papers.id
+                      AND discovery_results.publication_year IS NOT NULL
+                )
+                WHERE papers.publication_year IS NULL
+                  AND EXISTS (
+                    SELECT 1
+                    FROM discovery_results
+                    WHERE discovery_results.paper_id = papers.id
+                      AND discovery_results.publication_year IS NOT NULL
+                  )
+                """
+            )
+            return int(cursor.rowcount or 0)
 
     def add_paper_source(self, paper_id: str, provider: str, confidence: float, metadata: dict) -> None:
         with db_cursor(self.settings.db_path) as connection:
@@ -2684,6 +2709,7 @@ class Repository:
                 candidate_cards.*,
                 papers.title AS paper_title,
                 papers.original_url AS paper_url,
+                papers.publication_year AS publication_year,
                 topics.name AS topic_name,
                 (
                     SELECT color FROM judgements
@@ -2775,7 +2801,7 @@ class Repository:
     def get_excluded_content_summary(self, excluded_content_id: str) -> Optional[dict]:
         row = self._fetchone(
             """
-            SELECT paper_excluded_content.*, papers.title AS paper_title, papers.original_url AS paper_url, topics.name AS topic_name
+            SELECT paper_excluded_content.*, papers.title AS paper_title, papers.original_url AS paper_url, papers.publication_year AS publication_year, topics.name AS topic_name
             FROM paper_excluded_content
             JOIN papers ON papers.id = paper_excluded_content.paper_id
             JOIN topics ON topics.id = paper_excluded_content.topic_id
@@ -2811,7 +2837,7 @@ class Repository:
         where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
         rows = self._fetchall(
             f"""
-            SELECT paper_excluded_content.*, papers.title AS paper_title, papers.original_url AS paper_url, topics.name AS topic_name
+            SELECT paper_excluded_content.*, papers.title AS paper_title, papers.original_url AS paper_url, papers.publication_year AS publication_year, topics.name AS topic_name
             FROM paper_excluded_content
             JOIN papers ON papers.id = paper_excluded_content.paper_id
             JOIN topics ON topics.id = paper_excluded_content.topic_id
@@ -2866,6 +2892,7 @@ class Repository:
                         "run_id": card["run_id"],
                         "topic_name": card["topic_name"],
                         "paper_title": card["paper_title"],
+                        "publication_year": card.get("publication_year"),
                         "paper_url": card.get("paper_url", ""),
                         "display_title": card["title"],
                         "color": card.get("color", ""),
@@ -2900,6 +2927,7 @@ class Repository:
                         "run_id": item["run_id"],
                         "topic_name": item["topic_name"],
                         "paper_title": item["paper_title"],
+                        "publication_year": item.get("publication_year"),
                         "paper_url": item.get("paper_url", ""),
                         "display_title": item["label"],
                         "color": "",
@@ -2945,7 +2973,7 @@ class Repository:
         if run_id:
             return self._fetchall(
                 """
-                SELECT access_queue.*, papers.title AS paper_title, papers.original_url
+                SELECT access_queue.*, papers.title AS paper_title, papers.original_url, papers.publication_year
                 FROM access_queue
                 JOIN papers ON papers.id = access_queue.paper_id
                 WHERE access_queue.run_id = ?
@@ -2955,7 +2983,7 @@ class Repository:
             )
         return self._fetchall(
             """
-            SELECT access_queue.*, papers.title AS paper_title, papers.original_url
+            SELECT access_queue.*, papers.title AS paper_title, papers.original_url, papers.publication_year
             FROM access_queue
             JOIN papers ON papers.id = access_queue.paper_id
             ORDER BY access_queue.created_at DESC

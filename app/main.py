@@ -25,6 +25,7 @@ from .schemas import (
     ReviewCommentRequest,
     ReviewRequest,
     RunCreateRequest,
+    SearchTermRecommendationRequest,
     SinglePaperValidationRequest,
 )
 from .llm import LLMCardEngine, LLMGenerationError
@@ -58,6 +59,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     )
 
     repository = Repository(app_settings)
+    repository.backfill_missing_publication_years()
     repository.sync_governance_records()
     coordinator = RunCoordinator(app_settings, repository)
     exporter = ExportService(app_settings, repository)
@@ -88,6 +90,19 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         except Exception as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {"run": run}
+
+    @app.post("/api/discovery/recommend-search-terms")
+    def recommend_search_terms(payload: SearchTermRecommendationRequest) -> dict:
+        try:
+            recommendation = llm_engine.recommend_search_terms(
+                payload.research_goal,
+                max_terms=payload.max_terms,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except LLMGenerationError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"recommendation": recommendation}
 
     @app.get("/api/runs")
     def list_runs() -> dict:
@@ -282,6 +297,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "run_id",
                 "topic_name",
                 "paper_title",
+                "publication_year",
                 "paper_url",
                 "display_title",
                 "color",
@@ -398,6 +414,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "paper_id",
                 "run_id",
                 "paper_title",
+                "publication_year",
                 "reason",
                 "priority",
                 "owner",

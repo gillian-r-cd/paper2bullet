@@ -6,6 +6,188 @@ Main sections: completed work, pending work, known issues, and next starting poi
 
 ## 本次做了什么
 
+- 已按“不要在筛选侧改逻辑，只在论文列表里显式暴露发表时间”的要求补上 `publication_year` 展示：
+  - 目标：
+    - 让 operator 在 `Review List` / `Access Queue` 一眼看出论文是不是 2025 年之前
+    - 不改变现有筛选机制，只提升可见性
+  - 相关代码落点：
+    - `app/services.py`
+    - `app/main.py`
+    - `app/static/index.html`
+    - `tests/test_app.py`
+  - 后端改动：
+    - `list_cards()`、`get_excluded_content_summary()`、`list_excluded_content()`、`list_access_queue()` 现在都带出 `papers.publication_year`
+    - `list_review_items()` 现在对 card / excluded 两类对象都返回 `publication_year`
+    - CSV 导出也已同步包含 `publication_year`
+  - 旧数据补齐策略：
+    - 新增 `Repository.backfill_missing_publication_years()`
+    - 在 `create_app()` 启动时执行一次安全 backfill
+    - 规则是：
+      - 仅当 `papers.publication_year IS NULL`
+      - 且该 paper 在已有 `discovery_results` 里能找到非空年份
+      - 才回填到 `papers`
+    - 补不到就保持空值，不做外部请求、不额外改筛选逻辑
+    - 另外 `create_or_get_paper()` 也补了一个小修正：
+      - 若旧 paper 已存在但年份为空，而新写入路径拿到了 publication year，会即时补上
+  - 前端改动：
+    - `Review List` 新增 `Year` 列
+    - `Access Queue` 新增 `Year` 列
+    - review detail 中也新增：
+      - `Publication year`
+    - 缺失年份时显示为空，不做假值兜底
+  - 自动化验证：
+    - `review_items` API 现在会为 card / excluded 返回 `publication_year`
+    - `access_queue.csv` 导出现在包含年份
+    - `create_app()` 启动时可从已有 `discovery_results` 成功回填缺失年份
+    - 定向回归通过：
+      - `python3 -m pytest tests/test_app.py -k "review_items_api_supports_card_and_excluded_targets or access_queue_csv_export_uses_run_filter or create_app_backfills_missing_publication_years_from_discovery_results or review_items_csv_export_respects_filters"`
+
+- 已修复 `Review List` 中点击 `Accept / Reject / Keep / Manual Check / View / Save Comment / Promote` 后列表滚回顶部的问题，并做成更干净的长期形态：
+  - 根因判断：
+    - `Review List` 之前实际上是双层滚动：
+      - 外层 `#review-items.list-surface`
+      - 内层 `<div class="table-wrap">`
+    - action 之后前端会整块重渲染 review list
+    - 实际在滚动的那一层被重建后，浏览器自然回到顶部
+  - 本轮改法：
+    - `app/static/index.html`
+      - 给 `Review List` 增加显式的 scroll state：
+        - `captureReviewListScroll()`
+        - `restoreReviewListScroll()`
+      - 在这些路径里统一保留 scroll 位置：
+        - `toggleReviewItem()`
+        - `loadReviewItem()`
+        - `reviewItem()`
+        - `saveReviewComment()`
+        - `clearReviewComment()`
+        - `promoteExcludedItem()`
+        - `renderReviewItems()`
+      - 同时把 `Review List` 改回**单一滚动容器**，不再在它内部再包一层 `table-wrap`
+    - 这次不是临时在某个按钮后 `scrollTo(...)`，而是把 review list 的 render contract 改成“重渲染默认保留当前滚动位置”
+  - 自动化验证：
+    - 定向回归通过：
+      - `python3 -m pytest tests/test_app.py -k "review_items_api_supports_card_and_excluded_targets or review_item_comments_persist_separately_from_review_decisions or card_and_review_items_expose_paper_link or review_items_csv_export_respects_filters"`
+    - 轻量 UI smoke：
+      - served HTML 中已包含：
+        - `captureReviewListScroll`
+        - `restoreReviewListScroll`
+  - 影响范围：
+    - 只改了 `Review List` 的前端渲染与交互
+    - 没改 review API、数据库或 review decision 语义
+
+- 已对“调研目标 -> LLM 推荐搜索词”功能做了一轮 prompt 反思和收紧，原因是首版输出过于解释型、过长尾，不适合当前 discovery 机制：
+  - 触发原因：
+    - 真实 case 暴露出首版输出的问题不是“词不够聪明”，而是“太像咨询分析结果”，不适合直接进入 `Topics`
+    - 首版会输出：
+      - `goal summary`
+      - `priority`
+      - `strategy preview`
+      - 以及过长的 topic phrase
+    - 这和当前系统的 discovery 主链冲突，因为主链后面本来还会自动拼接：
+      - `mechanism evidence`
+      - `case study`
+      - `recent_window`
+    - 当原 topic 已经是长尾复合短语时，后续 query 会更容易塌成低召回垃圾
+  - 本轮改动：
+    - `app/llm.py`
+      - 重写 `recommend_search_terms()` 的 system prompt / user prompt 约束：
+        - 不再输出 explanation / rationale / summary / priority / metadata
+        - 只输出 `recommended_topics`
+        - 明确要求 topic 是可直接粘贴到 `Topics` 的短 academic anchors
+        - 强调当前系统会自行扩展 topic，因此原 topic 必须短、中心、可检索
+        - 明确偏好：
+          - `1-4` 词
+          - 中腰部 topic anchor
+          - 少量高杠杆词
+          - 禁止长尾复合短语
+      - normalization 也同步收紧：
+        - 去重
+        - 去掉布尔/引号/多余标点
+        - 超过 `4` 个词的 topic 直接丢弃
+    - `app/main.py`
+      - 新 endpoint 仍保留，但返回 payload 简化为：
+        - `research_goal`
+        - `recommended_topics`
+        - `suggested_topics_text`
+        - `provider_route`
+      - 去掉了 `strategy_preview`
+    - `app/static/index.html`
+      - recommendation 区域不再显示：
+        - `Goal summary`
+        - `Discovery Strategy Preview`
+      - 页面现在只显示一块可直接复制/写回的 topic 列表
+      - `Use Recommended Topics` 继续保留，直接写入 `Topics`
+  - 自动化验证：
+    - 更新测试后通过：
+      - `python3 -m pytest tests/test_app.py -k "recommend_search_terms or search_term_recommendation_api or prompt_version_records_include_understanding_and_planning_stages"`
+    - 额外 smoke check：
+      - endpoint 返回的 key 只剩：
+        - `provider_route`
+        - `recommended_topics`
+        - `research_goal`
+        - `suggested_topics_text`
+      - 首页 HTML 已不再包含：
+        - `Goal summary`
+        - `Discovery Strategy Preview`
+  - 当前形态：
+    - 这个功能现在更像一个“Topics 预处理器”，而不是“调研解释器”
+    - 输出目标已经从“讲清楚为什么推荐这些词”切到“给出能搜出东西的短词”
+
+- 已新增一个最小但可用的“调研目标 -> LLM 推荐搜索词”功能，用于在启动 run 之前先把模糊研究目标压缩成可直接进入 discovery 的 topic phrases：
+  - 相关代码落点：
+    - `app/llm.py`
+    - `app/main.py`
+    - `app/schemas.py`
+    - `app/static/index.html`
+    - `tests/test_app.py`
+  - 新增 API：
+    - `POST /api/discovery/recommend-search-terms`
+  - 请求体：
+    - `research_goal`
+    - `max_terms`
+  - 行为设计：
+    - 输入一段研究目标
+    - LLM 返回一组去重后的推荐 topic phrases
+    - 每个 topic 同时返回：
+      - `topic`
+      - `why`
+      - `priority`
+    - API 还会基于现有 `build_topic_search_strategies()` 自动补出 `strategy_preview`
+      - `core`
+      - `mechanism`
+      - `application`
+      - `recency`
+    - 返回值中还包含：
+      - `goal_summary`
+      - `suggested_topics_text`
+      - `provider_route`
+  - UI 已接到 `Start Run` 面板顶部：
+    - 新输入框：`Research Goal -> Search Terms`
+    - 新按钮：
+      - `Recommend Search Terms`
+      - `Use Recommended Topics`
+    - 点击推荐后会显示：
+      - goal summary
+      - 推荐 topics
+      - 每个 topic 的 discovery strategy preview
+    - 点击 `Use Recommended Topics` 会把推荐 topics 直接写回 `Topics, one per line`
+  - 实现边界：
+    - 这是一个 operator assist 功能，不会改现有 discovery 主链
+    - 没有把推荐词持久化进数据库；当前只做即时生成与手动采纳
+    - 当 LLM provider 未启用时，接口会返回 400 而不是 silent fallback
+  - 自动化验证：
+    - 新增测试覆盖：
+      - `LLMCardEngine.recommend_search_terms()` 会去重、归一化 priority、生成 `suggested_topics_text`
+      - API endpoint 会返回 `strategy_preview`
+      - LLM disabled 时接口会明确报错
+    - 定向测试通过：
+      - `python3 -m pytest tests/test_app.py -k "recommend_search_terms or search_term_recommendation_api"`
+    - 额外做了轻量 smoke：
+      - `FastAPI TestClient` 下调用新 endpoint 返回 `200`
+      - 首页 HTML 已包含：
+        - `recommend-search-terms`
+        - `use-recommended-topics`
+
 - 已补项目级 `README.md`，用于给新接手者和未来会话提供统一入口，而不是每次都从 `PRD.md` / `progress.md` / 零散治理文档里重新拼上下文：
   - 新增文件：`README.md`
   - 内容覆盖：

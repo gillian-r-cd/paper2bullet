@@ -69,6 +69,15 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
   <div class="grid">
     <div class="panel">
       <h2>Start Run</h2>
+      <label for="research-goal">Research Goal -> Search Terms</label>
+      <div class="muted">Describe what you want to investigate. The LLM will suggest search-friendly topic phrases you can paste directly into discovery.</div>
+      <textarea id="research-goal" rows="4" placeholder="I want papers about why coding agents fail in real repo work, especially around tool use, verification, and environment interaction."></textarea>
+      <div class="toolbar-actions" style="margin: 10px 0;">
+        <button id="recommend-search-terms">Recommend Search Terms</button>
+        <button id="use-recommended-topics">Use Recommended Topics</button>
+      </div>
+      <div id="search-term-recommendations" class="details result-scroll"></div>
+
       <label for="topics">Topics, one per line</label>
       <textarea id="topics" rows="7" placeholder="adaptive selling&#10;AI communication coaching"></textarea>
 
@@ -221,6 +230,8 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     let expandedReviewItemKey = "";
     let exportSelectedCardIds = new Set();
     let exportCandidateCards = [];
+    let latestRecommendedTopics = [];
+    let reviewListScrollTop = 0;
 
     async function readJson(url, options) {
       const response = await fetch(url, options);
@@ -244,6 +255,25 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
 
     function reviewItemKey(targetType, targetId) {
       return `${targetType}:${targetId}`;
+    }
+
+    function getReviewListContainer() {
+      return document.getElementById("review-items");
+    }
+
+    function captureReviewListScroll() {
+      const container = getReviewListContainer();
+      reviewListScrollTop = container ? container.scrollTop : 0;
+    }
+
+    function restoreReviewListScroll() {
+      const container = getReviewListContainer();
+      if (!container) {
+        return;
+      }
+      window.requestAnimationFrame(() => {
+        container.scrollTop = reviewListScrollTop;
+      });
     }
 
     function reviewCommentInputId(targetType, targetId) {
@@ -297,6 +327,46 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       anchor.remove();
     }
 
+    function renderSearchTermRecommendations(recommendation) {
+      const container = document.getElementById("search-term-recommendations");
+      const topics = recommendation.recommended_topics || [];
+      latestRecommendedTopics = topics.filter(Boolean);
+      if (!topics.length) {
+        container.textContent = "(no recommendations returned)";
+        return;
+      }
+      container.innerHTML = `<div class="mono">${escapeHtml(recommendation.suggested_topics_text || latestRecommendedTopics.join("\n"))}</div>`;
+    }
+
+    async function recommendSearchTerms() {
+      const output = document.getElementById("search-term-recommendations");
+      output.textContent = "";
+      const researchGoal = document.getElementById("research-goal").value.trim();
+      if (!researchGoal) {
+        output.textContent = "research_goal is required.";
+        return;
+      }
+      try {
+        const payload = await readJson("/api/discovery/recommend-search-terms", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ research_goal: researchGoal, max_terms: 6 })
+        });
+        renderSearchTermRecommendations(payload.recommendation || {});
+      } catch (error) {
+        output.textContent = `Search-term recommendation failed: ${error.message}`;
+      }
+    }
+
+    function useRecommendedTopics() {
+      const topics = latestRecommendedTopics.join("\n").trim();
+      if (!topics) {
+        document.getElementById("search-term-recommendations").textContent = "No recommended topics available yet.";
+        return;
+      }
+      document.getElementById("topics").value = topics;
+    }
+
     function figureAssetUrl(figure) {
       if (!figure || !figure.id) {
         return "";
@@ -346,6 +416,11 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       }
       const url = escapeHtml(item.paper_url);
       return `${title}<a class="paper-link" href="${url}" target="_blank" rel="noreferrer">Open paper link</a>`;
+    }
+
+    function formatPublicationYear(item) {
+      const year = item && item.publication_year;
+      return year === null || year === undefined || year === "" ? "" : escapeHtml(year);
     }
 
     function syncSelectedCardIdsField() {
@@ -508,6 +583,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     }
 
     function renderReviewItems(items) {
+      captureReviewListScroll();
       reviewItemsState = items;
       const rows = items.map(item => {
         const colorClass = item.color || "yellow";
@@ -538,12 +614,13 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
           : item.display_title;
         const commentPreview = summarizeText(item.comment_text || "", 72);
         const mainRow = `
-          <tr>
+          <tr data-row-key="${rowKey}">
             <td>${selectable ? `<input type="checkbox" class="export-select" value="${item.object_id}" ${exportSelectedCardIds.has(item.object_id) ? "checked" : ""}>` : ""}</td>
             <td>${typeLabel}</td>
             <td>${item.object_id}</td>
             <td>${item.topic_name}</td>
             <td>${formatPaperCell(item)}</td>
+            <td>${formatPublicationYear(item)}</td>
             <td>${displayTitle}</td>
             <td class="${colorClass}">${item.color || ""}</td>
             <td>${item.course_transformation || ""}</td>
@@ -560,18 +637,19 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         const detailContent = expandedItem ? renderReviewItemDetail(expandedItem) : "Loading...";
         return `${mainRow}
           <tr>
-            <td colspan="13"><div class="inline-details">${detailContent}</div></td>
+            <td colspan="14"><div class="inline-details">${detailContent}</div></td>
           </tr>
         `;
       }).join("");
       document.getElementById("review-items").innerHTML = `
-        <div class="table-wrap"><table>
+        <table>
           <tr>
-            <th></th><th>Type</th><th>ID</th><th>Topic</th><th>Paper</th><th>Title</th><th>Color</th><th>Course Use</th><th>Exclusion Type</th><th>Review</th><th>Comment</th><th>Export</th><th>Actions</th>
+            <th></th><th>Type</th><th>ID</th><th>Topic</th><th>Paper</th><th>Year</th><th>Title</th><th>Color</th><th>Course Use</th><th>Exclusion Type</th><th>Review</th><th>Comment</th><th>Export</th><th>Actions</th>
           </tr>
           ${rows}
-        </table></div>
+        </table>
       `;
+      restoreReviewListScroll();
     }
 
     function renderQueue(items) {
@@ -579,6 +657,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         <tr>
           <td class="mono">${item.id}</td>
           <td>${item.paper_title}</td>
+          <td>${formatPublicationYear(item)}</td>
           <td>${item.reason}</td>
           <td>${item.priority}</td>
           <td>${item.status}</td>
@@ -588,7 +667,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       `).join("");
       document.getElementById("queue").innerHTML = `
         <div class="table-wrap"><table>
-          <tr><th>Queue ID</th><th>Paper</th><th>Reason</th><th>Priority</th><th>Status</th><th>URL</th><th>Action</th></tr>
+          <tr><th>Queue ID</th><th>Paper</th><th>Year</th><th>Reason</th><th>Priority</th><th>Status</th><th>URL</th><th>Action</th></tr>
           ${rows}
         </table></div>
       `;
@@ -833,6 +912,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
               <h4>Summary</h4>
               <div class="detail-line"><strong>Excluded:</strong> ${escapeHtml(item.label || "")}</div>
               <div class="detail-line"><strong>Paper:</strong> ${escapeHtml(item.paper_title || "")}</div>
+              <div class="detail-line"><strong>Publication year:</strong> ${formatPublicationYear(item)}</div>
               <div class="detail-line"><strong>Paper link:</strong> ${escapeHtml(item.paper_url || "")}</div>
               <div class="detail-line"><strong>Type:</strong> ${escapeHtml(item.exclusion_type || "")}</div>
               <div class="detail-line"><strong>Reason:</strong> ${escapeHtml(item.reason || "")}</div>
@@ -883,6 +963,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
             <h4>Summary</h4>
             <div class="detail-line"><strong>Card:</strong> ${escapeHtml(item.title || "")}</div>
             <div class="detail-line"><strong>Paper:</strong> ${escapeHtml(item.paper_title || "")}</div>
+            <div class="detail-line"><strong>Publication year:</strong> ${formatPublicationYear(item)}</div>
             <div class="detail-line"><strong>Paper link:</strong> ${escapeHtml(item.paper_url || "")}</div>
             <div class="detail-line"><strong>Teach it as:</strong> ${escapeHtml(item.teachable_one_liner || "")}</div>
             <div class="detail-line"><strong>Course use:</strong> ${escapeHtml(item.course_transformation || "")}</div>
@@ -939,12 +1020,14 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     }
 
     async function loadReviewItem(targetType, targetId) {
+      captureReviewListScroll();
       const payload = await readJson(`/api/review-items/${targetType}/${targetId}`);
       reviewItemDetailsByKey[reviewItemKey(targetType, targetId)] = payload.item;
       renderReviewItems(reviewItemsState);
     }
 
     async function toggleReviewItem(targetType, targetId) {
+      captureReviewListScroll();
       const key = reviewItemKey(targetType, targetId);
       if (expandedReviewItemKey === key) {
         expandedReviewItemKey = "";
@@ -957,6 +1040,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     }
 
     async function reviewItem(targetType, targetId, decision) {
+      captureReviewListScroll();
       await readJson(`/api/review-items/${targetType}/${targetId}/review`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -968,6 +1052,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     }
 
     async function saveReviewComment(targetType, targetId) {
+      captureReviewListScroll();
       const input = document.getElementById(reviewCommentInputId(targetType, targetId));
       const comment = input ? input.value : "";
       const payload = await readJson(`/api/review-items/${targetType}/${targetId}/comment`, {
@@ -983,6 +1068,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     }
 
     async function clearReviewComment(targetType, targetId) {
+      captureReviewListScroll();
       const input = document.getElementById(reviewCommentInputId(targetType, targetId));
       if (input) {
         input.value = "";
@@ -991,6 +1077,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     }
 
     async function promoteExcludedItem(targetId) {
+      captureReviewListScroll();
       await readJson(`/api/review-items/excluded/${targetId}/promote`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1060,6 +1147,8 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     });
 
     document.getElementById("refresh-runs").addEventListener("click", refreshRuns);
+    document.getElementById("recommend-search-terms").addEventListener("click", recommendSearchTerms);
+    document.getElementById("use-recommended-topics").addEventListener("click", useRecommendedTopics);
     document.getElementById("refresh-review-items").addEventListener("click", refreshReviewItems);
     document.getElementById("refresh-queue").addEventListener("click", refreshQueue);
     document.getElementById("export-review-items-csv").addEventListener("click", () => {

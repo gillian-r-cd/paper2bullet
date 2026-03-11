@@ -21,6 +21,11 @@ class RunCreateRequest(BaseModel):
     local_pdfs: List[LocalPdfInput] = Field(default_factory=list)
 
 
+class SearchTermRecommendationRequest(BaseModel):
+    research_goal: str = Field(default="")
+    max_terms: int = Field(default=6, ge=1, le=12)
+
+
 class ReviewRequest(BaseModel):
     reviewer: str = Field(default="internal")
     decision: Literal["accepted", "rejected", "keep_for_later", "needs_manual_check", "reopened"]

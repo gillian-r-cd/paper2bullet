@@ -938,12 +938,17 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(list_response.status_code, 200, list_response.text)
         items = list_response.json()["items"]
         self.assertEqual({item["object_type"] for item in items}, {"card", "excluded"})
+        card_item = next(item for item in items if item["object_type"] == "card")
+        excluded_item_summary = next(item for item in items if item["object_type"] == "excluded")
+        self.assertEqual(card_item["publication_year"], 2026)
+        self.assertEqual(excluded_item_summary["publication_year"], 2026)
 
         excluded_detail = self.client.get("/api/review-items/excluded/excluded_review")
         self.assertEqual(excluded_detail.status_code, 200, excluded_detail.text)
         excluded_item = excluded_detail.json()["item"]
         self.assertEqual(excluded_item["review"]["decision"], "reopened")
         self.assertEqual(excluded_item["evidence_sections"][0]["id"], "section_review")
+        self.assertEqual(excluded_item["publication_year"], 2026)
 
         review_response = self.client.post(
             "/api/review-items/excluded/excluded_review/review",
@@ -1024,6 +1029,38 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(review_items.status_code, 200, review_items.text)
         self.assertEqual(review_items.json()["items"][0]["paper_url"], "https://example.com/paper-link")
 
+    def test_search_term_recommendation_api_returns_topic_only_payload(self) -> None:
+        with patch(
+            "app.main.LLMCardEngine.recommend_search_terms",
+            return_value={
+                "research_goal": "Find papers on why coding agents fail in real repo work.",
+                "recommended_topics": [
+                    "coding agents",
+                    "tool use verification",
+                ],
+                "suggested_topics_text": "coding agents\ntool use verification",
+                "provider_route": {},
+            },
+        ):
+            response = self.client.post(
+                "/api/discovery/recommend-search-terms",
+                json={"research_goal": "Find papers on why coding agents fail in real repo work.", "max_terms": 6},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()["recommendation"]
+        self.assertEqual(len(payload["recommended_topics"]), 2)
+        self.assertEqual(payload["recommended_topics"][0], "coding agents")
+        self.assertNotIn("goal_summary", payload)
+        self.assertEqual(payload["suggested_topics_text"], "coding agents\ntool use verification")
+
+    def test_search_term_recommendation_api_rejects_when_llm_is_disabled(self) -> None:
+        response = self.client.post(
+            "/api/discovery/recommend-search-terms",
+            json={"research_goal": "Find papers on coding agent reliability.", "max_terms": 6},
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("LLM provider is not enabled", response.text)
+
     def test_review_items_csv_export_respects_filters(self) -> None:
         accepted = self._create_export_card_fixture(card_id="card_csv_accepted", review_decision="accepted")
         self._create_export_card_fixture(card_id="card_csv_rejected", review_decision="rejected", run=accepted["run"])
@@ -1082,7 +1119,76 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn("attachment; filename=\"access_queue.csv\"", response.headers["content-disposition"])
         self.assertIn("Queue CSV Paper", response.text)
+        self.assertIn("2026", response.text)
         self.assertNotIn("Queue CSV Other Paper", response.text)
+
+    def test_create_app_backfills_missing_publication_years_from_discovery_results(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        try:
+            base = Path(temp_dir.name)
+            settings = Settings(
+                data_dir=base / "data",
+                db_path=base / "data" / "paper2bullet.sqlite3",
+                max_workers=2,
+                google_docs_mode="artifact_only",
+                llm_mode="disabled",
+            )
+            settings.ensure_directories()
+            init_db(settings.db_path)
+            repository = Repository(settings)
+            run = repository.create_run("Backfill Topic", {"operator": "tester"})
+            topic = repository.create_or_get_topic("Backfill Topic")
+            topic_run = repository.create_topic_run(run["id"], topic["id"])
+            paper = repository.create_or_get_paper(
+                title="Backfill Paper",
+                authors=["Test Author"],
+                publication_year=None,
+                external_id="paper::backfill-year",
+                source_type="semantic_scholar",
+                local_path="",
+                original_url="https://example.com/backfill-paper",
+                access_status="metadata_only",
+                ingestion_status="discovered",
+                parse_status="pending",
+                artifact_path="",
+            )
+            strategy = repository.create_discovery_strategy(
+                run_id=run["id"],
+                topic_run_id=topic_run["id"],
+                topic_id=topic["id"],
+                provider="semantic_scholar",
+                strategy_family="core",
+                strategy_type="topic_query",
+                strategy_order=1,
+                query_text="Backfill Topic",
+                result_count=1,
+                metadata={},
+            )
+            repository.create_discovery_result(
+                run_id=run["id"],
+                topic_run_id=topic_run["id"],
+                strategy_id=strategy["id"],
+                dedupe_key="dedupe::backfill",
+                provider="semantic_scholar",
+                source_external_id="paper::backfill-year",
+                paper_title="Backfill Paper",
+                authors=["Test Author"],
+                publication_year=2024,
+                original_url="https://example.com/backfill-paper",
+                asset_url="",
+                confidence=0.8,
+                dedupe_status="kept",
+                paper_id=paper["id"],
+                metadata={},
+            )
+
+            client = TestClient(create_app(settings))
+            self.assertEqual(client.get("/api/health").status_code, 200)
+
+            refreshed = Repository(settings).get_paper(paper["id"])
+            self.assertEqual(refreshed["publication_year"], 2024)
+        finally:
+            temp_dir.cleanup()
 
     def test_cards_api_supports_paper_and_topic_id_filters(self) -> None:
         run = self.repository.create_run("Validation Topic A\nValidation Topic B", {"operator": "tester"})
@@ -3731,6 +3837,45 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
             "complete Simplified Chinese translation",
             client.calls[1]["judgement_rules"]["evidence_translation_rules"][0],
         )
+
+    def test_llm_engine_recommend_search_terms_normalizes_and_deduplicates_topics(self) -> None:
+        test_case = self
+
+        class StubClient:
+            model = "stub-search-model"
+
+            def chat_json(self, system_prompt: str, user_prompt: str) -> dict:
+                payload = json.loads(user_prompt)
+                test_case.assertEqual(payload["stage"], "search_term_recommendation")
+                test_case.assertEqual(payload["max_terms"], 5)
+                test_case.assertIn("real-world coding agent failures", payload["research_goal"])
+                test_case.assertIn("Do not output any explanation", system_prompt)
+                test_case.assertIn("Prefer 1-4 words per topic phrase", system_prompt)
+                return {
+                    "recommended_topics": [
+                        "coding agents",
+                        "goal inference",
+                        "goal inference",
+                        "agent tool use verification loops",
+                        "context modeling",
+                    ],
+                }
+
+        engine = LLMCardEngine(self.settings, client=StubClient())
+        result = engine.recommend_search_terms(
+            "Find papers about real-world coding agent failures in repo work.",
+            max_terms=5,
+        )
+
+        self.assertEqual(
+            result["recommended_topics"],
+            [
+                "coding agents",
+                "goal inference",
+                "context modeling",
+            ],
+        )
+        self.assertEqual(result["suggested_topics_text"], "coding agents\ngoal inference\ncontext modeling")
 
     def test_render_system_prompt_includes_ideal_aha_ontology(self) -> None:
         class StubClient:
