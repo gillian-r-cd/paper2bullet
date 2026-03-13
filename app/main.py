@@ -21,7 +21,11 @@ from .schemas import (
     CalibrationSetImportRequest,
     EvaluationRunRequest,
     ExportRequest,
+    MemoryActivateRequest,
+    MemoryDraftRequest,
+    PaperQuestionRequest,
     PromoteExcludedRequest,
+    ResearchPlanDraftRequest,
     ReviewCommentRequest,
     ReviewRequest,
     RunCreateRequest,
@@ -29,7 +33,18 @@ from .schemas import (
     SinglePaperValidationRequest,
 )
 from .llm import LLMCardEngine, LLMGenerationError
-from .services import AccessQueueService, EvaluationService, ExportService, Repository, ReviewService, RunCoordinator
+from .services import (
+    AccessQueueService,
+    EvaluationService,
+    ExportService,
+    PaperQAService,
+    PreferenceMemoryService,
+    PreferenceMemoryStore,
+    Repository,
+    ResearchPlanningService,
+    ReviewService,
+    RunCoordinator,
+)
 
 
 def build_index_html(static_path: Path) -> str:
@@ -64,7 +79,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     coordinator = RunCoordinator(app_settings, repository)
     exporter = ExportService(app_settings, repository)
     llm_engine = LLMCardEngine(app_settings)
+    memory_store = PreferenceMemoryStore(app_settings)
+    planner = ResearchPlanningService(app_settings, llm_engine, memory_store)
     reviewer = ReviewService(app_settings, repository, llm_engine)
+    memory_service = PreferenceMemoryService(app_settings, repository, llm_engine, memory_store)
+    paper_qa_service = PaperQAService(app_settings, repository, llm_engine, memory_store)
     evaluator = EvaluationService(app_settings, repository, llm_engine)
     access_queue_service = AccessQueueService(app_settings, repository, coordinator)
 
@@ -82,9 +101,20 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.post("/api/runs")
     def create_run(payload: RunCreateRequest) -> dict:
         try:
+            metadata = dict(payload.metadata or {})
+            metadata["task_type"] = payload.task_type
+            if payload.research_brief.strip():
+                metadata["research_brief"] = payload.research_brief.strip()
+                metadata["task_brief"] = payload.research_brief.strip()
+            if payload.confirmed_plan:
+                metadata["confirmed_plan"] = payload.confirmed_plan
+            if payload.use_active_memory:
+                active_memory = memory_store.get_active_memory()
+                if active_memory:
+                    metadata["active_memory_snapshot"] = active_memory
             run = coordinator.create_run(
                 topics_text=payload.topics_text,
-                metadata=payload.metadata,
+                metadata=metadata,
                 local_pdfs=[item.model_dump() for item in payload.local_pdfs],
             )
         except Exception as error:
@@ -104,6 +134,20 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {"recommendation": recommendation}
 
+    @app.post("/api/research-plans/draft")
+    def draft_research_plan(payload: ResearchPlanDraftRequest) -> dict:
+        try:
+            plan = planner.draft_plan(
+                payload.research_brief,
+                requested_task_type=payload.task_type,
+                max_terms=payload.max_terms,
+                use_active_memory=payload.use_active_memory,
+                also_generate_aha_cards=payload.also_generate_aha_cards,
+            )
+        except (ValueError, LLMGenerationError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"plan": plan}
+
     @app.get("/api/runs")
     def list_runs() -> dict:
         return {
@@ -122,6 +166,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "access_queue": repository.list_access_queue(run_id),
             "discovery_strategies": repository.list_discovery_strategies(run_id=run_id),
             "discovery_results": repository.list_discovery_results(run_id=run_id),
+            "matrix_items": repository.list_matrix_items(run_id=run_id),
         }
 
     @app.get("/api/saturation/topics")
@@ -211,6 +256,28 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         )
         return {"cards": cards}
 
+    @app.get("/api/matrix-items")
+    def list_matrix_items(
+        run_id: str = Query(default=""),
+        topic: str = Query(default=""),
+        paper_id: str = Query(default=""),
+        topic_id: str = Query(default=""),
+    ) -> dict:
+        items = repository.list_matrix_items(
+            run_id=run_id or None,
+            topic=topic,
+            paper_id=paper_id or None,
+            topic_id=topic_id or None,
+        )
+        return {"matrix_items": items}
+
+    @app.get("/api/matrix-items/{matrix_item_id}")
+    def get_matrix_item(matrix_item_id: str) -> dict:
+        item = repository.get_matrix_item(matrix_item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Matrix item not found")
+        return {"matrix_item": item}
+
     @app.post("/api/papers/{paper_id}/validate-single")
     def validate_single_paper_flow(paper_id: str, payload: SinglePaperValidationRequest) -> dict:
         paper = repository.get_paper(paper_id)
@@ -251,6 +318,20 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if not record:
             raise HTTPException(status_code=404, detail="Card plan record not found")
         return {"card_plan": record}
+
+    @app.post("/api/papers/{paper_id}/qa")
+    def answer_paper_question(paper_id: str, payload: PaperQuestionRequest) -> dict:
+        try:
+            answer = paper_qa_service.answer_question(
+                paper_id,
+                payload.question,
+                max_sections=payload.max_sections,
+            )
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except (ValueError, LLMGenerationError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"answer": answer}
 
     @app.get("/api/quality/metrics")
     def get_quality_metrics(run_id: str = Query(default="")) -> dict:
@@ -307,6 +388,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "comment_text",
                 "comment_updated_at",
                 "exclusion_type",
+                "dimension_label",
+                "outcome_label",
+                "verdict",
+                "evidence_strength",
                 "export_eligible",
                 "promoted_card_id",
                 "promoted_card_title",
@@ -380,6 +465,30 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {"status": "ok", **promoted}
 
+    @app.get("/api/memory/active")
+    def get_active_memory() -> dict:
+        return {"active_memory": memory_store.get_active_memory()}
+
+    @app.post("/api/memory/draft")
+    def draft_memory(payload: MemoryDraftRequest) -> dict:
+        try:
+            memory_draft = memory_service.draft_memory(
+                task_type=payload.task_type,
+                run_id=payload.run_id,
+                reviewer=payload.reviewer,
+            )
+        except (ValueError, LLMGenerationError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"memory_draft": memory_draft}
+
+    @app.post("/api/memory/activate")
+    def activate_memory(payload: MemoryActivateRequest) -> dict:
+        try:
+            activated = memory_service.activate_memory(payload.memory_draft, payload.reviewer)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"active_memory": activated}
+
     @app.get("/api/cards/{card_id}")
     def get_card(card_id: str) -> dict:
         card = repository.get_card(card_id)
@@ -447,15 +556,25 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     @app.post("/api/exports/google-doc")
     def export_google_doc(payload: ExportRequest) -> dict:
-        if not payload.card_ids:
-            raise HTTPException(status_code=400, detail="At least one card must be selected for export")
         try:
-            export_record = exporter.export_google_doc_package(
-                run_id=payload.run_id,
-                card_ids=payload.card_ids,
-                document_title=payload.document_title,
-                existing_google_doc_id=payload.existing_google_doc_id,
-            )
+            if payload.export_kind == "matrix_items":
+                if not payload.matrix_item_ids:
+                    raise HTTPException(status_code=400, detail="At least one matrix item must be selected for export")
+                export_record = exporter.export_matrix_google_doc_package(
+                    run_id=payload.run_id,
+                    matrix_item_ids=payload.matrix_item_ids,
+                    document_title=payload.document_title,
+                    existing_google_doc_id=payload.existing_google_doc_id,
+                )
+            else:
+                if not payload.card_ids:
+                    raise HTTPException(status_code=400, detail="At least one card must be selected for export")
+                export_record = exporter.export_google_doc_package(
+                    run_id=payload.run_id,
+                    card_ids=payload.card_ids,
+                    document_title=payload.document_title,
+                    existing_google_doc_id=payload.existing_google_doc_id,
+                )
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {"export": export_record}
@@ -479,12 +598,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "runs": repository.list_runs(),
             "topic_runs": repository.list_topic_runs(),
             "cards": repository.list_cards(),
+            "matrix_items": repository.list_matrix_items(),
             "access_queue": repository.list_access_queue(),
             "discovery_strategies": repository.list_discovery_strategies(),
             "discovery_results": repository.list_discovery_results(),
             "saturation_trends": repository.list_topic_saturation_trends(history_limit=3),
             "calibration_sets": repository.list_calibration_sets(),
             "active_calibration_set": repository.get_active_calibration_set(),
+            "active_memory": memory_store.get_active_memory(),
             "prompt_versions": repository.list_prompt_versions(),
             "rubric_versions": repository.list_rubric_versions(),
             "calibration_workflow": repository.get_calibration_workflow_status(),

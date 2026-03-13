@@ -274,6 +274,30 @@ CREATE TABLE IF NOT EXISTS candidate_cards (
     FOREIGN KEY (source_excluded_content_id) REFERENCES paper_excluded_content(id)
 );
 
+CREATE TABLE IF NOT EXISTS evidence_matrix_items (
+    id TEXT PRIMARY KEY,
+    paper_id TEXT NOT NULL,
+    topic_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    dimension_key TEXT NOT NULL,
+    dimension_label TEXT NOT NULL,
+    outcome_key TEXT NOT NULL,
+    outcome_label TEXT NOT NULL,
+    claim_text TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    evidence_strength TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    limitation_text TEXT NOT NULL DEFAULT '',
+    citation_text TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL,
+    figure_ids_json TEXT NOT NULL DEFAULT '[]',
+    supporting_section_ids_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (paper_id) REFERENCES papers(id),
+    FOREIGN KEY (topic_id) REFERENCES topics(id),
+    FOREIGN KEY (run_id) REFERENCES runs(id)
+);
+
 CREATE TABLE IF NOT EXISTS judgements (
     id TEXT PRIMARY KEY,
     card_id TEXT NOT NULL,
@@ -532,6 +556,7 @@ def ensure_migrations(connection: sqlite3.Connection) -> None:
     ensure_review_decisions_target_schema(connection)
     ensure_review_item_comment_indexes(connection)
     ensure_discovery_indexes(connection)
+    ensure_evidence_matrix_indexes(connection)
 
 
 def ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, column_sql: str) -> None:
@@ -678,6 +703,26 @@ def ensure_discovery_indexes(connection: sqlite3.Connection) -> None:
         )
 
 
+def ensure_evidence_matrix_indexes(connection: sqlite3.Connection) -> None:
+    table_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'evidence_matrix_items'"
+    ).fetchone()
+    if not table_exists:
+        return
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_evidence_matrix_items_run_topic
+        ON evidence_matrix_items(run_id, topic_id, created_at)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_evidence_matrix_items_paper
+        ON evidence_matrix_items(paper_id, created_at)
+        """
+    )
+
+
 @contextmanager
 def db_cursor(db_path: Path) -> Generator[sqlite3.Connection, None, None]:
     connection = get_connection(db_path)
@@ -688,5 +733,14 @@ def db_cursor(db_path: Path) -> Generator[sqlite3.Connection, None, None]:
     except Exception:
         connection.rollback()
         raise
+    finally:
+        connection.close()
+
+
+@contextmanager
+def db_read_cursor(db_path: Path) -> Generator[sqlite3.Connection, None, None]:
+    connection = get_connection(db_path)
+    try:
+        yield connection
     finally:
         connection.close()

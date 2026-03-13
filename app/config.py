@@ -278,6 +278,10 @@ class Settings:
         return self.artifacts_dir / "figure_assets"
 
     @property
+    def preference_memory_dir(self) -> Path:
+        return self.data_dir / "preference_memory"
+
+    @property
     def llm_providers(self) -> list[LLMProviderConfig]:
         return build_llm_provider_configs(self)
 
@@ -287,6 +291,7 @@ class Settings:
         self.parsed_dir.mkdir(parents=True, exist_ok=True)
         self.exports_dir.mkdir(parents=True, exist_ok=True)
         self.figure_assets_dir.mkdir(parents=True, exist_ok=True)
+        self.preference_memory_dir.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
 

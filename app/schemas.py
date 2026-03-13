@@ -9,6 +9,8 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+TaskType = Literal["aha_exploration", "claim_evidence"]
+
 
 class LocalPdfInput(BaseModel):
     path: str
@@ -17,6 +19,10 @@ class LocalPdfInput(BaseModel):
 
 class RunCreateRequest(BaseModel):
     topics_text: str = Field(default="")
+    research_brief: str = Field(default="")
+    task_type: TaskType = Field(default="aha_exploration")
+    confirmed_plan: dict = Field(default_factory=dict)
+    use_active_memory: bool = Field(default=True)
     metadata: dict = Field(default_factory=dict)
     local_pdfs: List[LocalPdfInput] = Field(default_factory=list)
 
@@ -24,6 +30,14 @@ class RunCreateRequest(BaseModel):
 class SearchTermRecommendationRequest(BaseModel):
     research_goal: str = Field(default="")
     max_terms: int = Field(default=6, ge=1, le=12)
+
+
+class ResearchPlanDraftRequest(BaseModel):
+    research_brief: str = Field(default="")
+    task_type: Literal["auto", "aha_exploration", "claim_evidence"] = Field(default="auto")
+    max_terms: int = Field(default=6, ge=1, le=12)
+    use_active_memory: bool = Field(default=True)
+    also_generate_aha_cards: bool = Field(default=False)
 
 
 class ReviewRequest(BaseModel):
@@ -44,7 +58,9 @@ class ReviewCommentRequest(BaseModel):
 
 class ExportRequest(BaseModel):
     run_id: str
-    card_ids: List[str]
+    export_kind: Literal["cards", "matrix_items"] = Field(default="cards")
+    card_ids: List[str] = Field(default_factory=list)
+    matrix_item_ids: List[str] = Field(default_factory=list)
     document_title: str
     existing_google_doc_id: str = Field(default="")
 
@@ -57,6 +73,22 @@ class AccessQueueReactivateRequest(BaseModel):
 class SinglePaperValidationRequest(BaseModel):
     topic_id: str
     run_id: str
+
+
+class PaperQuestionRequest(BaseModel):
+    question: str = Field(default="")
+    max_sections: int = Field(default=6, ge=1, le=12)
+
+
+class MemoryDraftRequest(BaseModel):
+    task_type: Literal["", "aha_exploration", "claim_evidence"] = Field(default="")
+    run_id: str = Field(default="")
+    reviewer: str = Field(default="internal")
+
+
+class MemoryActivateRequest(BaseModel):
+    reviewer: str = Field(default="internal")
+    memory_draft: dict = Field(default_factory=dict)
 
 
 class CalibrationExampleInput(BaseModel):

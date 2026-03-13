@@ -69,13 +69,23 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
   <div class="grid">
     <div class="panel">
       <h2>Start Run</h2>
-      <label for="research-goal">Research Goal -> Search Terms</label>
-      <div class="muted">Describe what you want to investigate. The LLM will suggest search-friendly topic phrases you can paste directly into discovery.</div>
-      <textarea id="research-goal" rows="4" placeholder="I want papers about why coding agents fail in real repo work, especially around tool use, verification, and environment interaction."></textarea>
-      <div class="toolbar-actions" style="margin: 10px 0;">
-        <button id="recommend-search-terms">Recommend Search Terms</button>
-        <button id="use-recommended-topics">Use Recommended Topics</button>
+      <label for="research-goal">Research Brief</label>
+      <div class="muted">Describe the task in natural language. Draft a confirmable plan first, then start the run.</div>
+      <textarea id="research-goal" rows="5" placeholder="I want evidence showing whether five manager dialogue dimensions improve leadership effectiveness and team performance."></textarea>
+      <label for="task-type">Task Type</label>
+      <select id="task-type">
+        <option value="aha_exploration">Aha Exploration</option>
+        <option value="claim_evidence">Claim Evidence</option>
+      </select>
+      <div class="toolbar-actions" style="margin-top: 10px;">
+        <label><input id="use-active-memory" type="checkbox" checked> Use Active Memory</label>
+        <label><input id="claim-also-generate-cards" type="checkbox"> Also Generate Aha Cards In Claim Mode</label>
       </div>
+      <div class="toolbar-actions" style="margin: 10px 0;">
+        <button id="recommend-search-terms">Draft Research Plan</button>
+        <button id="use-recommended-topics">Confirm Draft Plan</button>
+      </div>
+      <div id="plan-confirmation-status" class="muted">No confirmed plan yet.</div>
       <div id="search-term-recommendations" class="details result-scroll"></div>
 
       <label for="topics">Topics, one per line</label>
@@ -119,8 +129,10 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         <label for="filter-item-type">Item Type</label>
         <select id="filter-item-type">
           <option value="cards">Cards Only</option>
+          <option value="matrix">Matrix Items Only</option>
           <option value="excluded">Excluded Only</option>
           <option value="both">Cards + Excluded</option>
+          <option value="all">Cards + Matrix + Excluded</option>
         </select>
       </div>
       <div style="flex: 1;">
@@ -153,6 +165,17 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
   </div>
 
   <div class="panel" style="margin-top: 20px;">
+    <h2>Preference Memory</h2>
+    <div class="toolbar-actions">
+      <button id="refresh-active-memory">Refresh Active Memory</button>
+      <button id="draft-memory">Draft Memory Update</button>
+      <button id="activate-memory">Activate Draft</button>
+    </div>
+    <div id="active-memory" class="details result-scroll"></div>
+    <div id="memory-draft" class="details result-scroll"></div>
+  </div>
+
+  <div class="panel" style="margin-top: 20px;">
     <h2>Single Paper Validation</h2>
     <details class="panel-collapse">
       <summary>Show / Hide Single Paper Validation</summary>
@@ -175,6 +198,11 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       <button id="load-understanding">Load Understanding</button>
       <button id="load-card-plan">Load Card Plan</button>
       <button id="load-stored-cards">Load Stored Cards</button>
+    </div>
+    <label for="paper-question" style="margin-top: 10px; display: block;">Ask This Paper</label>
+    <textarea id="paper-question" rows="4" placeholder="What exactly does this paper say about boundary conditions or limitations?"></textarea>
+    <div class="toolbar-actions" style="margin-top: 8px;">
+      <button id="ask-paper-question">Ask Paper</button>
     </div>
     <div id="single-validation-result" class="details result-scroll"></div>
     </details>
@@ -213,11 +241,16 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       <select id="export-run-id">
         <option value="">Select a run</option>
       </select>
+      <label for="export-kind">Export Kind</label>
+      <select id="export-kind">
+        <option value="cards">Accepted Cards</option>
+        <option value="matrix_items">Accepted Matrix Items</option>
+      </select>
       <label for="export-title">Document Title</label>
       <input id="export-title" type="text" placeholder="Boss Report - Adaptive Selling">
-      <label for="export-card-picker">Accepted Cards</label>
+      <label for="export-card-picker">Accepted Export Items</label>
       <div id="export-card-picker" class="picker">(select a run first)</div>
-      <label for="export-card-ids">Selected Card IDs</label>
+      <label for="export-card-ids">Selected Item IDs</label>
       <textarea id="export-card-ids" rows="5" placeholder="card_xxx,card_yyy" readonly></textarea>
       <button id="export-doc">Build Google Doc Export Package</button>
       <div id="export-result" class="details"></div>
@@ -228,9 +261,11 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     let reviewItemsState = [];
     let reviewItemDetailsByKey = {};
     let expandedReviewItemKey = "";
-    let exportSelectedCardIds = new Set();
-    let exportCandidateCards = [];
-    let latestRecommendedTopics = [];
+    let exportSelectedItemIds = new Set();
+    let exportCandidateItems = [];
+    let latestDraftPlan = null;
+    let confirmedDraftPlan = null;
+    let latestMemoryDraft = null;
     let reviewListScrollTop = 0;
 
     async function readJson(url, options) {
@@ -327,44 +362,57 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       anchor.remove();
     }
 
-    function renderSearchTermRecommendations(recommendation) {
+    function renderSearchTermRecommendations(plan) {
       const container = document.getElementById("search-term-recommendations");
-      const topics = recommendation.recommended_topics || [];
-      latestRecommendedTopics = topics.filter(Boolean);
-      if (!topics.length) {
-        container.textContent = "(no recommendations returned)";
+      latestDraftPlan = plan || null;
+      if (!plan || typeof plan !== "object") {
+        container.textContent = "(no plan returned)";
         return;
       }
-      container.innerHTML = `<div class="mono">${escapeHtml(recommendation.suggested_topics_text || latestRecommendedTopics.join("\n"))}</div>`;
+      container.textContent = JSON.stringify(plan, null, 2);
     }
 
     async function recommendSearchTerms() {
       const output = document.getElementById("search-term-recommendations");
       output.textContent = "";
-      const researchGoal = document.getElementById("research-goal").value.trim();
-      if (!researchGoal) {
-        output.textContent = "research_goal is required.";
+      const researchBrief = document.getElementById("research-goal").value.trim();
+      if (!researchBrief) {
+        output.textContent = "research_brief is required.";
         return;
       }
       try {
-        const payload = await readJson("/api/discovery/recommend-search-terms", {
+        const payload = await readJson("/api/research-plans/draft", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ research_goal: researchGoal, max_terms: 6 })
+          body: JSON.stringify({
+            research_brief: researchBrief,
+            task_type: document.getElementById("task-type").value,
+            max_terms: 6,
+            use_active_memory: document.getElementById("use-active-memory").checked,
+            also_generate_aha_cards: document.getElementById("claim-also-generate-cards").checked
+          })
         });
-        renderSearchTermRecommendations(payload.recommendation || {});
+        renderSearchTermRecommendations(payload.plan || {});
       } catch (error) {
-        output.textContent = `Search-term recommendation failed: ${error.message}`;
+        output.textContent = `Research plan draft failed: ${error.message}`;
       }
     }
 
     function useRecommendedTopics() {
-      const topics = latestRecommendedTopics.join("\n").trim();
-      if (!topics) {
-        document.getElementById("search-term-recommendations").textContent = "No recommended topics available yet.";
+      if (!latestDraftPlan) {
+        document.getElementById("plan-confirmation-status").textContent = "No draft plan available yet.";
         return;
       }
-      document.getElementById("topics").value = topics;
+      confirmedDraftPlan = latestDraftPlan;
+      const taskType = latestDraftPlan.task_type || latestDraftPlan.suggested_task_type || document.getElementById("task-type").value;
+      document.getElementById("task-type").value = taskType;
+      const topics = latestDraftPlan.confirmed_topics_text || "";
+      if (!topics) {
+        document.getElementById("topics").value = "";
+      } else {
+        document.getElementById("topics").value = topics;
+      }
+      document.getElementById("plan-confirmation-status").textContent = `Confirmed ${taskType} plan with ${topics ? topics.split("\n").filter(Boolean).length : 0} topics.`;
     }
 
     function figureAssetUrl(figure) {
@@ -423,26 +471,30 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       return year === null || year === undefined || year === "" ? "" : escapeHtml(year);
     }
 
-    function syncSelectedCardIdsField() {
-      document.getElementById("export-card-ids").value = Array.from(exportSelectedCardIds).join(",");
+    function currentExportKind() {
+      return document.getElementById("export-kind").value;
     }
 
-    function setExportSelectedCardIds(cardIds) {
-      exportSelectedCardIds = new Set(cardIds);
+    function syncSelectedCardIdsField() {
+      document.getElementById("export-card-ids").value = Array.from(exportSelectedItemIds).join(",");
+    }
+
+    function setExportSelectedCardIds(itemIds) {
+      exportSelectedItemIds = new Set(itemIds);
       syncSelectedCardIdsField();
       renderReviewItems(reviewItemsState);
-      renderExportCardPicker(exportCandidateCards);
+      renderExportCardPicker(exportCandidateItems);
     }
 
     function toggleExportCardSelection(cardId, checked) {
       if (checked) {
-        exportSelectedCardIds.add(cardId);
+        exportSelectedItemIds.add(cardId);
       } else {
-        exportSelectedCardIds.delete(cardId);
+        exportSelectedItemIds.delete(cardId);
       }
       syncSelectedCardIdsField();
       renderReviewItems(reviewItemsState);
-      renderExportCardPicker(exportCandidateCards);
+      renderExportCardPicker(exportCandidateItems);
     }
 
     function updateExportRunOptions(runs) {
@@ -461,14 +513,14 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     }
 
     function renderExportCardPicker(cards) {
-      exportCandidateCards = cards;
+      exportCandidateItems = cards;
       const picker = document.getElementById("export-card-picker");
       if (!document.getElementById("export-run-id").value) {
         picker.innerHTML = "(select a run first)";
         return;
       }
       if (!cards.length) {
-        picker.innerHTML = "(no accepted cards available for this run)";
+        picker.innerHTML = `(no accepted ${currentExportKind() === "matrix_items" ? "matrix items" : "cards"} available for this run)`;
         return;
       }
       picker.innerHTML = cards.map(card => `
@@ -477,10 +529,11 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
             type="checkbox"
             class="export-picker-select"
             value="${card.object_id}"
-            ${exportSelectedCardIds.has(card.object_id) ? "checked" : ""}
+            ${exportSelectedItemIds.has(card.object_id) ? "checked" : ""}
           >
           <strong>${escapeHtml(card.display_title)}</strong><br>
-          <span>${escapeHtml(card.paper_title)}</span><br>
+          <span>${escapeHtml(card.paper_title || "")}</span><br>
+          <span>${escapeHtml(card.dimension_label || card.topic_name || "")}</span><br>
           <span class="mono">${card.object_id}</span>
         </label>
       `).join("");
@@ -521,6 +574,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         `accessible=${resolved.accessible ?? 0}`,
         `parsed=${resolved.parsed_papers ?? 0}`,
         `cards=${resolved.cards ?? 0}`,
+        `matrix=${resolved.matrix_items ?? 0}`,
         `queued_for_access=${resolved.queued_for_access ?? 0}`,
         `acquisition_errors=${resolved.acquisition_errors ?? 0}`,
         `paper_processing_errors=${resolved.paper_processing_errors ?? 0}`,
@@ -552,14 +606,19 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       const runs = payload.runs || [];
       const runRows = runs.map(run => {
         const summary = run.progress_summary || {};
+        const metadata = run.metadata || {};
         const summaryLine = [
+          `mode=${metadata.task_type || "aha_exploration"}`,
           `topics=${summary.topic_completed ?? 0}/${summary.topic_total ?? 0}`,
           `papers=${summary.discovered ?? 0}`,
           `accessible=${summary.accessible ?? 0}`,
           `parsed=${summary.parsed ?? 0}`,
           `cards=${summary.carded ?? 0}`,
+          `matrix=${summary.matrix_items ?? 0}`,
           `reviewed=${summary.reviewed ?? 0}`,
-          `exported=${summary.exported ?? 0}`
+          `reviewed_matrix=${summary.reviewed_matrix_items ?? 0}`,
+          `exported=${summary.exported ?? 0}`,
+          `exported_matrix=${summary.exported_matrix_items ?? 0}`
         ].join(" | ");
         return `<tr><td class="mono">${run.id}</td><td>${run.status}</td><td><pre>${run.topics_text}</pre></td><td class="mono">${escapeHtml(summaryLine)}</td></tr>`;
       }).join("");
@@ -586,36 +645,52 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       captureReviewListScroll();
       reviewItemsState = items;
       const rows = items.map(item => {
-        const colorClass = item.color || "yellow";
+        const colorClass = ["green", "yellow", "red"].includes(item.color || "") ? item.color : "";
         const review = item.review_status || "";
-        const selectable = item.object_type === "card" && item.export_eligible;
+        const selectable = item.export_eligible && (
+          (currentExportKind() === "cards" && item.object_type === "card")
+          || (currentExportKind() === "matrix_items" && item.object_type === "matrix_item")
+        );
         const rowKey = reviewItemKey(item.object_type, item.object_id);
         const expandedItem = reviewItemDetailsByKey[rowKey];
         const typeLabel = item.object_type === "card"
           ? (item.promoted_from_excluded ? "Card (Promoted)" : "Card")
-          : "Excluded";
-        const actionButtons = item.object_type === "card"
-          ? `
-              <button onclick="toggleReviewItem('card', '${item.object_id}')">${expandedReviewItemKey === rowKey ? "Hide" : "View"}</button>
-              <button onclick="reviewItem('card', '${item.object_id}', 'accepted')">Accept</button>
-              <button onclick="reviewItem('card', '${item.object_id}', 'rejected')">Reject</button>
-              <button onclick="reviewItem('card', '${item.object_id}', 'keep_for_later')">Keep</button>
-              <button onclick="reviewItem('card', '${item.object_id}', 'needs_manual_check')">Manual Check</button>
-            `
-          : `
-              <button onclick="toggleReviewItem('excluded', '${item.object_id}')">${expandedReviewItemKey === rowKey ? "Hide" : "View"}</button>
-              <button onclick="reviewItem('excluded', '${item.object_id}', 'accepted')">Confirm Exclusion</button>
-              <button onclick="reviewItem('excluded', '${item.object_id}', 'reopened')">Reopen</button>
-              <button onclick="reviewItem('excluded', '${item.object_id}', 'needs_manual_check')">Manual Check</button>
-              <button onclick="promoteExcludedItem('${item.object_id}')" ${item.promoted_card_id ? "disabled" : ""}>Promote</button>
-            `;
+          : item.object_type === "matrix_item"
+            ? "Matrix Item"
+            : "Excluded";
+        let actionButtons = "";
+        if (item.object_type === "card") {
+          actionButtons = `
+            <button onclick="toggleReviewItem('card', '${item.object_id}')">${expandedReviewItemKey === rowKey ? "Hide" : "View"}</button>
+            <button onclick="reviewItem('card', '${item.object_id}', 'accepted')">Accept</button>
+            <button onclick="reviewItem('card', '${item.object_id}', 'rejected')">Reject</button>
+            <button onclick="reviewItem('card', '${item.object_id}', 'keep_for_later')">Keep</button>
+            <button onclick="reviewItem('card', '${item.object_id}', 'needs_manual_check')">Manual Check</button>
+          `;
+        } else if (item.object_type === "matrix_item") {
+          actionButtons = `
+            <button onclick="toggleReviewItem('matrix_item', '${item.object_id}')">${expandedReviewItemKey === rowKey ? "Hide" : "View"}</button>
+            <button onclick="reviewItem('matrix_item', '${item.object_id}', 'accepted')">Accept</button>
+            <button onclick="reviewItem('matrix_item', '${item.object_id}', 'rejected')">Reject</button>
+            <button onclick="reviewItem('matrix_item', '${item.object_id}', 'keep_for_later')">Keep</button>
+            <button onclick="reviewItem('matrix_item', '${item.object_id}', 'needs_manual_check')">Manual Check</button>
+          `;
+        } else {
+          actionButtons = `
+            <button onclick="toggleReviewItem('excluded', '${item.object_id}')">${expandedReviewItemKey === rowKey ? "Hide" : "View"}</button>
+            <button onclick="reviewItem('excluded', '${item.object_id}', 'accepted')">Confirm Exclusion</button>
+            <button onclick="reviewItem('excluded', '${item.object_id}', 'reopened')">Reopen</button>
+            <button onclick="reviewItem('excluded', '${item.object_id}', 'needs_manual_check')">Manual Check</button>
+            <button onclick="promoteExcludedItem('${item.object_id}')" ${item.promoted_card_id ? "disabled" : ""}>Promote</button>
+          `;
+        }
         const displayTitle = item.object_type === "excluded" && item.promoted_card_id
           ? `${item.display_title} -> ${item.promoted_card_title}`
           : item.display_title;
         const commentPreview = summarizeText(item.comment_text || "", 72);
         const mainRow = `
           <tr data-row-key="${rowKey}">
-            <td>${selectable ? `<input type="checkbox" class="export-select" value="${item.object_id}" ${exportSelectedCardIds.has(item.object_id) ? "checked" : ""}>` : ""}</td>
+            <td>${selectable ? `<input type="checkbox" class="export-select" value="${item.object_id}" ${exportSelectedItemIds.has(item.object_id) ? "checked" : ""}>` : ""}</td>
             <td>${typeLabel}</td>
             <td>${item.object_id}</td>
             <td>${item.topic_name}</td>
@@ -890,6 +965,74 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       }
     }
 
+    async function askPaperQuestion() {
+      const output = document.getElementById("single-validation-result");
+      output.textContent = "";
+      const { paperId } = getSingleValidationInput();
+      const question = document.getElementById("paper-question").value.trim();
+      if (!paperId) {
+        output.textContent = "paper_id is required.";
+        return;
+      }
+      if (!question) {
+        output.textContent = "paper question is required.";
+        return;
+      }
+      try {
+        const payload = await readJson(`/api/papers/${paperId}/qa`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question, max_sections: 6 })
+        });
+        output.textContent = JSON.stringify(payload.answer || payload, null, 2);
+      } catch (error) {
+        output.textContent = `Paper QA failed: ${error.message}`;
+      }
+    }
+
+    async function refreshActiveMemory() {
+      const payload = await readJson("/api/memory/active");
+      document.getElementById("active-memory").textContent = JSON.stringify(payload.active_memory || {}, null, 2);
+    }
+
+    async function draftMemoryUpdate() {
+      const output = document.getElementById("memory-draft");
+      output.textContent = "";
+      try {
+        const payload = await readJson("/api/memory/draft", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            task_type: document.getElementById("task-type").value,
+            run_id: document.getElementById("filter-run").value.trim(),
+            reviewer: "internal-ui"
+          })
+        });
+        latestMemoryDraft = payload.memory_draft || null;
+        output.textContent = JSON.stringify(latestMemoryDraft || {}, null, 2);
+      } catch (error) {
+        output.textContent = `Memory draft failed: ${error.message}`;
+      }
+    }
+
+    async function activateMemoryDraft() {
+      const output = document.getElementById("active-memory");
+      if (!latestMemoryDraft) {
+        output.textContent = "No memory draft available to activate.";
+        return;
+      }
+      try {
+        const payload = await readJson("/api/memory/activate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reviewer: "internal-ui", memory_draft: latestMemoryDraft })
+        });
+        output.textContent = JSON.stringify(payload.active_memory || {}, null, 2);
+      } catch (error) {
+        output.textContent = `Memory activation failed: ${error.message}`;
+      }
+    }
+
     function renderReviewItemDetail(item) {
       const targetType = item.object_type;
       const targetId = item.object_id;
@@ -936,10 +1079,59 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         `;
       }
 
+      if (item.object_type === "matrix_item") {
+        const evidenceBlock = (item.evidence || []).map(entry => `
+          <li class="evidence-card">
+            <div><strong>Evidence (EN):</strong> ${escapeHtml(entry.quote || "")}</div>
+            <div><strong>Evidence (ZH Translation):</strong> ${escapeHtml(entry.quote_zh || "")}</div>
+            <div><strong>Why it matters:</strong> ${escapeHtml(entry.analysis || "")}</div>
+          </li>
+        `).join("");
+        return `
+          <div class="detail-summary">
+            <div class="detail-box">
+              <h4>Summary</h4>
+              <div class="detail-line"><strong>Dimension:</strong> ${escapeHtml(item.dimension_label || "")}</div>
+              <div class="detail-line"><strong>Outcome:</strong> ${escapeHtml(item.outcome_label || "")}</div>
+              <div class="detail-line"><strong>Verdict:</strong> ${escapeHtml(item.verdict || "")}</div>
+              <div class="detail-line"><strong>Evidence strength:</strong> ${escapeHtml(item.evidence_strength || "")}</div>
+              <div class="detail-line"><strong>Paper:</strong> ${escapeHtml(item.paper_title || "")}</div>
+              <div class="detail-line"><strong>Publication year:</strong> ${formatPublicationYear(item)}</div>
+              <div class="detail-line"><strong>Paper link:</strong> ${escapeHtml(item.paper_url || "")}</div>
+              <div class="detail-line"><strong>Claim:</strong> ${escapeHtml(item.claim_text || "")}</div>
+              <div class="detail-line"><strong>Limitation:</strong> ${escapeHtml(item.limitation_text || "")}</div>
+              <div class="detail-line"><strong>Review:</strong> ${escapeHtml(((item.review || {}).decision) || "")} | ${escapeHtml(((item.review || {}).note) || "")}</div>
+            </div>
+            <div class="detail-box">
+              <h4>Citation</h4>
+              <div class="detail-line"><strong>Citation text:</strong> ${escapeHtml(item.citation_text || "")}</div>
+              <div class="detail-line"><strong>Supporting sections:</strong> ${escapeHtml((item.supporting_section_ids || []).join(", ") || "(none)")}</div>
+            </div>
+            <div class="detail-box comment-editor">
+              <h4>Persistent Comment</h4>
+              <div class="muted">Last saved: ${escapeHtml(commentMeta)}</div>
+              <textarea id="${commentInputId}" placeholder="Write your ongoing reviewer note here...">${escapeHtml(commentText)}</textarea>
+              <div class="comment-actions">
+                <button onclick="saveReviewComment('${targetType}', '${targetId}')">Save Comment</button>
+                <button onclick="clearReviewComment('${targetType}', '${targetId}')">Clear Comment</button>
+              </div>
+            </div>
+          </div>
+          <details class="detail-subsection" open>
+            <summary>Evidence</summary>
+            <ul class="detail-list">${evidenceBlock || "<li>(none)</li>"}</ul>
+          </details>
+          <details class="detail-subsection">
+            <summary>Figures</summary>
+            ${renderFigureBlock(item.figures || [])}
+          </details>
+        `;
+      }
+
       const evidenceBlock = (item.evidence || []).map(entry => `
         <li class="evidence-card">
           <div><strong>Evidence (EN):</strong> ${escapeHtml(entry.quote || "")}</div>
-          <div><strong>Evidence (ZH):</strong> ${escapeHtml(entry.quote_zh || "")}</div>
+          <div><strong>Evidence (ZH Translation):</strong> ${escapeHtml(entry.quote_zh || "")}</div>
           <div><strong>Why it matters:</strong> ${escapeHtml(entry.analysis || "")}</div>
         </li>
       `).join("");
@@ -1090,24 +1282,30 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
 
     async function refreshExportOptions() {
       const runId = document.getElementById("export-run-id").value;
+      const exportKind = currentExportKind();
       if (!runId) {
-        exportCandidateCards = [];
+        exportCandidateItems = [];
         setExportSelectedCardIds([]);
         renderExportCardPicker([]);
         return;
       }
       const params = new URLSearchParams({
         run_id: runId,
-        item_type: "cards",
+        item_type: exportKind === "matrix_items" ? "matrix" : "cards",
         review_status: "accepted"
       });
       const payload = await readJson(`/api/review-items?${params.toString()}`);
-      const candidateCards = (payload.items || []).filter(item => item.object_type === "card" && item.export_eligible);
-      const nextSelectedIds = Array.from(exportSelectedCardIds).filter(cardId =>
+      const candidateCards = (payload.items || []).filter(item =>
+        item.export_eligible && (
+          (exportKind === "matrix_items" && item.object_type === "matrix_item")
+          || (exportKind !== "matrix_items" && item.object_type === "card")
+        )
+      );
+      const nextSelectedIds = Array.from(exportSelectedItemIds).filter(cardId =>
         candidateCards.some(item => item.object_id === cardId)
       );
-      exportCandidateCards = candidateCards;
-      exportSelectedCardIds = new Set(nextSelectedIds);
+      exportCandidateItems = candidateCards;
+      exportSelectedItemIds = new Set(nextSelectedIds);
       syncSelectedCardIdsField();
       renderReviewItems(reviewItemsState);
       renderExportCardPicker(candidateCards);
@@ -1126,11 +1324,25 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         if (metadata === null || Array.isArray(metadata) || typeof metadata !== "object") {
           throw new Error("Metadata JSON must be an object, for example {} or {\"operator\":\"rantianshu\"}.");
         }
+        const taskType = document.getElementById("task-type").value;
+        const researchBrief = document.getElementById("research-goal").value.trim();
+        const useActiveMemory = document.getElementById("use-active-memory").checked;
+        if (taskType === "claim_evidence" && !confirmedDraftPlan) {
+          throw new Error("Claim-evidence mode requires a confirmed draft plan before starting the run.");
+        }
         const localPdfs = parseLocalPdfLines(document.getElementById("pdfs").value);
         const payload = await readJson("/api/runs", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ topics_text: topicsText, metadata, local_pdfs: localPdfs })
+          body: JSON.stringify({
+            topics_text: topicsText,
+            metadata,
+            local_pdfs: localPdfs,
+            research_brief: researchBrief,
+            task_type: taskType,
+            confirmed_plan: confirmedDraftPlan || {},
+            use_active_memory: useActiveMemory
+          })
         });
         resultNode.textContent = JSON.stringify(payload, null, 2);
         if (payload.run && payload.run.id) {
@@ -1149,6 +1361,10 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     document.getElementById("refresh-runs").addEventListener("click", refreshRuns);
     document.getElementById("recommend-search-terms").addEventListener("click", recommendSearchTerms);
     document.getElementById("use-recommended-topics").addEventListener("click", useRecommendedTopics);
+    document.getElementById("task-type").addEventListener("change", () => {
+      confirmedDraftPlan = null;
+      document.getElementById("plan-confirmation-status").textContent = "Task type changed. Re-draft and confirm the plan before running.";
+    });
     document.getElementById("refresh-review-items").addEventListener("click", refreshReviewItems);
     document.getElementById("refresh-queue").addEventListener("click", refreshQueue);
     document.getElementById("export-review-items-csv").addEventListener("click", () => {
@@ -1160,23 +1376,35 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     document.getElementById("refresh-calibration-status").addEventListener("click", refreshCalibrationStatus);
     document.getElementById("refresh-quality-metrics").addEventListener("click", refreshQualityMetrics);
     document.getElementById("refresh-saturation-trends").addEventListener("click", refreshSaturationTrends);
+    document.getElementById("refresh-active-memory").addEventListener("click", refreshActiveMemory);
+    document.getElementById("draft-memory").addEventListener("click", draftMemoryUpdate);
+    document.getElementById("activate-memory").addEventListener("click", activateMemoryDraft);
     document.getElementById("run-single-validation").addEventListener("click", runSingleValidation);
     document.getElementById("load-understanding").addEventListener("click", loadPaperUnderstanding);
     document.getElementById("load-card-plan").addEventListener("click", loadCardPlan);
     document.getElementById("load-stored-cards").addEventListener("click", loadStoredValidationCards);
+    document.getElementById("ask-paper-question").addEventListener("click", askPaperQuestion);
     document.getElementById("export-run-id").addEventListener("change", refreshExportOptions);
+    document.getElementById("export-kind").addEventListener("change", refreshExportOptions);
 
     document.getElementById("export-doc").addEventListener("click", async () => {
       const runId = document.getElementById("export-run-id").value.trim();
       const title = document.getElementById("export-title").value.trim();
-      const cardIds = Array.from(exportSelectedCardIds);
+      const exportKind = currentExportKind();
+      const itemIds = Array.from(exportSelectedItemIds);
       const resultNode = document.getElementById("export-result");
       resultNode.textContent = "";
       try {
         const payload = await readJson("/api/exports/google-doc", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ run_id: runId, card_ids: cardIds, document_title: title })
+          body: JSON.stringify({
+            run_id: runId,
+            export_kind: exportKind,
+            card_ids: exportKind === "cards" ? itemIds : [],
+            matrix_item_ids: exportKind === "matrix_items" ? itemIds : [],
+            document_title: title
+          })
         });
         resultNode.textContent = JSON.stringify(payload, null, 2);
       } catch (error) {
@@ -1197,6 +1425,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     refreshCalibrationStatus();
     refreshQualityMetrics();
     refreshSaturationTrends();
+    refreshActiveMemory();
     refreshExportOptions();
   </script>
 </body>

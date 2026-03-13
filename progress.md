@@ -1259,6 +1259,40 @@ Main sections: completed work, pending work, known issues, and next starting poi
   - 测试：
     - 新增 `test_concept_alignment_gate_requires_belief_gap_and_named_course_object`
     - 当前测试总数已增至 80 个，并全部通过
+- 已完成连续迭代第3轮（双模式研究系统落地版）：
+  - 后端主链：
+    - `app/main.py` 新增 `POST /api/research-plans/draft`，支持 `aha_exploration` / `claim_evidence` 双模式 planning
+    - `RunCreateRequest` 扩展为支持 `task_type`、`research_brief`、`confirmed_plan`、`use_active_memory`
+    - run 创建时会把 `task_type / confirmed_plan / active_memory_snapshot` 写入 `run.metadata`
+    - `app/services.py` 新增 `build_claim_evidence_search_strategies()`，claim mode 不再只能复用原来的 aha 默认 topic 展开
+    - `RunCoordinator` 已按 `task_type` 分流 discovery 与输出生成
+  - claim evidence 产物链：
+    - `app/db.py` 新增 `evidence_matrix_items` 表与索引
+    - `Repository` 新增 matrix item 的增删查、review 集成、export 集成
+    - `PaperPipeline` 新增 `build_matrix_items()` / `generate_matrix_items_for_sections()`
+    - review list 已支持 `matrix_item`，decision/comment/export eligibility 均已打通
+    - `ExportService` 新增 matrix item 的 Google Doc / markdown artifact 导出
+  - 跨模式能力：
+    - `app/main.py` 新增 `POST /api/papers/{paper_id}/qa`
+    - `app/services.py` 新增 `PaperQAService`，基于 `paper_sections` 做 retrieval 后再做 grounded answer
+    - `app/services.py` 新增 `PreferenceMemoryStore` / `PreferenceMemoryService`
+    - `app/main.py` 新增 `GET /api/memory/active`、`POST /api/memory/draft`、`POST /api/memory/activate`
+    - active memory 已接入 research planning、claim matrix generation、card extraction/judgement
+  - 提示词与 UI：
+    - `app/llm.py` 新增四类 prompt：`research_planning`、`claim_evidence_generation`、`paper_qa`、`preference_memory`
+    - `app/static/index.html` 已加入 Draft/Confirm Plan、matrix review/export、paper QA、memory activate 面板
+    - export 面板已支持 `cards` 与 `matrix_items` 双导出模式
+  - 案例验证（stubbed API + 真实服务主链）：
+    - `test_research_plan_draft_api_returns_claim_plan`：验证 research brief 能产出 claim-mode plan，并回填 confirmable topics
+    - `test_claim_run_uses_confirmed_plan_topics_and_active_memory`：验证 claim run 会从 confirmed plan 自动派生 topics，并挂载 active memory snapshot
+    - `test_review_items_api_supports_matrix_items`：验证 matrix item 可进入 review list 与 detail API
+    - `test_matrix_export_endpoint_builds_google_doc_artifact`：验证 accepted matrix item 可直接导出为 markdown / Google Doc artifact
+    - `test_paper_qa_endpoint_returns_grounded_answer`：验证 paper QA 返回 grounded answer 与 section ids
+    - `test_memory_draft_and_activate_endpoints`：验证 reaction -> memory draft -> activate 闭环已跑通
+  - 当前测试状态：
+    - `python3 -m pytest tests/test_app.py -k "not test_figure_asset_endpoint_serves_validated_local_asset and not test_parser_materializes_html_data_uri_figure_assets"`
+    - 结果：`110 passed, 1 skipped, 2 deselected`
+    - 说明：未 deselect 时，仍有 2 条 figure 相关测试依赖本机 `Pillow`；功能回归不受此次双模式改动影响
 
 ## 还没做什么
 
@@ -1290,10 +1324,15 @@ Main sections: completed work, pending work, known issues, and next starting poi
 
 ## 下次开始时应该先做什么
 
-- 先跑一遍 `python -m pytest tests/test_app.py`，当前基线应为 94 个测试全部通过。
+- 先跑一遍 `python3 -m pytest tests/test_app.py -k "not test_figure_asset_endpoint_serves_validated_local_asset and not test_parser_materializes_html_data_uri_figure_assets"`，当前基线应为 `110 passed, 1 skipped, 2 deselected`。
+- 如果本机已安装 `Pillow`，可再跑完整 `python3 -m pytest tests/test_app.py`；否则会额外触发 2 条 figure asset 相关环境依赖失败。
 - 先打开并人工审阅最新单篇验证产物：
   - `data/validation/run_56a6ea38de664028a74d0feb93deb762_paper_dad4d44180d24040992b5dec6f99d9d2_topic_cdc4a00ed5fd41e19e6eef5f5b9e88a6/final_cards.json`
   - `data/validation/run_56a6ea38de664028a74d0feb93deb762_paper_dad4d44180d24040992b5dec6f99d9d2_topic_cdc4a00ed5fd41e19e6eef5f5b9e88a6/single_paper_validation_report.md`
+- 双模式相关优先检查：
+  - Draft / Confirm Plan 后，claim mode 是否只用 confirmed plan topics 起 run
+  - matrix item review/export 是否符合你要的 leader-facing 证据矩阵形状
+  - active memory 是否只在你显式 activate 后才影响下一次 planning / filtering
 - 优先检查两件事：
   - final card 是否继续严格继承各自 plan slot 的具体对象
   - quote-first body 是否已经足够接近 `CONCEPT.md` few-shot，可否进一步压缩 `draft_body`

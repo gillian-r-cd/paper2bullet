@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import math
 import mimetypes
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
 import urllib.error
@@ -25,7 +27,7 @@ from typing import Any, Iterable, List, Optional
 from uuid import uuid4
 
 from .config import Settings
-from .db import db_cursor
+from .db import db_cursor, db_read_cursor
 from .llm import (
     CARD_RUBRIC_VERSION,
     CARD_PLAN_PROMPT_VERSION,
@@ -35,6 +37,7 @@ from .llm import (
     LLMGenerationError,
     get_prompt_version_records,
     get_rubric_version_records,
+    looks_like_complete_translation,
 )
 
 try:
@@ -319,6 +322,7 @@ def initial_topic_run_stats() -> dict[str, Any]:
         "discovered": 0,
         "accessible": 0,
         "cards": 0,
+        "matrix_items": 0,
         "parsed_papers": 0,
         "card_generation_attempts": 0,
         "discovered_raw": 0,
@@ -506,6 +510,478 @@ def build_topic_search_strategies(topic: str, *, current_year: Optional[int] = N
             "params": {"year_from": recent_year_from},
         },
     ]
+
+
+WORKPLACE_CLAIM_HINT_TOKENS = (
+    "leadership",
+    "leader",
+    "manager",
+    "managerial",
+    "employee",
+    "employees",
+    "team",
+    "teams",
+    "workplace",
+    "organization",
+    "organizational",
+    "management",
+    "supervisor",
+    "subordinate",
+    "follower",
+    "followers",
+    "staff",
+    "job",
+    "jobs",
+    "engagement",
+    "psychological safety",
+    "voice",
+    "burnout",
+    "lmx",
+    "领导",
+    "管理",
+    "经理",
+    "员工",
+    "团队",
+    "组织",
+    "绩效",
+    "心理安全",
+)
+
+WORKPLACE_CONTEXT_QUERY_TERMS = (
+    "leadership",
+    "manager",
+    "employee",
+    "workplace",
+    "organizational",
+)
+
+WORKPLACE_DIMENSION_QUERY_ANCHORS = {
+    "expression": "leadership communication sensegiving role clarity goal clarity employee engagement",
+    "listening": "supervisor listening employee commitment trust in leader psychological safety communication satisfaction",
+    "questioning": "managerial coaching leader questioning inquiry employee development problem solving",
+    "empathy": "leader empathy supervisor support emotional intelligence burnout job satisfaction leader-member exchange",
+    "action_facilitation": "manager praise goal setting performance feedback accountability follow-up employee performance goal attainment",
+    "integrative_framework": "organizational communication leadership employee commitment team performance workplace well-being",
+    "boundary_contradictions": "leadership communication boundary conditions culture remote work task interdependence null effects",
+    "measurement_methods": "experience sampling daily diary workplace communication supervisor employee conversation behavior coding",
+}
+
+WORKPLACE_DIMENSION_QUERY_EXPANSIONS = {
+    "expression": (
+        "supervisor communication goal clarity role clarity employee engagement",
+        "transparent communication sensegiving trust in leader team performance",
+    ),
+    "listening": (
+        "leader listening trust in leader psychological safety employee voice",
+        "active empathic listening supervisor employee trust psychological safety",
+        "perceived leader listening supervisor listening quality employee voice trust in leader",
+    ),
+    "questioning": (
+        "managerial coaching feedback leadership development employee learning",
+        "coach-like questioning inquiry problem solving employee development",
+        "executive coaching feedback inquiry leadership development work performance",
+        "leader questioning inquiry learning behavior problem solving innovation",
+    ),
+    "empathy": (
+        "servant leadership workplace trust employee wellbeing burnout",
+        "leader emotional intelligence trust in supervisor job satisfaction",
+    ),
+    "action_facilitation": (
+        "performance appraisal goal setting organizational performance manager feedback",
+        "manager praise feedback goal setting accountability follow-up employee performance",
+    ),
+    "integrative_framework": (
+        "organizational communication leadership employee engagement performance mediation",
+        "leadership style workplace wellbeing commitment employee performance",
+    ),
+    "boundary_contradictions": (
+        "virtual teams participative leadership job satisfaction remote work",
+        "leadership communication culture task interdependence null effects workplace",
+    ),
+    "measurement_methods": (
+        "experience sampling supervisor behavior daily diary employee wellbeing",
+        "family supportive supervisor behavior multilevel workplace interactions",
+    ),
+}
+
+CLAIM_EVIDENCE_PROVIDER_RESULT_LIMIT = 8
+CLAIM_EVIDENCE_DISCOVERY_CANDIDATE_CAP = 30
+CLAIM_EVIDENCE_MAX_ABSTRACT_FALLBACK_ITEMS_NO_FULLTEXT = 2
+CLAIM_EVIDENCE_MAX_ABSTRACT_FALLBACK_ITEMS_WITH_FULLTEXT = 1
+CLAIM_EVIDENCE_MAX_ABSTRACT_FALLBACK_PAPER_ATTEMPTS = 8
+
+LOW_SIGNAL_CLAIM_EVIDENCE_TITLE_TOKENS = (
+    "decision letter",
+    "review for",
+    "review of",
+    "retracted:",
+    "retraction",
+    "corrigendum",
+    "erratum",
+    "editorial",
+    "book review",
+    "preface",
+)
+
+WORKPLACE_DIRECT_EVIDENCE_TOKENS = (
+    "leadership",
+    "leader",
+    "manager",
+    "managerial",
+    "employee",
+    "employees",
+    "workplace",
+    "organizational",
+    "organization",
+    "supervisor",
+    "subordinate",
+    "follower",
+    "followers",
+    "staff",
+    "worker",
+    "workers",
+    "management",
+    "firm",
+    "firms",
+    "job satisfaction",
+    "trust in leader",
+    "employee voice",
+    "psychological safety",
+    "supervisor support",
+    "team performance",
+    "leader-member exchange",
+    "lmx",
+    "burnout",
+    "service innovation",
+)
+
+OFFDOMAIN_CLAIM_EVIDENCE_TITLE_TOKENS = (
+    "robot",
+    "robotic",
+    "artificial intelligence",
+    " ai ",
+    "llm",
+    "language model",
+    "reinforcement learning",
+    "goal-conditioned",
+    "video model",
+    "benchmark",
+    "dataset",
+    "maze",
+    "physics-conditioned",
+    "consumer",
+    "customer",
+    "restaurant",
+    "marketing",
+    "fitness",
+    "physical activity",
+    "driver",
+    "medical student",
+    "medical students",
+    "physiotherapy",
+    "patient",
+    "therapy",
+    "music listening",
+    "cochlear",
+    "hearing",
+    "virtual reality",
+    "madrasah",
+    "crowd worker",
+    "crowd workers",
+    "tennis",
+    "supernova",
+    "black hole",
+    "qed",
+    "qcd",
+)
+
+
+def _joined_lower_text(*parts: Any) -> str:
+    return " ".join(str(part or "").strip() for part in parts if str(part or "").strip()).lower()
+
+
+def infer_claim_evidence_context(
+    query_anchor: str,
+    *,
+    outcome_terms: Optional[list[str]] = None,
+    claim_text: str = "",
+    research_brief: str = "",
+) -> dict[str, Any]:
+    combined = _joined_lower_text(query_anchor, claim_text, research_brief, " ".join(outcome_terms or []))
+    requires_workplace_context = any(token in combined for token in WORKPLACE_CLAIM_HINT_TOKENS)
+    context_terms: list[str] = []
+    if requires_workplace_context:
+        for term in WORKPLACE_CONTEXT_QUERY_TERMS:
+            if term in combined or term in str(query_anchor or "").lower():
+                context_terms.append(term)
+        for fallback in WORKPLACE_CONTEXT_QUERY_TERMS:
+            if fallback not in context_terms:
+                context_terms.append(fallback)
+    return {
+        "requires_workplace_context": requires_workplace_context,
+        "context_terms": context_terms[:5],
+        "provider_allowlist": ["openalex", "crossref", "semantic_scholar"] if requires_workplace_context else [],
+    }
+
+
+def scope_claim_evidence_query(anchor: str, context_terms: list[str]) -> str:
+    normalized_anchor = str(anchor or "").strip()
+    if not normalized_anchor or not context_terms:
+        return normalized_anchor
+    lowered_anchor = normalized_anchor.lower()
+    suffix_terms = [term for term in context_terms if term and term.lower() not in lowered_anchor]
+    if not suffix_terms:
+        return normalized_anchor
+    return f"{normalized_anchor} {' '.join(suffix_terms)}".strip()
+
+
+def _clean_metadata_abstract(text: str) -> str:
+    normalized = html.unescape(str(text or ""))
+    normalized = re.sub(r"<[^>]+>", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def _reconstruct_openalex_abstract(abstract_index: Any) -> str:
+    if not isinstance(abstract_index, dict):
+        return ""
+    positions: dict[int, str] = {}
+    for token, indexes in abstract_index.items():
+        if not isinstance(indexes, list):
+            continue
+        for index in indexes:
+            if isinstance(index, int):
+                positions[index] = str(token or "")
+    if not positions:
+        return ""
+    return " ".join(positions[index] for index in sorted(positions))
+
+
+def _extract_source_metadata_abstract(metadata: Any) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    direct_abstract = _clean_metadata_abstract(str(metadata.get("abstract", "") or ""))
+    if direct_abstract:
+        return direct_abstract
+    source_metadata = metadata.get("source_metadata", {})
+    if isinstance(source_metadata, dict):
+        source_abstract = _clean_metadata_abstract(str(source_metadata.get("abstract", "") or ""))
+        if source_abstract:
+            return source_abstract
+        openalex_abstract = _reconstruct_openalex_abstract(source_metadata.get("abstract_inverted_index"))
+        if openalex_abstract:
+            return _clean_metadata_abstract(openalex_abstract)
+    openalex_abstract = _reconstruct_openalex_abstract(metadata.get("abstract_inverted_index"))
+    if openalex_abstract:
+        return _clean_metadata_abstract(openalex_abstract)
+    return ""
+
+
+def _extract_candidate_metadata_abstract(candidate: dict[str, Any]) -> str:
+    candidates: list[str] = []
+    for source in candidate.get("discovery_sources", []):
+        abstract_text = _extract_source_metadata_abstract(source.get("metadata", {}))
+        if abstract_text:
+            candidates.append(abstract_text)
+    abstract_text = _extract_source_metadata_abstract(candidate.get("metadata", {}))
+    if abstract_text:
+        candidates.append(abstract_text)
+    if not candidates:
+        return ""
+    return max(candidates, key=len)
+
+
+def _keywordize_claim_text(*parts: Any) -> list[str]:
+    stopwords = {
+        "and",
+        "the",
+        "for",
+        "with",
+        "that",
+        "from",
+        "into",
+        "over",
+        "using",
+        "use",
+        "role",
+        "effects",
+        "effect",
+        "study",
+        "workplace",
+        "organizational",
+        "leadership",
+        "manager",
+        "employee",
+    }
+    keywords: list[str] = []
+    for part in parts:
+        cleaned = _clean_metadata_abstract(str(part or "")).lower()
+        for token in re.findall(r"[a-z][a-z\-]{2,}", cleaned):
+            if token in stopwords:
+                continue
+            keywords.append(token)
+    return list(dict.fromkeys(keywords))
+
+
+def _title_has_claim_evidence_noise(title: str) -> bool:
+    lowered = _clean_metadata_abstract(title).lower()
+    if not lowered:
+        return False
+    if any(token in lowered for token in LOW_SIGNAL_CLAIM_EVIDENCE_TITLE_TOKENS):
+        return True
+    return False
+
+
+def build_claim_evidence_search_strategies(
+    query_anchor: str,
+    *,
+    outcome_terms: Optional[list[str]] = None,
+    dimension_key: str = "",
+    claim_text: str = "",
+    research_brief: str = "",
+    current_year: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    normalized_anchor = str(query_anchor or "").strip()
+    if not normalized_anchor:
+        return []
+    normalized_outcomes = []
+    for raw_term in outcome_terms or []:
+        term = str(raw_term or "").strip()
+        if term and term.lower() not in {str(item or "").lower() for item in normalized_outcomes}:
+            normalized_outcomes.append(term)
+    year = current_year or datetime.now(timezone.utc).year
+    recent_year_from = max(1900, year - 3)
+    primary_outcome = normalized_outcomes[0] if normalized_outcomes else ""
+    secondary_outcome = normalized_outcomes[1] if len(normalized_outcomes) >= 2 else primary_outcome
+    context = infer_claim_evidence_context(
+        normalized_anchor,
+        outcome_terms=normalized_outcomes,
+        claim_text=claim_text,
+        research_brief=research_brief,
+    )
+    normalized_dimension_key = str(dimension_key or "").strip().lower()
+    dimension_anchor = WORKPLACE_DIMENSION_QUERY_ANCHORS.get(normalized_dimension_key, "")
+    dimension_expansions = WORKPLACE_DIMENSION_QUERY_EXPANSIONS.get(normalized_dimension_key, ())
+    effective_anchor = dimension_anchor if context["requires_workplace_context"] and dimension_anchor else normalized_anchor
+    scoped_anchor = scope_claim_evidence_query(effective_anchor, context["context_terms"])
+    provider_allowlist = context["provider_allowlist"]
+    evidence_suffix = "empirical study" if context["requires_workplace_context"] else "empirical evidence"
+    result_limit = CLAIM_EVIDENCE_PROVIDER_RESULT_LIMIT if context["requires_workplace_context"] else 5
+    strategies = [
+        {
+            "strategy_family": "core",
+            "strategy_type": "topic_query",
+            "strategy_order": 1,
+            "query_text": scoped_anchor,
+            "params": {"result_limit": result_limit},
+            "provider_allowlist": provider_allowlist,
+        },
+        {
+            "strategy_family": "evidence",
+            "strategy_type": "evidence_focus",
+            "strategy_order": 2,
+            "query_text": f"{scoped_anchor} {evidence_suffix}",
+            "params": {"result_limit": result_limit},
+            "provider_allowlist": provider_allowlist,
+        },
+    ]
+    for expansion in dimension_expansions:
+        scoped_expansion = scope_claim_evidence_query(str(expansion or "").strip(), context["context_terms"])
+        if not scoped_expansion or scoped_expansion.lower() == scoped_anchor.lower():
+            continue
+        strategies.append(
+            {
+                "strategy_family": "dimension",
+                "strategy_type": "dimension_focus",
+                "strategy_order": len(strategies) + 1,
+                "query_text": scoped_expansion,
+                "params": {"result_limit": result_limit},
+                "provider_allowlist": provider_allowlist,
+            }
+        )
+    if primary_outcome:
+        strategies.append(
+            {
+                "strategy_family": "outcome",
+                "strategy_type": "outcome_focus",
+                "strategy_order": 3,
+                "query_text": f"{scoped_anchor} {primary_outcome}",
+                "params": {"outcome": primary_outcome, "result_limit": result_limit},
+                "provider_allowlist": provider_allowlist,
+            }
+        )
+    if secondary_outcome and secondary_outcome != primary_outcome:
+        strategies.append(
+            {
+                "strategy_family": "outcome",
+                "strategy_type": "outcome_focus",
+                "strategy_order": 4,
+                "query_text": f"{scoped_anchor} {secondary_outcome}",
+                "params": {"outcome": secondary_outcome, "result_limit": result_limit},
+                "provider_allowlist": provider_allowlist,
+            }
+        )
+    strategies.append(
+        {
+            "strategy_family": "recency",
+            "strategy_type": "recent_window",
+            "strategy_order": len(strategies) + 1,
+            "query_text": scoped_anchor,
+            "params": {"year_from": recent_year_from, "result_limit": max(4, result_limit - 2)},
+            "provider_allowlist": provider_allowlist,
+        }
+    )
+    unique_strategies: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    for strategy in strategies:
+        key = (
+            str(strategy.get("strategy_family", "")).strip().lower(),
+            str(strategy.get("strategy_type", "")).strip().lower(),
+            str(strategy.get("query_text", "")).strip().lower(),
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        strategy["strategy_order"] = len(unique_strategies) + 1
+        unique_strategies.append(strategy)
+    return unique_strategies
+
+
+def derive_topics_from_confirmed_plan(task_type: str, confirmed_plan: dict[str, Any]) -> list[str]:
+    normalized_task_type = normalize_task_type(task_type)
+    if normalized_task_type == "claim_evidence":
+        entries = confirmed_plan.get("search_topics", [])
+        topics = []
+        seen: set[str] = set()
+        for entry in entries if isinstance(entries, list) else []:
+            if isinstance(entry, dict):
+                topic_name = str(entry.get("topic_name", "")).strip()
+            else:
+                topic_name = str(entry or "").strip()
+            if not topic_name:
+                continue
+            lowered = topic_name.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            topics.append(topic_name)
+        return topics
+    recommended_topics = confirmed_plan.get("recommended_topics", [])
+    topics = []
+    seen_topics: set[str] = set()
+    for entry in recommended_topics if isinstance(recommended_topics, list) else []:
+        if isinstance(entry, dict):
+            topic_name = str(entry.get("topic_name", "") or entry.get("topic", "")).strip()
+        else:
+            topic_name = str(entry or "").strip()
+        if not topic_name:
+            continue
+        lowered = topic_name.lower()
+        if lowered in seen_topics:
+            continue
+        seen_topics.add(lowered)
+        topics.append(topic_name)
+    return topics
 
 
 def classify_neighbor_relationship(similarity: float) -> str:
@@ -782,13 +1258,34 @@ class ParseFailure(ValueError):
         self.reason = reason
 
 
+TASK_TYPES = frozenset({"aha_exploration", "claim_evidence"})
 CARD_REVIEW_DECISIONS = frozenset({"accepted", "rejected", "keep_for_later", "needs_manual_check"})
+MATRIX_REVIEW_DECISIONS = CARD_REVIEW_DECISIONS
 EXCLUDED_REVIEW_DECISIONS = frozenset({"accepted", "reopened", "needs_manual_check"})
+
+
+def normalize_task_type(value: str, *, default: str = "aha_exploration") -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in TASK_TYPES:
+        return normalized
+    return default
+
+
+def review_status_sort_value(decision: str) -> int:
+    return {
+        "accepted": 4,
+        "keep_for_later": 3,
+        "needs_manual_check": 2,
+        "rejected": 1,
+        "reopened": 1,
+    }.get(str(decision or "").strip().lower(), 0)
 
 
 def allowed_review_decisions(target_type: str) -> frozenset[str]:
     if target_type == "card":
         return CARD_REVIEW_DECISIONS
+    if target_type == "matrix_item":
+        return MATRIX_REVIEW_DECISIONS
     if target_type == "excluded":
         return EXCLUDED_REVIEW_DECISIONS
     return frozenset()
@@ -804,17 +1301,20 @@ class Repository:
         self._lock = threading.Lock()
 
     def _fetchone(self, query: str, params: tuple = ()) -> Optional[dict]:
-        with db_cursor(self.settings.db_path) as connection:
+        with db_read_cursor(self.settings.db_path) as connection:
             return connection.execute(query, params).fetchone()
 
     def _fetchall(self, query: str, params: tuple = ()) -> list[dict]:
-        with db_cursor(self.settings.db_path) as connection:
+        with db_read_cursor(self.settings.db_path) as connection:
             return connection.execute(query, params).fetchall()
 
     def _hydrate_evidence(self, evidence: list[dict]) -> list[dict]:
         hydrated = []
         for item in evidence:
-            quote_zh = str(item.get("quote_zh", "")).strip() or str(item.get("analysis", "")).strip()
+            quote_en = str(item.get("quote", "")).strip()
+            quote_zh = str(item.get("quote_zh", "")).strip()
+            if quote_zh and quote_en and not looks_like_complete_translation(quote_en, quote_zh):
+                quote_zh = ""
             hydrated.append(
                 {
                     **item,
@@ -831,6 +1331,13 @@ class Repository:
         row["supporting_section_ids"] = json.loads(row.get("supporting_section_ids_json", "[]") or "[]")
         row["paper_url"] = row.get("paper_url", "")
         row["source_excluded_content_id"] = row.get("source_excluded_content_id")
+        return row
+
+    def _hydrate_matrix_row(self, row: dict) -> dict:
+        row["evidence"] = self._hydrate_evidence(json.loads(row["evidence_json"]))
+        row["figure_ids"] = json.loads(row.get("figure_ids_json", "[]") or "[]")
+        row["supporting_section_ids"] = json.loads(row.get("supporting_section_ids_json", "[]") or "[]")
+        row["paper_url"] = row.get("paper_url", "")
         return row
 
     def _hydrate_figure_row(self, row: dict) -> dict:
@@ -884,6 +1391,37 @@ class Repository:
                 int(card.get("duplicate_rank", 0) or 0),
                 card.get("duplicate_disposition", ""),
                 card["created_at"],
+            ),
+        )
+
+    def _insert_evidence_matrix_item(self, connection, paper_id: str, topic_id: str, run_id: str, item: dict) -> None:
+        connection.execute(
+            """
+            INSERT INTO evidence_matrix_items(
+                id, paper_id, topic_id, run_id, dimension_key, dimension_label, outcome_key, outcome_label,
+                claim_text, verdict, evidence_strength, summary, limitation_text, citation_text, evidence_json,
+                figure_ids_json, supporting_section_ids_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item["id"],
+                paper_id,
+                topic_id,
+                run_id,
+                item["dimension_key"],
+                item["dimension_label"],
+                item["outcome_key"],
+                item["outcome_label"],
+                item["claim_text"],
+                item["verdict"],
+                item["evidence_strength"],
+                item["summary"],
+                item.get("limitation_text", ""),
+                item.get("citation_text", ""),
+                json.dumps(item.get("evidence", []), ensure_ascii=False),
+                json.dumps(item.get("figure_ids", []), ensure_ascii=False),
+                json.dumps(item.get("supporting_section_ids", []), ensure_ascii=False),
+                item["created_at"],
             ),
         )
 
@@ -2000,6 +2538,20 @@ class Repository:
                 (new_id("psrc"), paper_id, provider, confidence, json.dumps(metadata, ensure_ascii=False), utc_now()),
             )
 
+    def list_paper_sources(self, paper_id: str) -> list[dict]:
+        rows = self._fetchall(
+            """
+            SELECT *
+            FROM paper_sources
+            WHERE paper_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (paper_id,),
+        )
+        for row in rows:
+            row["metadata"] = json.loads(row.get("metadata_json", "{}") or "{}")
+        return rows
+
     def link_paper_to_topic(self, paper_id: str, topic_id: str, run_id: str, source_kind: str) -> None:
         with db_cursor(self.settings.db_path) as connection:
             connection.execute(
@@ -2218,6 +2770,30 @@ class Repository:
     def replace_cards_for_paper_topic(self, paper_id: str, topic_id: str, run_id: str, cards: list[dict]) -> None:
         self.replace_generation_outputs_for_paper_topic(paper_id, topic_id, run_id, cards, [])
 
+    def replace_matrix_items_for_paper_topic(
+        self,
+        paper_id: str,
+        topic_id: str,
+        run_id: str,
+        matrix_items: list[dict],
+    ) -> None:
+        with db_cursor(self.settings.db_path) as connection:
+            existing_rows = connection.execute(
+                "SELECT id FROM evidence_matrix_items WHERE paper_id = ? AND topic_id = ? AND run_id = ?",
+                (paper_id, topic_id, run_id),
+            ).fetchall()
+            for row in existing_rows:
+                connection.execute(
+                    "DELETE FROM review_decisions WHERE target_type = 'matrix_item' AND target_id = ?",
+                    (row["id"],),
+                )
+            connection.execute(
+                "DELETE FROM evidence_matrix_items WHERE paper_id = ? AND topic_id = ? AND run_id = ?",
+                (paper_id, topic_id, run_id),
+            )
+            for item in matrix_items:
+                self._insert_evidence_matrix_item(connection, paper_id, topic_id, run_id, item)
+
     def create_review_decision(self, target_type: str, target_id: str, reviewer: str, decision: str, note: str) -> None:
         card_id = target_id if target_type == "card" else None
         with db_cursor(self.settings.db_path) as connection:
@@ -2390,6 +2966,7 @@ class Repository:
             (run_id,),
         )
         card_rows = self._fetchall("SELECT id FROM candidate_cards WHERE run_id = ?", (run_id,))
+        matrix_rows = self._fetchall("SELECT id FROM evidence_matrix_items WHERE run_id = ?", (run_id,))
         judged_count = self._fetchone(
             """
             SELECT COUNT(DISTINCT judgements.card_id) AS count
@@ -2408,8 +2985,18 @@ class Repository:
             """,
             (run_id,),
         )["count"]
+        reviewed_matrix_count = self._fetchone(
+            """
+            SELECT COUNT(DISTINCT review_decisions.target_id) AS count
+            FROM review_decisions
+            JOIN evidence_matrix_items ON evidence_matrix_items.id = review_decisions.target_id
+            WHERE review_decisions.target_type = 'matrix_item' AND evidence_matrix_items.run_id = ?
+            """,
+            (run_id,),
+        )["count"]
         export_rows = self._fetchall("SELECT request_json FROM exports WHERE run_id = ?", (run_id,))
         exported_card_ids: set[str] = set()
+        exported_matrix_item_ids: set[str] = set()
         for row in export_rows:
             try:
                 request_payload = json.loads(row["request_json"] or "{}")
@@ -2418,6 +3005,9 @@ class Repository:
             for card_id in request_payload.get("resolved_card_ids", []):
                 if card_id:
                     exported_card_ids.add(str(card_id))
+            for item_id in request_payload.get("resolved_matrix_item_ids", []):
+                if item_id:
+                    exported_matrix_item_ids.add(str(item_id))
         topic_runs = self.list_topic_runs(run_id)
         return {
             "topic_total": len(topic_runs),
@@ -2428,12 +3018,19 @@ class Repository:
             "accessible": sum(1 for row in paper_rows if row["access_status"] == "open_fulltext"),
             "parsed": sum(1 for row in paper_rows if row["parse_status"] == "parsed"),
             "carded": len(card_rows),
+            "matrix_items": len(matrix_rows),
             "judged": int(judged_count),
             "reviewed": int(reviewed_count),
+            "reviewed_matrix_items": int(reviewed_matrix_count),
             "exported": len(exported_card_ids),
+            "exported_matrix_items": len(exported_matrix_item_ids),
         }
 
     def _decorate_run(self, row: dict) -> dict:
+        try:
+            row["metadata"] = json.loads(row.get("metadata_json", "{}") or "{}")
+        except json.JSONDecodeError:
+            row["metadata"] = {}
         row["progress_summary"] = self.get_run_progress_summary(row["id"])
         return row
 
@@ -2631,6 +3228,40 @@ class Repository:
         row["grounding_diagnostics"] = self._build_card_grounding_diagnostics(row)
         return row
 
+    def get_matrix_item(self, matrix_item_id: str) -> Optional[dict]:
+        row = self._fetchone(
+            """
+            SELECT evidence_matrix_items.*, papers.title AS paper_title, papers.original_url AS paper_url,
+                   papers.publication_year AS publication_year, topics.name AS topic_name
+            FROM evidence_matrix_items
+            JOIN papers ON papers.id = evidence_matrix_items.paper_id
+            JOIN topics ON topics.id = evidence_matrix_items.topic_id
+            WHERE evidence_matrix_items.id = ?
+            """,
+            (matrix_item_id,),
+        )
+        if not row:
+            return None
+        row = self._hydrate_matrix_row(row)
+        row["review"] = self.get_latest_review_decision("matrix_item", matrix_item_id)
+        row["comment"] = self.get_review_item_comment("matrix_item", matrix_item_id)
+        row["figures"] = self.get_figures_by_ids(row["paper_id"], row.get("figure_ids", []))
+        evidence_section_ids = [
+            str(item.get("section_id", "")).strip()
+            for item in row.get("evidence", [])
+            if str(item.get("section_id", "")).strip()
+        ]
+        row["evidence_sections"] = self._fetchall(
+            f"""
+            SELECT id, section_title, paragraph_text, page_number
+            FROM paper_sections
+            WHERE paper_id = ? AND id IN ({",".join("?" for _ in evidence_section_ids) or "''"})
+            ORDER BY section_order ASC
+            """,
+            tuple([row["paper_id"]] + evidence_section_ids),
+        )
+        return row
+
     def _build_card_grounding_diagnostics(self, card: dict) -> dict[str, Any]:
         evidence_section_ids = [item.get("section_id") for item in card.get("evidence", []) if item.get("section_id")]
         if evidence_section_ids:
@@ -2732,6 +3363,55 @@ class Repository:
         )
         for row in rows:
             self._hydrate_card_row(row)
+        return rows
+
+    def list_matrix_items(
+        self,
+        *,
+        run_id: Optional[str] = None,
+        topic: str = "",
+        paper_id: Optional[str] = None,
+        topic_id: Optional[str] = None,
+    ) -> list[dict]:
+        params: list[str] = []
+        filters = []
+        if run_id:
+            filters.append("evidence_matrix_items.run_id = ?")
+            params.append(run_id)
+        if paper_id:
+            filters.append("evidence_matrix_items.paper_id = ?")
+            params.append(paper_id)
+        if topic_id:
+            filters.append("evidence_matrix_items.topic_id = ?")
+            params.append(topic_id)
+        if topic:
+            filters.append("lower(topics.name) = lower(?)")
+            params.append(topic)
+        where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+        rows = self._fetchall(
+            f"""
+            SELECT
+                evidence_matrix_items.*,
+                papers.title AS paper_title,
+                papers.original_url AS paper_url,
+                papers.publication_year AS publication_year,
+                topics.name AS topic_name,
+                (
+                    SELECT decision FROM review_decisions
+                    WHERE review_decisions.target_type = 'matrix_item'
+                      AND review_decisions.target_id = evidence_matrix_items.id
+                    ORDER BY created_at DESC LIMIT 1
+                ) AS review_decision
+            FROM evidence_matrix_items
+            JOIN papers ON papers.id = evidence_matrix_items.paper_id
+            JOIN topics ON topics.id = evidence_matrix_items.topic_id
+            {where_clause}
+            ORDER BY evidence_matrix_items.created_at DESC
+            """,
+            tuple(params),
+        )
+        for row in rows:
+            self._hydrate_matrix_row(row)
         return rows
 
     def get_quality_metrics(self, run_id: Optional[str] = None) -> dict[str, Any]:
@@ -2880,7 +3560,7 @@ class Repository:
     ) -> list[dict]:
         normalized_item_type = (item_type or "cards").strip().lower()
         items = []
-        if normalized_item_type in {"cards", "both"}:
+        if normalized_item_type in {"cards", "both", "all"}:
             for card in self.list_cards(run_id=run_id, topic=topic):
                 if review_status and (card.get("review_decision") or "") != review_status:
                     continue
@@ -2908,7 +3588,37 @@ class Repository:
                         "created_at": card["created_at"],
                     }
                 )
-        if normalized_item_type in {"excluded", "both"}:
+        if normalized_item_type in {"matrix", "matrix_items", "all"}:
+            for item in self.list_matrix_items(run_id=run_id, topic=topic):
+                if review_status and (item.get("review_decision") or "") != review_status:
+                    continue
+                comment = self.get_review_item_comment("matrix_item", item["id"]) or {}
+                items.append(
+                    {
+                        "object_type": "matrix_item",
+                        "object_id": item["id"],
+                        "run_id": item["run_id"],
+                        "topic_name": item["topic_name"],
+                        "paper_title": item["paper_title"],
+                        "publication_year": item.get("publication_year"),
+                        "paper_url": item.get("paper_url", ""),
+                        "display_title": item["summary"],
+                        "color": item.get("verdict", ""),
+                        "course_transformation": item.get("outcome_label", ""),
+                        "teachable_one_liner": item.get("claim_text", ""),
+                        "review_status": item.get("review_decision", ""),
+                        "comment_text": comment.get("comment", ""),
+                        "comment_updated_at": comment.get("updated_at", ""),
+                        "exclusion_type": "",
+                        "export_eligible": is_card_export_eligible(item.get("review_decision") or ""),
+                        "verdict": item.get("verdict", ""),
+                        "evidence_strength": item.get("evidence_strength", ""),
+                        "dimension_label": item.get("dimension_label", ""),
+                        "outcome_label": item.get("outcome_label", ""),
+                        "created_at": item["created_at"],
+                    }
+                )
+        if normalized_item_type in {"excluded", "both", "all"}:
             excluded_filters = {"run_id": run_id, "topic_id": None, "paper_id": None}
             excluded_rows = self.list_excluded_content(run_id=run_id)
             for item in excluded_rows:
@@ -2967,6 +3677,15 @@ class Repository:
             item["display_title"] = item["label"]
             item["export_eligible"] = False
             return item
+        if target_type == "matrix_item":
+            item = self.get_matrix_item(target_id)
+            if not item:
+                return None
+            item["object_type"] = "matrix_item"
+            item["object_id"] = item["id"]
+            item["display_title"] = item["summary"]
+            item["export_eligible"] = is_card_export_eligible((item.get("review") or {}).get("decision", ""))
+            return item
         return None
 
     def list_access_queue(self, run_id: Optional[str] = None) -> list[dict]:
@@ -3018,6 +3737,28 @@ class Repository:
             row["review"] = self.get_latest_review_decision("card", row["id"])
         return rows
 
+    def list_matrix_items_for_export(self, run_id: str, matrix_item_ids: list[str]) -> list[dict]:
+        placeholders = ",".join("?" for _ in matrix_item_ids) or "''"
+        params = [run_id] + matrix_item_ids
+        rows = self._fetchall(
+            f"""
+            SELECT evidence_matrix_items.*, papers.title AS paper_title, papers.original_url AS paper_url,
+                   papers.publication_year AS publication_year, topics.name AS topic_name
+            FROM evidence_matrix_items
+            JOIN papers ON papers.id = evidence_matrix_items.paper_id
+            JOIN topics ON topics.id = evidence_matrix_items.topic_id
+            WHERE evidence_matrix_items.run_id = ? AND evidence_matrix_items.id IN ({placeholders})
+            ORDER BY evidence_matrix_items.dimension_label ASC, evidence_matrix_items.outcome_label ASC, evidence_matrix_items.created_at ASC
+            """,
+            tuple(params),
+        )
+        for row in rows:
+            self._hydrate_matrix_row(row)
+            row["review"] = self.get_latest_review_decision("matrix_item", row["id"])
+            row["comment"] = self.get_review_item_comment("matrix_item", row["id"])
+            row["figures"] = self.get_figures_by_ids(row["paper_id"], row.get("figure_ids", []))
+        return rows
+
     def build_neighbors(self, card_id: str, limit: int = 5) -> list[dict]:
         current = self.get_card(card_id)
         if not current:
@@ -3061,8 +3802,20 @@ class DiscoveryService:
     def discover(self, topic: str) -> list[dict]:
         raw_results = []
         strategies = self.strategy_builder(topic)
+        return self.discover_with_strategies(topic, strategies)
+
+    def discover_with_strategies(self, topic: str, strategies: list[dict[str, Any]]) -> list[dict]:
+        raw_results = []
         for strategy in strategies:
+            allowlist = {
+                str(item).strip().lower()
+                for item in strategy.get("provider_allowlist", [])
+                if str(item).strip()
+            }
             for provider in self.providers:
+                provider_name = str(getattr(provider, "provider_name", provider.__class__.__name__)).strip().lower()
+                if allowlist and provider_name not in allowlist:
+                    continue
                 raw_results.extend(self._discover_with_provider(provider, topic, strategy))
         deduped: dict[str, dict] = {}
         for result in raw_results:
@@ -3173,7 +3926,8 @@ class OpenAlexDiscoveryProvider:
         strategy = strategy or {}
         query_text = str(strategy.get("query_text", topic)).strip() or topic
         query = urllib.parse.quote(query_text)
-        url = f"https://api.openalex.org/works?search={query}&per-page=5"
+        result_limit = max(1, min(int((strategy.get("params") or {}).get("result_limit", 5) or 5), 15))
+        url = f"https://api.openalex.org/works?search={query}&per-page={result_limit}"
         year_from = (strategy.get("params") or {}).get("year_from")
         if isinstance(year_from, int):
             filter_param = urllib.parse.quote(f"from_publication_date:{year_from}-01-01")
@@ -3270,7 +4024,8 @@ class CrossrefDiscoveryProvider:
         strategy = strategy or {}
         query_text = str(strategy.get("query_text", topic)).strip() or topic
         query = urllib.parse.quote(query_text)
-        url = f"https://api.crossref.org/works?query={query}&rows=5"
+        result_limit = max(1, min(int((strategy.get("params") or {}).get("result_limit", 5) or 5), 15))
+        url = f"https://api.crossref.org/works?query={query}&rows={result_limit}"
         year_from = (strategy.get("params") or {}).get("year_from")
         if isinstance(year_from, int):
             url += f"&filter={urllib.parse.quote(f'from-pub-date:{year_from}-01-01')}"
@@ -3322,7 +4077,8 @@ class SemanticScholarDiscoveryProvider:
         query_text = str(strategy.get("query_text", topic)).strip() or topic
         query = urllib.parse.quote(query_text)
         fields = urllib.parse.quote("title,year,authors,url,openAccessPdf,externalIds,abstract")
-        url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={query}&limit=5&fields={fields}"
+        result_limit = max(1, min(int((strategy.get("params") or {}).get("result_limit", 5) or 5), 15))
+        url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={query}&limit={result_limit}&fields={fields}"
         request = urllib.request.Request(url, headers={"User-Agent": "paper2bullet/1.0"})
         try:
             with urllib.request.urlopen(request, timeout=8) as response:
@@ -4259,7 +5015,7 @@ class PaperPipeline:
         )
         return len(parsed["sections"])
 
-    def build_cards(self, paper: dict, topic: dict, run_id: str) -> int:
+    def build_cards(self, paper: dict, topic: dict, run_id: str, *, active_memory: Optional[dict[str, Any]] = None) -> int:
         sections = self.repository.get_sections(paper["id"])
         if not self.card_engine.is_enabled():
             self.repository.replace_generation_outputs_for_paper_topic(paper["id"], topic["id"], run_id, [], [])
@@ -4270,7 +5026,13 @@ class PaperPipeline:
             )
             return 0
         try:
-            generation_output = self.generate_outputs_for_sections(sections, topic, paper, run_id=run_id)
+            generation_output = self.generate_outputs_for_sections(
+                sections,
+                topic,
+                paper,
+                run_id=run_id,
+                active_memory=active_memory,
+            )
         except LLMGenerationError as error:
             self.repository.replace_generation_outputs_for_paper_topic(paper["id"], topic["id"], run_id, [], [])
             self.repository.update_paper(
@@ -4309,8 +5071,213 @@ class PaperPipeline:
         )
         return len(cards)
 
-    def generate_outputs_for_sections(self, sections: list[dict], topic: dict, paper: dict, run_id: str = "") -> dict:
-        return self._build_cards_with_llm(sections, topic, paper, run_id=run_id)
+    def build_matrix_items(
+        self,
+        paper: dict,
+        topic: dict,
+        run_id: str,
+        *,
+        claim_plan: dict[str, Any],
+        active_memory: Optional[dict[str, Any]] = None,
+    ) -> int:
+        sections = self.repository.get_sections(paper["id"])
+        abstract_only_fallback = False
+        if not sections:
+            sections = self._build_claim_evidence_abstract_fallback_sections(paper)
+            abstract_only_fallback = bool(sections)
+        if not sections:
+            self.repository.replace_matrix_items_for_paper_topic(paper["id"], topic["id"], run_id, [])
+            self.repository.update_paper(
+                paper["id"],
+                card_generation_status="matrix_no_items",
+                card_generation_failure_reason="No parsed sections or abstract fallback evidence were available for claim evidence generation.",
+            )
+            return 0
+        if not self.card_engine.is_enabled():
+            self.repository.replace_matrix_items_for_paper_topic(paper["id"], topic["id"], run_id, [])
+            self.repository.update_paper(
+                paper["id"],
+                card_generation_status="matrix_llm_unavailable",
+                card_generation_failure_reason="LLM-only claim evidence generation is enabled, but no LLM provider is configured.",
+            )
+            return 0
+        try:
+            generation_output = self.generate_matrix_items_for_sections(
+                sections,
+                topic,
+                paper,
+                claim_plan=claim_plan,
+                active_memory=active_memory,
+                abstract_only_fallback=abstract_only_fallback,
+            )
+        except LLMGenerationError as error:
+            self.repository.replace_matrix_items_for_paper_topic(paper["id"], topic["id"], run_id, [])
+            self.repository.update_paper(
+                paper["id"],
+                card_generation_status="matrix_llm_failed",
+                card_generation_failure_reason=str(error),
+            )
+            return 0
+        items = generation_output["items"]
+        self.repository.replace_matrix_items_for_paper_topic(paper["id"], topic["id"], run_id, items)
+        self.repository.update_paper(
+            paper["id"],
+            card_generation_status=(
+                "matrix_generated_abstract_only"
+                if items and abstract_only_fallback
+                else "matrix_generated"
+                if items
+                else "matrix_no_items_abstract_only"
+                if abstract_only_fallback
+                else "matrix_no_items"
+            ),
+            card_generation_failure_reason="" if items else "LLM completed successfully but did not return any valid evidence matrix items.",
+        )
+        return len(items)
+
+    def generate_outputs_for_sections(
+        self,
+        sections: list[dict],
+        topic: dict,
+        paper: dict,
+        run_id: str = "",
+        *,
+        active_memory: Optional[dict[str, Any]] = None,
+    ) -> dict:
+        return self._build_cards_with_llm(sections, topic, paper, run_id=run_id, active_memory=active_memory)
+
+    def generate_matrix_items_for_sections(
+        self,
+        sections: list[dict],
+        topic: dict,
+        paper: dict,
+        *,
+        claim_plan: dict[str, Any],
+        active_memory: Optional[dict[str, Any]] = None,
+        abstract_only_fallback: bool = False,
+    ) -> dict[str, list[dict]]:
+        figures = self.repository.get_figures(paper["id"])
+        topic_entry = self._resolve_claim_plan_topic_entry(claim_plan, topic["name"])
+        if not self._paper_is_direct_claim_evidence_match(paper, sections, topic_entry, claim_plan):
+            return {"items": []}
+        query_anchor = str(topic_entry.get("query_anchor", "") or topic["name"]).strip()
+        evidence_packet = self._build_evidence_packet(sections, figures, query_anchor)
+        generated = self.card_engine.generate_matrix_items(
+            claim_text=str(claim_plan.get("claim", "") or claim_plan.get("research_brief", "")).strip(),
+            topic_name=topic["name"],
+            paper_title=paper["title"],
+            dimension=topic_entry,
+            sections=evidence_packet["prompt_sections"],
+            figures=evidence_packet["figure_candidates"],
+            active_memory=active_memory,
+            evidence_policy={
+                **(claim_plan.get("evidence_policy", {}) or {}),
+                "abstract_only_fallback": abstract_only_fallback,
+            },
+        )
+        generated_items = generated.get("items", [])
+        if abstract_only_fallback and generated_items:
+            generated_items = self._downgrade_abstract_only_matrix_items(generated_items)
+        return {
+            "items": [self._finalize_matrix_item(item, topic_entry, claim_plan) for item in generated_items],
+        }
+
+    def _build_claim_evidence_abstract_fallback_sections(self, paper: dict) -> list[dict]:
+        best_abstract = self._extract_best_metadata_abstract_for_paper(paper["id"])
+        if len(best_abstract) < 120:
+            return []
+        return [
+            {
+                "id": f"abstract_meta::{paper['id']}",
+                "paper_id": paper["id"],
+                "section_order": 0,
+                "section_title": "Abstract (discovery metadata)",
+                "paragraph_text": best_abstract,
+                "page_number": None,
+                "section_kind": "abstract",
+                "section_label": "metadata_abstract",
+                "is_front_matter": False,
+                "is_abstract": True,
+                "is_body": False,
+                "body_role": "",
+                "has_figure_reference": False,
+                "source_format": "metadata_abstract",
+                "selection_score": 0.62,
+                "selection_reason_json": {"reason": "claim_evidence_abstract_fallback"},
+            }
+        ]
+
+    def _extract_best_metadata_abstract_for_paper(self, paper_id: str) -> str:
+        paper_sources = self.repository.list_paper_sources(paper_id)
+        abstract_candidates: list[str] = []
+        for source in paper_sources:
+            metadata = source.get("metadata", {}) if isinstance(source.get("metadata"), dict) else {}
+            abstract_text = _extract_source_metadata_abstract(metadata)
+            if abstract_text:
+                abstract_candidates.append(abstract_text)
+        if not abstract_candidates:
+            return ""
+        return max(abstract_candidates, key=len).strip()
+
+    def _downgrade_abstract_only_matrix_items(self, items: list[dict]) -> list[dict]:
+        downgraded: list[dict] = []
+        for item in items[:1]:
+            adjusted = dict(item)
+            adjusted["evidence_strength"] = "weak"
+            limitation = str(adjusted.get("limitation_text", "")).strip()
+            abstract_note = "仅基于论文摘要/发现元数据生成，尚未核对全文，因此只能作为弱证据使用。"
+            if abstract_note not in limitation:
+                adjusted["limitation_text"] = f"{limitation} {abstract_note}".strip()
+            downgraded.append(adjusted)
+        return downgraded
+
+    def _paper_is_direct_claim_evidence_match(
+        self,
+        paper: dict,
+        sections: list[dict],
+        topic_entry: dict[str, Any],
+        claim_plan: dict[str, Any],
+    ) -> bool:
+        context = infer_claim_evidence_context(
+            str(topic_entry.get("query_anchor", "") or topic_entry.get("topic_name", "")).strip(),
+            outcome_terms=topic_entry.get("outcome_terms", []),
+            claim_text=str(claim_plan.get("claim", "")).strip(),
+            research_brief=str(claim_plan.get("research_brief", "")).strip(),
+        )
+        if not context["requires_workplace_context"]:
+            return True
+        title_text = _joined_lower_text(paper.get("title", ""))
+        sampled_sections = sections[:8]
+        section_text = _joined_lower_text(
+            " ".join(section.get("section_title", "") for section in sampled_sections),
+            " ".join(section.get("paragraph_text", "")[:320] for section in sampled_sections),
+        )
+        searchable_text = _joined_lower_text(title_text, section_text)
+        direct_hits = sum(1 for token in WORKPLACE_DIRECT_EVIDENCE_TOKENS if token in searchable_text)
+        offdomain_hits = sum(1 for token in OFFDOMAIN_CLAIM_EVIDENCE_TITLE_TOKENS if token in title_text)
+        if direct_hits > 0:
+            return True
+        if offdomain_hits > 0:
+            return False
+        return False
+
+    def _extract_candidates_with_optional_memory(self, **kwargs) -> dict[str, Any]:
+        active_memory = kwargs.pop("active_memory", None)
+        try:
+            return self.card_engine.extract_candidates(active_memory=active_memory, **kwargs)
+        except TypeError as error:
+            if "active_memory" not in str(error):
+                raise
+            return self.card_engine.extract_candidates(**kwargs)
+
+    def _judge_candidates_with_optional_memory(self, **kwargs) -> dict[str, Any]:
+        active_memory = kwargs.pop("active_memory", None)
+        try:
+            return self.card_engine.judge_candidates(active_memory=active_memory, **kwargs)
+        except TypeError as error:
+            if "active_memory" not in str(error):
+                raise
+            return self.card_engine.judge_candidates(**kwargs)
 
     def _build_paper_understanding(
         self,
@@ -4606,6 +5573,7 @@ class PaperPipeline:
         planning_context: dict[str, Any],
         calibration_examples: list[dict],
         calibration_set_name: str,
+        active_memory: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         body_sections = [section for section in sections if section.get("is_body")]
         body_sections.sort(key=lambda item: float(item.get("selection_score", 0.0)), reverse=True)
@@ -4617,7 +5585,7 @@ class PaperPipeline:
                 continue
             deduped.append(section)
             seen.add(section["id"])
-        return self.card_engine.extract_candidates(
+        return self._extract_candidates_with_optional_memory(
             topic_name=topic_name,
             paper_title=paper_title,
             sections=deduped,
@@ -4626,6 +5594,7 @@ class PaperPipeline:
             planning_context=planning_context,
             calibration_examples=calibration_examples,
             calibration_set_name=calibration_set_name,
+            active_memory=active_memory,
         )
 
     def _align_cards_to_plan(self, cards: list[dict], card_plan: dict[str, Any]) -> tuple[list[dict], list[dict]]:
@@ -4992,6 +5961,7 @@ class PaperPipeline:
         precomputed_understanding: Optional[dict[str, Any]] = None,
         precomputed_card_plan: Optional[dict[str, Any]] = None,
         persist_records: bool = True,
+        active_memory: Optional[dict[str, Any]] = None,
     ) -> dict:
         active_calibration_set = self.repository.get_active_calibration_set()
         figures = self.repository.get_figures(paper["id"])
@@ -5033,7 +6003,7 @@ class PaperPipeline:
             card_plan=card_plan,
         )
         self.repository.update_section_selection_diagnostics(paper["id"], evidence_packet["selection_diagnostics"])
-        extracted_output = self.card_engine.extract_candidates(
+        extracted_output = self._extract_candidates_with_optional_memory(
             topic_name=topic["name"],
             paper_title=paper["title"],
             sections=evidence_packet["prompt_sections"],
@@ -5042,6 +6012,7 @@ class PaperPipeline:
             planning_context=card_plan,
             calibration_examples=(active_calibration_set or {}).get("examples", []),
             calibration_set_name=(active_calibration_set or {}).get("name", ""),
+            active_memory=active_memory,
         )
         gated_cards, gated_excluded = self._gate_extracted_candidates(extracted_output["cards"], sections)
         recovery_excluded: list[dict] = []
@@ -5055,19 +6026,21 @@ class PaperPipeline:
                 planning_context=card_plan,
                 calibration_examples=(active_calibration_set or {}).get("examples", []),
                 calibration_set_name=(active_calibration_set or {}).get("name", ""),
+                active_memory=active_memory,
             )
             recovered_cards, recovered_excluded = self._gate_extracted_candidates(recovered_extraction["cards"], sections)
             if recovered_cards:
                 gated_cards = recovered_cards
                 extracted_output = recovered_extraction
             recovery_excluded = recovered_excluded
-        judged_output = self.card_engine.judge_candidates(
+        judged_output = self._judge_candidates_with_optional_memory(
             topic_name=topic["name"],
             paper_title=paper["title"],
             extracted_cards=gated_cards,
             figures=evidence_packet["figure_candidates"],
             calibration_examples=(active_calibration_set or {}).get("examples", []),
             calibration_set_name=(active_calibration_set or {}).get("name", ""),
+            active_memory=active_memory,
         )
         concept_kept_cards, concept_excluded = self._gate_judged_cards_for_concept_alignment(judged_output["cards"])
         plan_aligned_cards, plan_excluded = self._align_cards_to_plan(concept_kept_cards, card_plan)
@@ -5133,6 +6106,57 @@ class PaperPipeline:
             "exclusion_type": item["exclusion_type"],
             "reason": item["reason"],
             "section_ids": item["section_ids"],
+            "created_at": utc_now(),
+        }
+
+    def _resolve_claim_plan_topic_entry(self, claim_plan: dict[str, Any], topic_name: str) -> dict[str, Any]:
+        search_topics = claim_plan.get("search_topics", [])
+        for entry in search_topics if isinstance(search_topics, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("topic_name", "")).strip().lower() == str(topic_name or "").strip().lower():
+                normalized = dict(entry)
+                normalized.setdefault("dimension_key", str(entry.get("dimension_key", "") or slugify(topic_name)).strip())
+                normalized.setdefault("dimension_label", str(entry.get("dimension_label", "") or topic_name).strip())
+                normalized.setdefault("query_anchor", str(entry.get("query_anchor", "") or topic_name).strip())
+                normalized.setdefault(
+                    "outcome_terms",
+                    [str(item).strip() for item in claim_plan.get("outcomes", []) if str(item).strip()],
+                )
+                return normalized
+        return {
+            "topic_name": topic_name,
+            "dimension_key": slugify(topic_name),
+            "dimension_label": topic_name,
+            "query_anchor": topic_name,
+            "outcome_terms": [str(item).strip() for item in claim_plan.get("outcomes", []) if str(item).strip()],
+        }
+
+    def _finalize_matrix_item(self, item: dict, topic_entry: dict[str, Any], claim_plan: dict[str, Any]) -> dict[str, Any]:
+        evidence = item.get("evidence", [])
+        primary_section_ids = [
+            str(entry.get("section_id", "")).strip()
+            for entry in evidence
+            if str(entry.get("section_id", "")).strip()
+        ]
+        citation_text = str(item.get("citation_text", "")).strip()
+        if not citation_text:
+            citation_text = f"{topic_entry.get('dimension_label', '')} | {topic_entry.get('query_anchor', '')}".strip(" |")
+        return {
+            "id": new_id("matrix"),
+            "dimension_key": str(item.get("dimension_key", "") or topic_entry.get("dimension_key", "")).strip(),
+            "dimension_label": str(item.get("dimension_label", "") or topic_entry.get("dimension_label", "")).strip(),
+            "outcome_key": str(item.get("outcome_key", "") or slugify(item.get("outcome_label", "")) or slugify((topic_entry.get("outcome_terms") or ["outcome"])[0])).strip(),
+            "outcome_label": str(item.get("outcome_label", "") or ((topic_entry.get("outcome_terms") or ["Outcome"])[0])).strip(),
+            "claim_text": str(item.get("claim_text", "") or claim_plan.get("claim", "")).strip(),
+            "verdict": str(item.get("verdict", "")).strip() or "context_only",
+            "evidence_strength": str(item.get("evidence_strength", "")).strip() or "medium",
+            "summary": str(item.get("summary", "")).strip(),
+            "limitation_text": str(item.get("limitation_text", "")).strip(),
+            "citation_text": citation_text,
+            "evidence": evidence,
+            "figure_ids": [str(figure_id).strip() for figure_id in item.get("figure_ids", []) if str(figure_id).strip()],
+            "supporting_section_ids": list(dict.fromkeys(primary_section_ids)),
             "created_at": utc_now(),
         }
 
@@ -5373,6 +6397,451 @@ class ReviewService:
         }
 
 
+class PreferenceMemoryStore:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.active_path = self.settings.preference_memory_dir / "active_memory.json"
+
+    def get_active_memory(self) -> Optional[dict[str, Any]]:
+        if not self.active_path.exists():
+            return None
+        try:
+            payload = json.loads(self.active_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def activate_memory(self, memory_draft: dict[str, Any], reviewer: str) -> dict[str, Any]:
+        activated = {
+            "id": new_id("memory"),
+            "scope": str(memory_draft.get("scope", "project")).strip() or "project",
+            "mode": str(memory_draft.get("mode", "")).strip(),
+            "summary": str(memory_draft.get("summary", "")).strip(),
+            "prefer": [str(item).strip() for item in memory_draft.get("prefer", []) if str(item).strip()],
+            "avoid": [str(item).strip() for item in memory_draft.get("avoid", []) if str(item).strip()],
+            "review_signals": [str(item).strip() for item in memory_draft.get("review_signals", []) if str(item).strip()],
+            "source_run_id": str(memory_draft.get("source_run_id", "")).strip(),
+            "source_task_type": normalize_task_type(memory_draft.get("source_task_type", ""), default="aha_exploration"),
+            "status": "active",
+            "reviewer": reviewer,
+            "created_at": utc_now(),
+            "activated_at": utc_now(),
+        }
+        history_path = self.settings.preference_memory_dir / f"{activated['id']}.json"
+        history_path.write_text(json.dumps(activated, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.active_path.write_text(json.dumps(activated, ensure_ascii=False, indent=2), encoding="utf-8")
+        return activated
+
+
+class ResearchPlanningService:
+    def __init__(self, settings: Settings, llm_engine: Optional[LLMCardEngine] = None, memory_store: Optional[PreferenceMemoryStore] = None):
+        self.settings = settings
+        self.llm_engine = llm_engine or LLMCardEngine(settings)
+        self.memory_store = memory_store or PreferenceMemoryStore(settings)
+
+    def draft_plan(
+        self,
+        research_brief: str,
+        *,
+        requested_task_type: str = "auto",
+        max_terms: int = 6,
+        use_active_memory: bool = True,
+        also_generate_aha_cards: bool = False,
+    ) -> dict[str, Any]:
+        normalized_brief = str(research_brief or "").strip()
+        if not normalized_brief:
+            raise ValueError("research_brief is required")
+        requested = str(requested_task_type or "auto").strip().lower()
+        active_memory = self.memory_store.get_active_memory() if use_active_memory else None
+        if self.llm_engine.is_enabled() and hasattr(self.llm_engine, "draft_research_plan"):
+            raw_plan = self.llm_engine.draft_research_plan(
+                normalized_brief,
+                requested_task_type=requested,
+                max_terms=max_terms,
+                active_memory=active_memory,
+                also_generate_aha_cards=also_generate_aha_cards,
+            )
+        else:
+            raw_plan = self._fallback_draft_plan(
+                normalized_brief,
+                requested_task_type=requested,
+                max_terms=max_terms,
+                active_memory=active_memory,
+                also_generate_aha_cards=also_generate_aha_cards,
+            )
+        return self._normalize_draft_plan(
+            raw_plan,
+            research_brief=normalized_brief,
+            requested_task_type=requested,
+            max_terms=max_terms,
+            active_memory=active_memory,
+            also_generate_aha_cards=also_generate_aha_cards,
+        )
+
+    def _infer_task_type(self, research_brief: str) -> str:
+        lowered = str(research_brief or "").lower()
+        claim_markers = [
+            "prove",
+            "proof",
+            "support",
+            "evidence",
+            "matrix",
+            "claim",
+            "dimension",
+            "命题",
+            "证明",
+            "支持",
+            "证据",
+            "维度",
+            "反证",
+            "领导力",
+            "绩效",
+        ]
+        if any(marker in lowered for marker in claim_markers):
+            return "claim_evidence"
+        return "aha_exploration"
+
+    def _fallback_topics(self, research_brief: str, max_terms: int) -> list[str]:
+        candidates: list[str] = []
+        for raw in re.split(r"[\n,;，。！？/]+", research_brief):
+            cleaned = str(raw or "").strip().strip("-*")
+            cleaned = re.sub(r"\s+", " ", cleaned)
+            if not cleaned:
+                continue
+            word_count = len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", cleaned))
+            if word_count > 8:
+                continue
+            candidates.append(cleaned)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            lowered = item.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            deduped.append(item)
+            if len(deduped) >= max_terms:
+                break
+        if deduped:
+            return deduped
+        fallback_tokens = re.findall(r"[A-Za-z0-9\u4e00-\u9fff]{2,}", research_brief)
+        return fallback_tokens[:max_terms] or ["research topic"]
+
+    def _fallback_draft_plan(
+        self,
+        research_brief: str,
+        *,
+        requested_task_type: str,
+        max_terms: int,
+        active_memory: Optional[dict[str, Any]],
+        also_generate_aha_cards: bool,
+    ) -> dict[str, Any]:
+        task_type = normalize_task_type(
+            requested_task_type if requested_task_type != "auto" else self._infer_task_type(research_brief)
+        )
+        topics = self._fallback_topics(research_brief, max_terms)
+        if task_type == "claim_evidence":
+            dimension_entries = []
+            for index, topic_name in enumerate(topics[:max_terms], start=1):
+                dimension_entries.append(
+                    {
+                        "topic_name": topic_name,
+                        "dimension_key": slugify(topic_name),
+                        "dimension_label": topic_name,
+                        "query_anchor": topic_name,
+                        "outcome_terms": ["leadership effectiveness", "team performance"],
+                    }
+                )
+            return {
+                "task_type": task_type,
+                "suggested_task_type": task_type,
+                "claim": research_brief,
+                "search_topics": dimension_entries,
+                "outcomes": ["leadership effectiveness", "team performance"],
+                "evidence_policy": {
+                    "surface_contradictions": True,
+                    "minimum_supporting_papers_per_dimension": 3,
+                },
+                "also_generate_aha_cards": also_generate_aha_cards,
+                "summary": "Fallback claim-evidence plan generated without an LLM.",
+                "active_memory_snapshot": active_memory or {},
+            }
+        return {
+            "task_type": task_type,
+            "suggested_task_type": task_type,
+            "recommended_topics": [{"topic_name": topic_name, "query_anchor": topic_name} for topic_name in topics],
+            "summary": "Fallback aha plan generated without an LLM.",
+            "active_memory_snapshot": active_memory or {},
+        }
+
+    def _normalize_draft_plan(
+        self,
+        raw_plan: dict[str, Any],
+        *,
+        research_brief: str,
+        requested_task_type: str,
+        max_terms: int,
+        active_memory: Optional[dict[str, Any]],
+        also_generate_aha_cards: bool,
+    ) -> dict[str, Any]:
+        task_type = normalize_task_type(
+            raw_plan.get("task_type") or raw_plan.get("suggested_task_type") or (
+                requested_task_type if requested_task_type != "auto" else self._infer_task_type(research_brief)
+            )
+        )
+        if task_type == "claim_evidence":
+            normalized_topics = []
+            seen: set[str] = set()
+            for entry in raw_plan.get("search_topics", []) if isinstance(raw_plan.get("search_topics", []), list) else []:
+                if not isinstance(entry, dict):
+                    entry = {"topic_name": str(entry or "").strip(), "query_anchor": str(entry or "").strip()}
+                topic_name = str(entry.get("topic_name", "") or entry.get("dimension_label", "") or entry.get("query_anchor", "")).strip()
+                if not topic_name:
+                    continue
+                lowered = topic_name.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                query_anchor = str(entry.get("query_anchor", "") or topic_name).strip()
+                outcome_terms = [str(item).strip() for item in entry.get("outcome_terms", []) if str(item).strip()]
+                if not outcome_terms:
+                    outcome_terms = [str(item).strip() for item in raw_plan.get("outcomes", []) if str(item).strip()]
+                normalized_topics.append(
+                    {
+                        "topic_name": topic_name,
+                        "dimension_key": str(entry.get("dimension_key", "") or slugify(topic_name)).strip(),
+                        "dimension_label": str(entry.get("dimension_label", "") or topic_name).strip(),
+                        "query_anchor": query_anchor,
+                        "outcome_terms": outcome_terms[:4],
+                    }
+                )
+                if len(normalized_topics) >= max_terms:
+                    break
+            if not normalized_topics:
+                normalized_topics = self._fallback_draft_plan(
+                    research_brief,
+                    requested_task_type="claim_evidence",
+                    max_terms=max_terms,
+                    active_memory=active_memory,
+                    also_generate_aha_cards=also_generate_aha_cards,
+                )["search_topics"]
+            return {
+                "task_type": "claim_evidence",
+                "suggested_task_type": "claim_evidence",
+                "research_brief": research_brief,
+                "claim": str(raw_plan.get("claim", "") or research_brief).strip(),
+                "search_topics": normalized_topics,
+                "outcomes": [str(item).strip() for item in raw_plan.get("outcomes", []) if str(item).strip()],
+                "evidence_policy": {
+                    "surface_contradictions": bool((raw_plan.get("evidence_policy", {}) or {}).get("surface_contradictions", True)),
+                    "minimum_supporting_papers_per_dimension": int((raw_plan.get("evidence_policy", {}) or {}).get("minimum_supporting_papers_per_dimension", 3) or 3),
+                },
+                "also_generate_aha_cards": bool(raw_plan.get("also_generate_aha_cards", also_generate_aha_cards)),
+                "confirmed_topics_text": "\n".join(item["topic_name"] for item in normalized_topics),
+                "summary": str(raw_plan.get("summary", "")).strip(),
+                "active_memory_snapshot": active_memory or {},
+            }
+        normalized_topics = []
+        seen_topics: set[str] = set()
+        raw_topics = raw_plan.get("recommended_topics", [])
+        if isinstance(raw_topics, list):
+            for entry in raw_topics:
+                if isinstance(entry, dict):
+                    topic_name = str(entry.get("topic_name", "") or entry.get("topic", "")).strip()
+                else:
+                    topic_name = str(entry or "").strip()
+                if not topic_name:
+                    continue
+                lowered = topic_name.lower()
+                if lowered in seen_topics:
+                    continue
+                seen_topics.add(lowered)
+                normalized_topics.append({"topic_name": topic_name, "query_anchor": topic_name})
+                if len(normalized_topics) >= max_terms:
+                    break
+        if not normalized_topics:
+            normalized_topics = [{"topic_name": item, "query_anchor": item} for item in self._fallback_topics(research_brief, max_terms)]
+        return {
+            "task_type": "aha_exploration",
+            "suggested_task_type": "aha_exploration",
+            "research_brief": research_brief,
+            "recommended_topics": normalized_topics,
+            "confirmed_topics_text": "\n".join(item["topic_name"] for item in normalized_topics),
+            "summary": str(raw_plan.get("summary", "")).strip(),
+            "active_memory_snapshot": active_memory or {},
+        }
+
+
+class PreferenceMemoryService:
+    def __init__(
+        self,
+        settings: Settings,
+        repository: Repository,
+        llm_engine: Optional[LLMCardEngine] = None,
+        memory_store: Optional[PreferenceMemoryStore] = None,
+    ):
+        self.settings = settings
+        self.repository = repository
+        self.llm_engine = llm_engine or LLMCardEngine(settings)
+        self.memory_store = memory_store or PreferenceMemoryStore(settings)
+
+    def draft_memory(self, *, task_type: str = "", run_id: str = "", reviewer: str = "internal") -> dict[str, Any]:
+        normalized_task_type = normalize_task_type(task_type, default="")
+        review_items = self.repository.list_review_items(
+            run_id=run_id or None,
+            item_type="all",
+            review_status="",
+        )
+        latest_items = [item for item in review_items if (not normalized_task_type or self._item_matches_task_type(item, normalized_task_type))]
+        active_memory = self.memory_store.get_active_memory()
+        if self.llm_engine.is_enabled() and hasattr(self.llm_engine, "distill_preference_memory"):
+            raw_memory = self.llm_engine.distill_preference_memory(
+                latest_items,
+                task_type=normalized_task_type or "",
+                active_memory=active_memory,
+            )
+        else:
+            raw_memory = self._fallback_memory(latest_items, normalized_task_type)
+        return {
+            "scope": str(raw_memory.get("scope", "project")).strip() or "project",
+            "mode": str(raw_memory.get("mode", normalized_task_type or "mixed")).strip(),
+            "summary": str(raw_memory.get("summary", "")).strip(),
+            "prefer": [str(item).strip() for item in raw_memory.get("prefer", []) if str(item).strip()],
+            "avoid": [str(item).strip() for item in raw_memory.get("avoid", []) if str(item).strip()],
+            "review_signals": [str(item).strip() for item in raw_memory.get("review_signals", []) if str(item).strip()],
+            "source_run_id": run_id,
+            "source_task_type": normalized_task_type or "mixed",
+            "reviewer": reviewer,
+            "active_memory_snapshot": active_memory or {},
+            "signal_count": len(latest_items),
+        }
+
+    def activate_memory(self, memory_draft: dict[str, Any], reviewer: str) -> dict[str, Any]:
+        if not isinstance(memory_draft, dict) or not memory_draft:
+            raise ValueError("memory_draft is required")
+        return self.memory_store.activate_memory(memory_draft, reviewer)
+
+    def _item_matches_task_type(self, item: dict[str, Any], task_type: str) -> bool:
+        if not task_type:
+            return True
+        object_type = str(item.get("object_type", "")).strip()
+        if task_type == "claim_evidence":
+            return object_type == "matrix_item"
+        return object_type in {"card", "excluded"}
+
+    def _fallback_memory(self, items: list[dict], task_type: str) -> dict[str, Any]:
+        accepted = [item for item in items if item.get("review_status") == "accepted"]
+        rejected = [item for item in items if item.get("review_status") == "rejected"]
+        manual = [item for item in items if item.get("review_status") == "needs_manual_check"]
+        context_only_rejects = [
+            item for item in rejected
+            if item.get("object_type") == "matrix_item" and str(item.get("verdict", "")).strip() == "context_only"
+        ]
+        mixed_accepts = [
+            item for item in accepted
+            if item.get("object_type") == "matrix_item" and str(item.get("verdict", "")).strip() == "mixed"
+        ]
+        prefer = []
+        avoid = []
+        signals = [
+            f"accepted={len(accepted)}",
+            f"rejected={len(rejected)}",
+            f"needs_manual_check={len(manual)}",
+        ]
+        if context_only_rejects:
+            avoid.append("Avoid context-only evidence items unless they establish a strong direct outcome link.")
+            signals.append(f"context_only_rejects={len(context_only_rejects)}")
+        if mixed_accepts:
+            prefer.append("Prefer mixed-evidence items when limitations are explicit and evidence remains decision-useful.")
+            signals.append(f"mixed_accepts={len(mixed_accepts)}")
+        if not prefer:
+            prefer.append("Prefer direct empirical evidence with short transfer distance to the reporting claim.")
+        if not avoid:
+            avoid.append("Avoid weakly grounded summaries, taxonomy recaps, and items whose course or reporting use is still vague.")
+        return {
+            "scope": "project",
+            "mode": task_type or "mixed",
+            "summary": "Fallback preference memory distilled from explicit review decisions.",
+            "prefer": prefer,
+            "avoid": avoid,
+            "review_signals": signals,
+        }
+
+
+class PaperQAService:
+    def __init__(
+        self,
+        settings: Settings,
+        repository: Repository,
+        llm_engine: Optional[LLMCardEngine] = None,
+        memory_store: Optional[PreferenceMemoryStore] = None,
+    ):
+        self.settings = settings
+        self.repository = repository
+        self.llm_engine = llm_engine or LLMCardEngine(settings)
+        self.memory_store = memory_store or PreferenceMemoryStore(settings)
+
+    def answer_question(self, paper_id: str, question: str, *, max_sections: int = 6) -> dict[str, Any]:
+        paper = self.repository.get_paper(paper_id)
+        if not paper:
+            raise LookupError("Paper not found")
+        normalized_question = str(question or "").strip()
+        if not normalized_question:
+            raise ValueError("question is required")
+        sections = self.repository.get_sections(paper_id)
+        if not sections:
+            raise ValueError("Paper has no parsed sections")
+        if not self.llm_engine.is_enabled():
+            raise LLMGenerationError("LLM provider is not enabled")
+        scored_sections = self._rank_sections(normalized_question, sections, limit=max_sections)
+        selected_ids = {item["id"] for item in scored_sections}
+        figures = [
+            figure
+            for figure in self.repository.get_figures(paper_id)
+            if set(figure.get("linked_section_ids", [])).intersection(selected_ids)
+        ][:4]
+        answer = self.llm_engine.answer_paper_question(
+            paper_title=paper["title"],
+            question=normalized_question,
+            sections=scored_sections,
+            figures=figures,
+            active_memory=self.memory_store.get_active_memory(),
+        )
+        answer["paper_id"] = paper_id
+        answer["paper_title"] = paper["title"]
+        answer["question"] = normalized_question
+        return answer
+
+    def _rank_sections(self, question: str, sections: list[dict], *, limit: int) -> list[dict]:
+        question_embedding = embedding_for_text(question)
+        question_tokens = {
+            token
+            for token in re.findall(r"[A-Za-z0-9\u4e00-\u9fff]{2,}", question.lower())
+            if len(token) >= 2
+        }
+        scored = []
+        for section in sections:
+            section_embedding = section.get("embedding") or embedding_for_text(section.get("paragraph_text", ""))
+            cosine = cosine_similarity(question_embedding, section_embedding)
+            text = f"{section.get('section_title', '')} {section.get('paragraph_text', '')}".lower()
+            lexical_overlap = sum(1 for token in question_tokens if token in text)
+            score = cosine + (0.12 * lexical_overlap) + (0.08 if section.get("is_body") else 0.0)
+            scored.append((score, section))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        selected = []
+        seen: set[str] = set()
+        for _, section in scored:
+            if section["id"] in seen:
+                continue
+            seen.add(section["id"])
+            selected.append(section)
+            if len(selected) >= limit:
+                break
+        return selected
+
+
 class EvaluationService:
     def __init__(self, settings: Settings, repository: Repository, card_engine: Optional[LLMCardEngine] = None):
         self.settings = settings
@@ -5608,17 +7077,26 @@ class AccessQueueService:
         self.pipeline.parse_and_store(refreshed_paper)
         refreshed_paper = self.repository.get_paper(paper["id"])
         topic_runs = self.repository.list_topic_runs_for_paper_run(paper["id"], queue_item["run_id"])
+        task_context = self.coordinator._get_run_task_context(queue_item["run_id"])
         processed_topics = []
 
         for topic_run in topic_runs:
             stats = topic_run["stats"]
             self.coordinator._mark_topic_progress(topic_run["id"], stats, stage="parsing")
             if refreshed_paper and refreshed_paper["parse_status"] == "parsed":
-                self.coordinator._build_cards_for_paper(refreshed_paper, {"id": topic_run["topic_id"], "name": topic_run["topic_name"]}, queue_item["run_id"])
+                output_counts = self.coordinator._build_task_outputs_for_paper(
+                    refreshed_paper,
+                    {"id": topic_run["topic_id"], "name": topic_run["topic_name"]},
+                    queue_item["run_id"],
+                    task_context=task_context,
+                )
                 stats["parsed_papers"] = stats.get("parsed_papers", 0) + 1
                 stats["card_generation_attempts"] = stats.get("card_generation_attempts", 0) + 1
+                stats["cards"] = int(stats.get("cards", 0) or 0) + int(output_counts.get("cards", 0) or 0)
+                stats["matrix_items"] = int(stats.get("matrix_items", 0) or 0) + int(output_counts.get("matrix_items", 0) or 0)
             else:
                 self.repository.replace_cards_for_paper_topic(paper["id"], topic_run["topic_id"], queue_item["run_id"], [])
+                self.repository.replace_matrix_items_for_paper_topic(paper["id"], topic_run["topic_id"], queue_item["run_id"], [])
             stats["accessible"] = sum(
                 1
                 for item in self.repository.list_papers_for_topic_run(queue_item["run_id"], topic_run["topic_id"])
@@ -5630,6 +7108,7 @@ class AccessQueueService:
                 if item["parse_status"] == "parsed"
             )
             stats["cards"] = len(self.repository.list_cards(run_id=queue_item["run_id"], topic=topic_run["topic_name"]))
+            stats["matrix_items"] = len(self.repository.list_matrix_items(run_id=queue_item["run_id"], topic=topic_run["topic_name"]))
             stats["queued_for_access"] = self.repository.count_open_access_queue_for_topic(queue_item["run_id"], topic_run["topic_id"])
             stats = self.coordinator._build_topic_run_metrics(
                 queue_item["run_id"],
@@ -5637,7 +7116,11 @@ class AccessQueueService:
                 topic_run,
                 stats,
             )
-            stats = self.coordinator._attach_topic_stop_decision({"id": topic_run["topic_id"], "name": topic_run["topic_name"]}, stats)
+            if task_context["task_type"] == "aha_exploration":
+                stats = self.coordinator._attach_topic_stop_decision(
+                    {"id": topic_run["topic_id"], "name": topic_run["topic_name"]},
+                    stats,
+                )
             stats["current_stage"] = "completed"
             stats["last_progress_at"] = utc_now()
             self.repository.update_topic_run(topic_run["id"], "completed", stats=stats)
@@ -5749,6 +7232,96 @@ class ExportService:
         record["json_path"] = str(json_path)
         return record
 
+    def export_matrix_google_doc_package(
+        self,
+        run_id: str,
+        matrix_item_ids: list[str],
+        document_title: str,
+        existing_google_doc_id: str = "",
+    ) -> dict:
+        selection = self._resolve_matrix_export_selection(run_id, matrix_item_ids)
+        matrix_items = selection["matrix_items"]
+        grouped: dict[str, dict[str, list[dict]]] = {}
+        for item in matrix_items:
+            grouped.setdefault(item["dimension_label"], {}).setdefault(item["outcome_label"], []).append(item)
+
+        markdown_lines = [f"# {document_title}", ""]
+        requests = []
+        current_index = 1
+        markdown_lines.append(f"Run 编号：`{run_id}`")
+        markdown_lines.append("")
+        for dimension_label, outcomes in grouped.items():
+            markdown_lines.append(f"## 维度：{dimension_label}")
+            markdown_lines.append("")
+            requests.extend(self._insert_text(current_index, f"{dimension_label}\n"))
+            current_index += len(dimension_label) + 1
+            for outcome_label, items in outcomes.items():
+                markdown_lines.append(f"### 结果：{outcome_label}")
+                markdown_lines.append("")
+                requests.extend(self._insert_text(current_index, f"{outcome_label}\n"))
+                current_index += len(outcome_label) + 1
+                for item in items:
+                    markdown_lines.append(f"- [{item['verdict']}] **{item['summary']}**")
+                    markdown_lines.append(f"  - 命题：{item['claim_text']}")
+                    markdown_lines.append(f"  - 证据强度：{item['evidence_strength']}")
+                    markdown_lines.append(f"  - 限制：{item.get('limitation_text', '')}")
+                    markdown_lines.append(f"  - 引文：{item.get('citation_text', '')}")
+                    markdown_lines.append(f"  - 论文：{item.get('paper_title', '')}")
+                    markdown_lines.append("")
+                    block = (
+                        f"[{item['verdict']}] {item['summary']}\n"
+                        f"命题：{item['claim_text']}\n"
+                        f"证据强度：{item['evidence_strength']}\n"
+                        f"限制：{item.get('limitation_text', '')}\n"
+                        f"引文：{item.get('citation_text', '')}\n"
+                        f"论文：{item.get('paper_title', '')}\n\n"
+                    )
+                    requests.extend(self._insert_text(current_index, block))
+                    current_index += len(block)
+
+        export_payload = {
+            "document_title": document_title,
+            "existing_google_doc_id": existing_google_doc_id,
+            "requested_matrix_item_ids": selection["requested_matrix_item_ids"],
+            "resolved_matrix_item_ids": [item["id"] for item in matrix_items],
+            "selection_snapshot": selection["selection_snapshot"],
+            "review_snapshot": selection["review_snapshot"],
+            "requests": requests,
+            "matrix_item_count": len(matrix_items),
+        }
+
+        export_id = new_id("exportdoc")
+        artifact_base = self.settings.exports_dir / export_id
+        markdown_path = artifact_base.with_suffix(".md")
+        json_path = artifact_base.with_suffix(".json")
+        markdown_path.write_text("\n".join(markdown_lines), encoding="utf-8")
+        json_path.write_text(json.dumps(export_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        google_doc_id = ""
+        export_status = "artifact_only"
+        export_mode = "artifact_only"
+        error_message = ""
+        if self.settings.google_docs_mode == "gws":
+            gws_result = self._try_gws_export(document_title, existing_google_doc_id, export_payload)
+            google_doc_id = gws_result["google_doc_id"]
+            export_status = gws_result["export_status"]
+            export_mode = gws_result["export_mode"]
+            error_message = gws_result["error_message"]
+
+        record = self.repository.create_export(
+            run_id=run_id,
+            destination_type="google_docs",
+            export_mode=export_mode,
+            google_doc_id=google_doc_id,
+            export_status=export_status,
+            error_message=error_message,
+            artifact_path=str(markdown_path),
+            request_payload=export_payload,
+        )
+        record["markdown_path"] = str(markdown_path)
+        record["json_path"] = str(json_path)
+        return record
+
     def _resolve_export_selection(self, run_id: str, card_ids: list[str]) -> dict:
         run = self.repository.get_run(run_id)
         if not run:
@@ -5807,6 +7380,74 @@ class ExportService:
         return {
             "cards": cards,
             "requested_card_ids": normalized_card_ids,
+            "selection_snapshot": selection_snapshot,
+            "review_snapshot": review_snapshot,
+        }
+
+    def _resolve_matrix_export_selection(self, run_id: str, matrix_item_ids: list[str]) -> dict:
+        run = self.repository.get_run(run_id)
+        if not run:
+            raise ValueError(f"Run not found: {run_id}")
+        normalized_ids = []
+        seen = set()
+        for raw_item_id in matrix_item_ids:
+            item_id = str(raw_item_id or "").strip()
+            if not item_id or item_id in seen:
+                continue
+            seen.add(item_id)
+            normalized_ids.append(item_id)
+        if not normalized_ids:
+            raise ValueError("At least one matrix item must be selected for export")
+
+        matrix_items = []
+        selection_snapshot = []
+        review_snapshot = []
+        for item_id in normalized_ids:
+            item = self.repository.get_matrix_item(item_id)
+            if not item:
+                raise ValueError(f"Selected matrix item does not exist: {item_id}")
+            review = item.get("review") or {}
+            review_decision = review.get("decision", "")
+            selection_snapshot.append(
+                {
+                    "matrix_item_id": item["id"],
+                    "run_id": item["run_id"],
+                    "requested_run_id": run_id,
+                    "review_status": review_decision,
+                    "export_eligible": is_card_export_eligible(review_decision) and item["run_id"] == run_id,
+                    "dimension_label": item.get("dimension_label", ""),
+                    "outcome_label": item.get("outcome_label", ""),
+                }
+            )
+            review_snapshot.append(
+                {
+                    "matrix_item_id": item["id"],
+                    "decision": review_decision,
+                    "reviewer": review.get("reviewer", ""),
+                    "note": review.get("note", ""),
+                    "created_at": review.get("created_at", ""),
+                }
+            )
+            if item["run_id"] != run_id:
+                raise ValueError(f"Selected matrix item {item_id} belongs to run {item['run_id']}, not {run_id}")
+            if not review_decision:
+                raise ValueError(f"Selected matrix item {item_id} has not been reviewed as accepted")
+            if not is_card_export_eligible(review_decision):
+                raise ValueError(
+                    f"Selected matrix item {item_id} is not export eligible because its review decision is {review_decision}"
+                )
+            matrix_items.append(item)
+        matrix_items.sort(
+            key=lambda item: (
+                item.get("dimension_label", ""),
+                item.get("outcome_label", ""),
+                item.get("created_at", ""),
+                item["id"],
+            )
+        )
+        return {
+            "matrix_items": matrix_items,
+            "requested_matrix_item_ids": normalized_ids,
             "selection_snapshot": selection_snapshot,
             "review_snapshot": review_snapshot,
         }
@@ -5918,8 +7559,14 @@ class RunCoordinator:
         self.executor = ThreadPoolExecutor(max_workers=settings.max_workers)
 
     def create_run(self, topics_text: str, metadata: dict, local_pdfs: list[dict]) -> dict:
+        run_metadata = dict(metadata or {})
+        task_type = normalize_task_type(run_metadata.get("task_type", "aha_exploration"))
+        run_metadata["task_type"] = task_type
+        confirmed_plan = run_metadata.get("confirmed_plan") or {}
         topics = normalize_topics(topics_text)
-        run = self.repository.create_run(topics_text="\n".join(topics), metadata=metadata)
+        if not topics and isinstance(confirmed_plan, dict):
+            topics = derive_topics_from_confirmed_plan(task_type, confirmed_plan)
+        run = self.repository.create_run(topics_text="\n".join(topics), metadata=run_metadata)
         if not topics and not local_pdfs:
             self.repository.update_run_status(run["id"], "failed")
             raise ValueError("At least one topic or one local PDF is required.")
@@ -5932,19 +7579,26 @@ class RunCoordinator:
         local_mapping = self._ingest_local_pdfs(run["id"], topic_records, local_pdfs)
         self.repository.update_run_status(run["id"], "running")
 
-        futures = []
-        for topic, topic_run in zip(topic_records, topic_runs):
-            futures.append(
-                self.executor.submit(
-                    self._process_topic_run,
-                    run["id"],
-                    topic,
-                    topic_run,
-                    local_mapping.get(topic["name"].lower(), []),
+        if task_type == "claim_evidence":
+            threading.Thread(
+                target=self._process_run_serially,
+                args=(run["id"], topic_records, topic_runs, local_mapping),
+                daemon=True,
+            ).start()
+        else:
+            futures = []
+            for topic, topic_run in zip(topic_records, topic_runs):
+                futures.append(
+                    self.executor.submit(
+                        self._process_topic_run,
+                        run["id"],
+                        topic,
+                        topic_run,
+                        local_mapping.get(topic["name"].lower(), []),
+                    )
                 )
-            )
 
-        threading.Thread(target=self._finalize_run, args=(run["id"], futures), daemon=True).start()
+            threading.Thread(target=self._finalize_run, args=(run["id"], futures), daemon=True).start()
         return run
 
     def retry_topic_run(self, topic_run_id: str) -> dict:
@@ -5958,12 +7612,41 @@ class RunCoordinator:
             raise LookupError("Topic not found for topic run")
         local_papers = self.repository.list_local_papers_for_topic_run(topic_run["run_id"], topic_run["topic_id"])
         self.repository.update_run_status(topic_run["run_id"], "running")
-        future = self.executor.submit(self._process_topic_run, topic_run["run_id"], topic, topic_run, local_papers)
-        threading.Thread(target=self._finalize_run, args=(topic_run["run_id"], [future]), daemon=True).start()
+        task_context = self._get_run_task_context(topic_run["run_id"])
+        if normalize_task_type(task_context.get("task_type", "aha_exploration")) == "claim_evidence":
+            threading.Thread(
+                target=self._retry_topic_run_serially,
+                args=(topic_run["run_id"], topic, topic_run, local_papers),
+                daemon=True,
+            ).start()
+        else:
+            future = self.executor.submit(self._process_topic_run, topic_run["run_id"], topic, topic_run, local_papers)
+            threading.Thread(target=self._finalize_run, args=(topic_run["run_id"], [future]), daemon=True).start()
         refreshed = self.repository.get_topic_run(topic_run_id)
         if not refreshed:
             raise LookupError("Topic run disappeared during retry")
         return refreshed
+
+    def _process_run_serially(
+        self,
+        run_id: str,
+        topics: list[dict[str, Any]],
+        topic_runs: list[dict[str, Any]],
+        local_mapping: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        for topic, topic_run in zip(topics, topic_runs):
+            self._process_topic_run(run_id, topic, topic_run, local_mapping.get(topic["name"].lower(), []))
+        self._finalize_run(run_id, [])
+
+    def _retry_topic_run_serially(
+        self,
+        run_id: str,
+        topic: dict[str, Any],
+        topic_run: dict[str, Any],
+        local_papers: list[dict[str, Any]],
+    ) -> None:
+        self._process_topic_run(run_id, topic, topic_run, local_papers)
+        self._finalize_run(run_id, [])
 
     def _mark_topic_progress(
         self,
@@ -5985,15 +7668,26 @@ class RunCoordinator:
             stats.setdefault("processing_warnings", []).append(note)
         self.repository.update_topic_run(topic_run_id, status, stats=stats, started=(status == "running"))
 
-    def _run_discovery_with_budget(self, topic_name: str) -> list[dict]:
+    def _run_discovery_with_budget(self, topic_name: str, *, task_context: Optional[dict[str, Any]] = None) -> list[dict]:
         discovery_executor = ThreadPoolExecutor(max_workers=1)
-        future = discovery_executor.submit(self.discovery.discover, topic_name)
+        strategies = self._build_run_topic_discovery_strategies(topic_name, task_context or {})
+        provider_count = max(1, len(self.discovery.providers))
+        strategy_count = max(1, len(strategies))
+        provider_timeout_budget = strategy_count * provider_count * 8
+        timeout_budget = max(self.settings.discovery_timeout_seconds, provider_timeout_budget + 10)
+        if strategies:
+            future = discovery_executor.submit(self.discovery.discover_with_strategies, topic_name, strategies)
+        else:
+            future = discovery_executor.submit(self.discovery.discover, topic_name)
         try:
-            return future.result(timeout=self.settings.discovery_timeout_seconds)
+            discovered = future.result(timeout=timeout_budget)
+            if normalize_task_type((task_context or {}).get("task_type", "aha_exploration")) == "claim_evidence":
+                return self._rerank_claim_evidence_discovery_candidates(topic_name, discovered, task_context or {})
+            return discovered
         except FutureTimeoutError:
             future.cancel()
             raise TimeoutError(
-                f"Discovery timed out after {self.settings.discovery_timeout_seconds}s for topic '{topic_name}'"
+                f"Discovery timed out after {timeout_budget}s for topic '{topic_name}'"
             ) from None
         finally:
             discovery_executor.shutdown(wait=False, cancel_futures=True)
@@ -6009,7 +7703,7 @@ class RunCoordinator:
             self.repository.replace_cards_for_paper_topic(paper["id"], paper["topic_id"], paper["run_id"], [])
         return paper["id"], parsed_ok
 
-    def _build_cards_for_paper(self, paper: dict, topic: dict, run_id: str) -> int:
+    def _build_cards_for_paper(self, paper: dict, topic: dict, run_id: str, *, active_memory: Optional[dict[str, Any]] = None) -> int:
         current = self.repository.get_paper(paper["id"])
         if not current or current["parse_status"] != "parsed":
             self.repository.replace_cards_for_paper_topic(current["id"] if current else paper["id"], topic["id"], run_id, [])
@@ -6018,7 +7712,52 @@ class RunCoordinator:
         if primary_topic and primary_topic["id"] != topic["id"]:
             self.repository.replace_cards_for_paper_topic(current["id"], topic["id"], run_id, [])
             return 0
-        return self.pipeline.build_cards(current, topic, run_id)
+        return self.pipeline.build_cards(current, topic, run_id, active_memory=active_memory)
+
+    def _build_task_outputs_for_paper(
+        self,
+        paper: dict,
+        topic: dict,
+        run_id: str,
+        *,
+        task_context: Optional[dict[str, Any]] = None,
+    ) -> dict[str, int]:
+        current = self.repository.get_paper(paper["id"])
+        if not current:
+            self.repository.replace_cards_for_paper_topic(paper["id"], topic["id"], run_id, [])
+            self.repository.replace_matrix_items_for_paper_topic(paper["id"], topic["id"], run_id, [])
+            return {"cards": 0, "matrix_items": 0}
+        resolved_context = task_context or {}
+        active_memory = resolved_context.get("active_memory_snapshot") if isinstance(resolved_context.get("active_memory_snapshot"), dict) else None
+        task_type = normalize_task_type(resolved_context.get("task_type", "aha_exploration"))
+        if task_type == "claim_evidence":
+            matrix_count = self.pipeline.build_matrix_items(
+                current,
+                topic,
+                run_id,
+                claim_plan=resolved_context.get("confirmed_plan", {}),
+                active_memory=active_memory,
+            )
+            card_count = 0
+            if resolved_context.get("also_generate_aha_cards"):
+                card_count = self.pipeline.build_cards(current, topic, run_id, active_memory=active_memory)
+            else:
+                self.repository.replace_cards_for_paper_topic(current["id"], topic["id"], run_id, [])
+            return {"cards": card_count, "matrix_items": matrix_count}
+        primary_topic = self._resolve_primary_topic_for_paper_run(paper["id"], run_id)
+        if primary_topic and primary_topic["id"] != topic["id"]:
+            self.repository.replace_cards_for_paper_topic(current["id"], topic["id"], run_id, [])
+            self.repository.replace_matrix_items_for_paper_topic(current["id"], topic["id"], run_id, [])
+            return {"cards": 0, "matrix_items": 0}
+        if current["parse_status"] != "parsed":
+            self.repository.replace_cards_for_paper_topic(current["id"], topic["id"], run_id, [])
+            self.repository.replace_matrix_items_for_paper_topic(current["id"], topic["id"], run_id, [])
+            return {"cards": 0, "matrix_items": 0}
+        self.repository.replace_matrix_items_for_paper_topic(current["id"], topic["id"], run_id, [])
+        return {
+            "cards": self.pipeline.build_cards(current, topic, run_id, active_memory=active_memory),
+            "matrix_items": 0,
+        }
 
     def _build_run_topic_priority(self, run_id: str) -> dict[str, int]:
         run = self.repository.get_run(run_id)
@@ -6028,6 +7767,182 @@ class RunCoordinator:
         if "manual-import" not in priority:
             priority["manual-import"] = max(priority.values(), default=0) + 1
         return priority
+
+    def _get_run_task_context(self, run_id: str) -> dict[str, Any]:
+        run = self.repository.get_run(run_id) or {}
+        metadata = dict(run.get("metadata", {}) or {})
+        task_type = normalize_task_type(metadata.get("task_type", "aha_exploration"))
+        confirmed_plan = metadata.get("confirmed_plan", {}) if isinstance(metadata.get("confirmed_plan", {}), dict) else {}
+        active_memory = metadata.get("active_memory_snapshot", {}) if isinstance(metadata.get("active_memory_snapshot", {}), dict) else {}
+        return {
+            "task_type": task_type,
+            "confirmed_plan": confirmed_plan,
+            "active_memory_snapshot": active_memory,
+            "also_generate_aha_cards": bool(confirmed_plan.get("also_generate_aha_cards", False)),
+            "research_brief": str(metadata.get("task_brief", "") or metadata.get("research_brief", "")).strip(),
+        }
+
+    def _build_run_topic_discovery_strategies(self, topic_name: str, task_context: dict[str, Any]) -> list[dict[str, Any]]:
+        if normalize_task_type(task_context.get("task_type", "aha_exploration")) != "claim_evidence":
+            return []
+        topic_entry = self.pipeline._resolve_claim_plan_topic_entry(task_context.get("confirmed_plan", {}), topic_name)
+        return build_claim_evidence_search_strategies(
+            str(topic_entry.get("query_anchor", "") or topic_name).strip(),
+            outcome_terms=topic_entry.get("outcome_terms", []),
+            dimension_key=str(topic_entry.get("dimension_key", "")).strip(),
+            claim_text=str((task_context.get("confirmed_plan", {}) or {}).get("claim", "")).strip(),
+            research_brief=str(task_context.get("research_brief", "")).strip(),
+        )
+
+    def _score_claim_evidence_text_candidate(
+        self,
+        *,
+        title: str,
+        abstract_text: str,
+        asset_url: str,
+        publication_year: Optional[int],
+        confidence: float,
+        topic_entry: dict[str, Any],
+        task_context: dict[str, Any],
+    ) -> float:
+        cleaned_title = _clean_metadata_abstract(title)
+        cleaned_abstract = _clean_metadata_abstract(abstract_text)
+        title_lower = cleaned_title.lower()
+        abstract_lower = cleaned_abstract.lower()
+        combined = _joined_lower_text(cleaned_title, cleaned_abstract)
+        if _title_has_claim_evidence_noise(cleaned_title):
+            return -100.0
+        score = max(float(confidence or 0.0), 0.0) * 3.0
+        if asset_url:
+            score += 4.0
+        if cleaned_abstract:
+            score += 2.0
+        if any(token in combined for token in WORKPLACE_DIRECT_EVIDENCE_TOKENS):
+            score += 6.0
+        else:
+            score -= 4.0
+        if any(token in title_lower for token in OFFDOMAIN_CLAIM_EVIDENCE_TITLE_TOKENS):
+            score -= 15.0
+
+        dimension_key = str(topic_entry.get("dimension_key", "")).strip().lower()
+        dimension_anchor = str(topic_entry.get("query_anchor", "") or "").strip()
+        dimension_expansions = WORKPLACE_DIMENSION_QUERY_EXPANSIONS.get(dimension_key, ())
+        outcome_terms = [str(item or "").strip() for item in topic_entry.get("outcome_terms", []) if str(item or "").strip()]
+
+        for phrase in [dimension_anchor, *dimension_expansions, *outcome_terms]:
+            normalized_phrase = _clean_metadata_abstract(phrase).lower()
+            if not normalized_phrase:
+                continue
+            if normalized_phrase in combined:
+                score += 3.5
+
+        keywords = _keywordize_claim_text(
+            dimension_anchor,
+            " ".join(dimension_expansions),
+            " ".join(outcome_terms),
+            task_context.get("research_brief", ""),
+            (task_context.get("confirmed_plan", {}) or {}).get("claim", ""),
+        )
+        title_hits = sum(1 for keyword in keywords if keyword in title_lower)
+        abstract_hits = sum(1 for keyword in keywords if keyword in abstract_lower)
+        score += title_hits * 1.25
+        score += abstract_hits * 0.4
+
+        if publication_year:
+            score += max(min(int(publication_year) - 2000, 25), 0) * 0.04
+        return score
+
+    def _rerank_claim_evidence_discovery_candidates(
+        self,
+        topic_name: str,
+        candidates: list[dict[str, Any]],
+        task_context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not candidates:
+            return []
+        topic_entry = self.pipeline._resolve_claim_plan_topic_entry(task_context.get("confirmed_plan", {}), topic_name)
+        target_items = int(
+            ((task_context.get("confirmed_plan", {}) or {}).get("evidence_policy", {}) or {}).get(
+                "minimum_supporting_papers_per_dimension",
+                3,
+            )
+            or 3
+        )
+        candidate_cap = max(CLAIM_EVIDENCE_DISCOVERY_CANDIDATE_CAP, target_items * 8)
+        scored: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if _title_has_claim_evidence_noise(str(candidate.get("title", "")).strip()):
+                continue
+            abstract_text = _extract_candidate_metadata_abstract(candidate)
+            claim_score = self._score_claim_evidence_text_candidate(
+                title=str(candidate.get("title", "")).strip(),
+                abstract_text=abstract_text,
+                asset_url=str(candidate.get("asset_url", "")).strip(),
+                publication_year=candidate.get("publication_year"),
+                confidence=float(candidate.get("confidence", 0.0) or 0.0),
+                topic_entry=topic_entry,
+                task_context=task_context,
+            )
+            enriched = dict(candidate)
+            enriched["claim_candidate_score"] = round(claim_score, 4)
+            scored.append(enriched)
+        scored.sort(
+            key=lambda item: (
+                -float(item.get("claim_candidate_score", 0.0)),
+                -(1 if item.get("asset_url") else 0),
+                -(item.get("publication_year") or 0),
+                str(item.get("title", "")).lower(),
+            )
+        )
+        return scored[:candidate_cap]
+
+    def _matrix_item_is_abstract_only(self, item: dict[str, Any]) -> bool:
+        supporting_ids = list(item.get("supporting_section_ids", []) or [])
+        return bool(supporting_ids and all(str(section_id).startswith("abstract_meta::") for section_id in supporting_ids))
+
+    def _claim_evidence_target_item_count(self, task_context: dict[str, Any]) -> int:
+        return int(
+            ((task_context.get("confirmed_plan", {}) or {}).get("evidence_policy", {}) or {}).get(
+                "minimum_supporting_papers_per_dimension",
+                3,
+            )
+            or 3
+        )
+
+    def _list_topic_matrix_items(self, run_id: str, topic_name: str) -> list[dict[str, Any]]:
+        return self.repository.list_matrix_items(run_id=run_id, topic=topic_name)
+
+    def _rank_claim_evidence_abstract_fallback_papers(
+        self,
+        fallback_papers: list[dict[str, Any]],
+        topic: dict[str, Any],
+        task_context: dict[str, Any],
+    ) -> list[tuple[float, dict[str, Any]]]:
+        unique_papers = {paper["id"]: paper for paper in fallback_papers}
+        if not unique_papers:
+            return []
+        topic_entry = self.pipeline._resolve_claim_plan_topic_entry(task_context.get("confirmed_plan", {}), topic["name"])
+        ranked = []
+        for paper in unique_papers.values():
+            if _title_has_claim_evidence_noise(str(paper.get("title", "")).strip()):
+                continue
+            abstract_text = self.pipeline._extract_best_metadata_abstract_for_paper(paper["id"])
+            if not abstract_text:
+                continue
+            score = self._score_claim_evidence_text_candidate(
+                title=str(paper.get("title", "")).strip(),
+                abstract_text=abstract_text,
+                asset_url="",
+                publication_year=paper.get("publication_year"),
+                confidence=0.25,
+                topic_entry=topic_entry,
+                task_context=task_context,
+            )
+            if score <= -50:
+                continue
+            ranked.append((score, paper))
+        ranked.sort(key=lambda item: (-item[0], -(item[1].get("publication_year") or 0), str(item[1].get("title", "")).lower()))
+        return ranked
 
     def _resolve_primary_topic_from_routes(self, run_id: str, topic_routes: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
         if not topic_routes:
@@ -6142,10 +8057,25 @@ class RunCoordinator:
         return strategy_records
 
     def _build_topic_run_metrics(self, run_id: str, topic: dict, topic_run: dict, stats: dict[str, Any]) -> dict[str, Any]:
+        task_context = self._get_run_task_context(run_id)
         cards = self.repository.list_cards(run_id=run_id, topic=topic["name"])
+        matrix_items = self.repository.list_matrix_items(run_id=run_id, topic=topic["name"])
         strategies = self.repository.list_discovery_strategies(topic_run_id=topic_run["id"])
         discovery_results = self.repository.list_discovery_results(topic_run_id=topic_run["id"])
         papers = {paper["id"]: paper for paper in self.repository.list_papers_for_topic_run(run_id, topic["id"])}
+        if task_context["task_type"] == "claim_evidence":
+            verdict_counts: dict[str, int] = {}
+            dimension_counts: dict[str, int] = {}
+            for item in matrix_items:
+                verdict = str(item.get("verdict", "")).strip() or "unknown"
+                verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+                dimension = str(item.get("dimension_label", "") or item.get("dimension_key", "")).strip() or topic["name"]
+                dimension_counts[dimension] = dimension_counts.get(dimension, 0) + 1
+            stats["claim_evidence_metrics"] = {
+                "matrix_item_count": len(matrix_items),
+                "verdict_counts": verdict_counts,
+                "dimension_counts": dimension_counts,
+            }
         cross_topic_resurfaced_papers = 0
         suppressed_cross_topic_papers = 0
         primary_topic_papers = 0
@@ -6309,12 +8239,15 @@ class RunCoordinator:
         run_id: str,
         topic_run: dict,
         stats: dict[str, Any],
+        task_context: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         unique_papers = {paper["id"]: paper for paper in accessible_papers}
         stats["accessible"] = len(unique_papers)
         if not unique_papers:
             return stats
-        paper_worker_count = max(1, min(self.settings.max_workers, len(unique_papers)))
+        task_type = normalize_task_type((task_context or {}).get("task_type", "aha_exploration"))
+        paper_worker_cap = 1 if task_type == "claim_evidence" else self.settings.max_workers
+        paper_worker_count = max(1, min(paper_worker_cap, len(unique_papers)))
 
         self._mark_topic_progress(topic_run["id"], stats, stage="parsing")
         parsed_papers: list[dict] = []
@@ -6352,30 +8285,114 @@ class RunCoordinator:
         if not parsed_papers:
             return stats
 
-        self._mark_topic_progress(topic_run["id"], stats, stage="card_generation")
-        with ThreadPoolExecutor(max_workers=max(1, min(self.settings.max_workers, len(parsed_papers)))) as paper_executor:
-            futures = [paper_executor.submit(self._build_cards_for_paper, paper, topic, run_id) for paper in parsed_papers]
+        generation_stage = "matrix_generation" if task_type == "claim_evidence" else "card_generation"
+        self._mark_topic_progress(topic_run["id"], stats, stage=generation_stage)
+        generation_worker_cap = 1 if task_type == "claim_evidence" else self.settings.max_workers
+        with ThreadPoolExecutor(max_workers=max(1, min(generation_worker_cap, len(parsed_papers)))) as paper_executor:
+            futures = [
+                paper_executor.submit(
+                    self._build_task_outputs_for_paper,
+                    paper,
+                    topic,
+                    run_id,
+                    task_context=task_context,
+                )
+                for paper in parsed_papers
+            ]
             for future in as_completed(futures):
                 try:
                     stats["card_generation_attempts"] += 1
-                    stats["cards"] += future.result()
+                    output_counts = future.result()
+                    stats["cards"] += int(output_counts.get("cards", 0) or 0)
+                    stats["matrix_items"] += int(output_counts.get("matrix_items", 0) or 0)
                 except Exception as error:
                     stats["paper_processing_errors"] += 1
-                    stats["processing_warnings"].append(f"card_generation_failed:{error}")
+                    stats["processing_warnings"].append(f"{generation_stage}_failed:{error}")
                     append_failure_log(
                         stats,
-                        stage="card_generation",
-                        code="card_generation_failed",
+                        stage=generation_stage,
+                        code=f"{generation_stage}_failed",
                         message=str(error),
                     )
-                self._mark_topic_progress(topic_run["id"], stats, stage="card_generation")
+                self._mark_topic_progress(topic_run["id"], stats, stage=generation_stage)
+        return stats
+
+    def _process_claim_evidence_abstract_fallback_papers(
+        self,
+        fallback_papers: list[dict],
+        topic: dict,
+        run_id: str,
+        topic_run: dict,
+        stats: dict[str, Any],
+        *,
+        task_context: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        resolved_context = task_context or {}
+        ranked_papers = self._rank_claim_evidence_abstract_fallback_papers(
+            fallback_papers,
+            topic,
+            resolved_context,
+        )
+        if not ranked_papers:
+            return stats
+        target_items = self._claim_evidence_target_item_count(resolved_context)
+        existing_items = self._list_topic_matrix_items(run_id, topic["name"])
+        current_total = len(existing_items)
+        if current_total >= target_items:
+            return stats
+        current_abstract_only = sum(1 for item in existing_items if self._matrix_item_is_abstract_only(item))
+        fulltext_items = [item for item in existing_items if not self._matrix_item_is_abstract_only(item)]
+        abstract_allowance = max(0, target_items - current_total)
+        if not fulltext_items:
+            abstract_allowance = max(abstract_allowance, CLAIM_EVIDENCE_MAX_ABSTRACT_FALLBACK_ITEMS_NO_FULLTEXT)
+        else:
+            abstract_allowance = max(abstract_allowance, CLAIM_EVIDENCE_MAX_ABSTRACT_FALLBACK_ITEMS_WITH_FULLTEXT)
+        attempt_budget = min(len(ranked_papers), max(abstract_allowance * 3, 3), CLAIM_EVIDENCE_MAX_ABSTRACT_FALLBACK_PAPER_ATTEMPTS)
+        if attempt_budget <= 0:
+            return stats
+        self._mark_topic_progress(topic_run["id"], stats, stage="matrix_generation")
+        attempted: set[str] = set()
+        for _, paper in ranked_papers[:attempt_budget]:
+            if paper["id"] in attempted:
+                continue
+            if current_total >= target_items:
+                break
+            if current_abstract_only >= abstract_allowance and current_total > 0:
+                break
+            attempted.add(paper["id"])
+            try:
+                stats["card_generation_attempts"] += 1
+                before_ids = {item["id"] for item in self._list_topic_matrix_items(run_id, topic["name"])}
+                output_counts = self._build_task_outputs_for_paper(
+                    paper,
+                    topic,
+                    run_id,
+                    task_context=resolved_context,
+                )
+                stats["cards"] += int(output_counts.get("cards", 0) or 0)
+                stats["matrix_items"] += int(output_counts.get("matrix_items", 0) or 0)
+                after_items = self._list_topic_matrix_items(run_id, topic["name"])
+                current_total = len(after_items)
+                new_items = [item for item in after_items if item["id"] not in before_ids]
+                current_abstract_only += sum(1 for item in new_items if self._matrix_item_is_abstract_only(item))
+            except Exception as error:
+                stats["paper_processing_errors"] += 1
+                stats["processing_warnings"].append(f"matrix_generation_failed:{error}")
+                append_failure_log(
+                    stats,
+                    stage="matrix_generation",
+                    code="matrix_generation_failed",
+                    message=str(error),
+                )
+            self._mark_topic_progress(topic_run["id"], stats, stage="matrix_generation")
         return stats
 
     def _process_topic_run(self, run_id: str, topic: dict, topic_run: dict, local_papers: list[dict]) -> None:
         stats = initial_topic_run_stats()
+        task_context = self._get_run_task_context(run_id)
         try:
             self._mark_topic_progress(topic_run["id"], stats, stage="discovery")
-            discovered = self._run_discovery_with_budget(topic["name"])
+            discovered = self._run_discovery_with_budget(topic["name"], task_context=task_context)
             raw_discovered = sum(len(item.get("discovery_sources", [])) or 1 for item in discovered)
             strategy_records = self._create_discovery_strategy_records(run_id, topic, topic_run, discovered)
             stats["discovered"] = len(discovered)
@@ -6394,6 +8411,7 @@ class RunCoordinator:
                 summary["deduped_candidates"] += 1
             stats["provider_summary"] = provider_summary
             accessible_papers = list(local_papers)
+            abstract_fallback_papers: list[dict] = []
             self._mark_topic_progress(topic_run["id"], stats, stage="acquisition")
             for item in discovered:
                 try:
@@ -6490,6 +8508,10 @@ class RunCoordinator:
                             run_id=run_id,
                             reason="Relevant paper discovered but full text could not be acquired automatically.",
                         )
+                        if task_context["task_type"] == "claim_evidence":
+                            refreshed_paper = self.repository.get_paper(paper["id"]) or paper
+                            if self.pipeline._build_claim_evidence_abstract_fallback_sections(refreshed_paper):
+                                abstract_fallback_papers.append(refreshed_paper)
                     self._mark_topic_progress(topic_run["id"], stats, stage="acquisition")
                 except Exception as error:
                     stats["processing_warnings"].append(
@@ -6504,9 +8526,26 @@ class RunCoordinator:
                     self._mark_topic_progress(topic_run["id"], stats, stage="acquisition")
                     continue
 
-            stats = self._process_accessible_papers(accessible_papers, topic, run_id, topic_run, stats)
+            stats = self._process_accessible_papers(
+                accessible_papers,
+                topic,
+                run_id,
+                topic_run,
+                stats,
+                task_context=task_context,
+            )
+            if task_context["task_type"] == "claim_evidence" and abstract_fallback_papers:
+                stats = self._process_claim_evidence_abstract_fallback_papers(
+                    abstract_fallback_papers,
+                    topic,
+                    run_id,
+                    topic_run,
+                    stats,
+                    task_context=task_context,
+                )
             stats = self._build_topic_run_metrics(run_id, topic, topic_run, stats)
-            stats = self._attach_topic_stop_decision(topic, stats)
+            if task_context["task_type"] == "aha_exploration":
+                stats = self._attach_topic_stop_decision(topic, stats)
             self._mark_topic_progress(topic_run["id"], stats, stage="review_ready")
             self.repository.create_topic_saturation_snapshot(
                 run_id=run_id,
@@ -6531,4 +8570,8 @@ class RunCoordinator:
                 future.result()
             except Exception:
                 continue
-        self._refresh_run_status_from_topics(run_id)
+        try:
+            self._refresh_run_status_from_topics(run_id)
+        except sqlite3.OperationalError as error:
+            if "unable to open database file" not in str(error).lower():
+                raise

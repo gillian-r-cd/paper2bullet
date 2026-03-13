@@ -299,6 +299,97 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
             self.repository.create_review_decision("card", card_id, "tester", review_decision, f"review:{review_decision}")
         return {"run": run, "topic": topic, "paper": paper, "card_id": card_id}
 
+    def _create_matrix_item_fixture(
+        self,
+        *,
+        matrix_item_id: str,
+        review_decision: str | None,
+        run: dict | None = None,
+    ) -> dict:
+        run = run or self.repository.create_run(
+            "",
+            {
+                "operator": "tester",
+                "task_type": "claim_evidence",
+                "confirmed_plan": {
+                    "claim": "Manager dialogue quality improves leadership effectiveness.",
+                    "search_topics": [
+                        {
+                            "topic_name": "表达",
+                            "dimension_key": "expression",
+                            "dimension_label": "表达",
+                            "query_anchor": "leader communication clarity",
+                            "outcome_terms": ["leadership effectiveness", "team performance"],
+                        }
+                    ],
+                    "outcomes": ["leadership effectiveness", "team performance"],
+                },
+            },
+        )
+        topic = self.repository.create_or_get_topic("表达")
+        paper = self.repository.create_or_get_paper(
+            title=f"Matrix Paper {matrix_item_id}",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id=f"paper::matrix::{matrix_item_id}",
+            source_type="local",
+            local_path="",
+            original_url="https://example.com/matrix-paper",
+            access_status="open_fulltext",
+            ingestion_status="ready",
+            parse_status="parsed",
+            artifact_path="",
+        )
+        self.repository.link_paper_to_topic(paper["id"], topic["id"], run["id"], "local_pdf")
+        self.repository.replace_sections(
+            paper["id"],
+            [
+                {
+                    "id": f"section_{matrix_item_id}",
+                    "section_order": 1,
+                    "section_title": "Results",
+                    "paragraph_text": "Leaders who were perceived as strong listeners produced higher psychological safety and stronger team commitment.",
+                    "page_number": 3,
+                    "embedding": [0.0] * 64,
+                }
+            ],
+        )
+        self.repository.replace_matrix_items_for_paper_topic(
+            paper["id"],
+            topic["id"],
+            run["id"],
+            [
+                {
+                    "id": matrix_item_id,
+                    "dimension_key": "expression",
+                    "dimension_label": "表达",
+                    "outcome_key": "team_performance",
+                    "outcome_label": "team performance",
+                    "claim_text": "Manager dialogue quality improves leadership effectiveness and team performance.",
+                    "verdict": "supporting",
+                    "evidence_strength": "strong",
+                    "summary": "这篇论文支持管理对话中的表达质量会改善团队绩效。",
+                    "limitation_text": "研究主要基于心理安全与承诺，并非所有绩效指标。",
+                    "citation_text": "Test Author, 2026",
+                    "evidence": [
+                        {
+                            "section_id": f"section_{matrix_item_id}",
+                            "quote": "Leaders who were perceived as strong listeners produced higher psychological safety and stronger team commitment.",
+                            "quote_zh": "被感知为强倾听者的领导，会带来更高的心理安全与更强的团队承诺。",
+                            "analysis": "这说明管理对话中的高质量表达与倾听会带来更好的团队结果。",
+                            "page_number": 3,
+                        }
+                    ],
+                    "figure_ids": [],
+                    "supporting_section_ids": [f"section_{matrix_item_id}"],
+                    "created_at": "2026-03-06T00:00:03+00:00",
+                }
+            ],
+        )
+        if review_decision:
+            self.repository.create_review_decision("matrix_item", matrix_item_id, "tester", review_decision, f"review:{review_decision}")
+        return {"run": run, "topic": topic, "paper": paper, "matrix_item_id": matrix_item_id}
+
     def test_local_pdf_to_export_flow(self) -> None:
         source_pdf = Path(self.temp_dir.name) / "adaptive-selling.pdf"
         source_pdf.write_bytes(
@@ -1060,6 +1151,163 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("LLM provider is not enabled", response.text)
+
+    def test_research_plan_draft_api_returns_claim_plan(self) -> None:
+        with patch("app.main.LLMCardEngine.is_enabled", return_value=True), patch(
+            "app.main.LLMCardEngine.draft_research_plan",
+            return_value={
+                "suggested_task_type": "claim_evidence",
+                "summary": "Use one topic per claim dimension.",
+                "claim": "Five dialogue dimensions improve leadership effectiveness and team performance.",
+                "search_topics": [
+                    {
+                        "topic_name": "表达",
+                        "dimension_key": "expression",
+                        "dimension_label": "表达",
+                        "query_anchor": "leader communication clarity",
+                        "outcome_terms": ["leadership effectiveness", "team performance"],
+                    }
+                ],
+                "outcomes": ["leadership effectiveness", "team performance"],
+                "evidence_policy": {"surface_contradictions": True, "minimum_supporting_papers_per_dimension": 3},
+                "also_generate_aha_cards": False,
+            },
+        ):
+            response = self.client.post(
+                "/api/research-plans/draft",
+                json={
+                    "research_brief": "Please find evidence for five dialogue dimensions and their impact on leadership and team performance.",
+                    "task_type": "claim_evidence",
+                    "max_terms": 6,
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        plan = response.json()["plan"]
+        self.assertEqual(plan["task_type"], "claim_evidence")
+        self.assertEqual(plan["search_topics"][0]["dimension_label"], "表达")
+        self.assertEqual(plan["confirmed_topics_text"], "表达")
+
+    def test_claim_run_uses_confirmed_plan_topics_and_active_memory(self) -> None:
+        active_memory_path = self.settings.preference_memory_dir / "active_memory.json"
+        active_memory_path.write_text(
+            json.dumps(
+                {
+                    "id": "memory_active",
+                    "summary": "Prefer direct evidence.",
+                    "prefer": ["Prefer direct empirical evidence."],
+                    "avoid": ["Avoid context-only evidence."],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        response = self.client.post(
+            "/api/runs",
+            json={
+                "topics_text": "",
+                "research_brief": "Find claim evidence for manager dialogue quality.",
+                "task_type": "claim_evidence",
+                "confirmed_plan": {
+                    "claim": "Manager dialogue quality improves leadership effectiveness.",
+                    "search_topics": [
+                        {
+                            "topic_name": "表达",
+                            "dimension_key": "expression",
+                            "dimension_label": "表达",
+                            "query_anchor": "leader communication clarity",
+                            "outcome_terms": ["leadership effectiveness", "team performance"],
+                        }
+                    ],
+                    "outcomes": ["leadership effectiveness", "team performance"],
+                },
+                "metadata": {"operator": "tester"},
+                "use_active_memory": True,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        run_id = response.json()["run"]["id"]
+        run_response = self.client.get(f"/api/runs/{run_id}")
+        self.assertEqual(run_response.status_code, 200, run_response.text)
+        run_payload = run_response.json()["run"]
+        self.assertEqual(run_payload["metadata"]["task_type"], "claim_evidence")
+        self.assertEqual(run_payload["topics_text"], "表达")
+        self.assertEqual(run_payload["metadata"]["active_memory_snapshot"]["id"], "memory_active")
+
+    def test_review_items_api_supports_matrix_items(self) -> None:
+        fixture = self._create_matrix_item_fixture(matrix_item_id="matrix_review", review_decision="accepted")
+        response = self.client.get(
+            "/api/review-items",
+            params={"run_id": fixture["run"]["id"], "item_type": "matrix", "review_status": "accepted"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        items = response.json()["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["object_type"], "matrix_item")
+        self.assertEqual(items[0]["dimension_label"], "表达")
+        detail = self.client.get(f"/api/review-items/matrix_item/{fixture['matrix_item_id']}")
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["item"]["verdict"], "supporting")
+
+    def test_matrix_export_endpoint_builds_google_doc_artifact(self) -> None:
+        fixture = self._create_matrix_item_fixture(matrix_item_id="matrix_export", review_decision="accepted")
+        response = self.client.post(
+            "/api/exports/google-doc",
+            json={
+                "run_id": fixture["run"]["id"],
+                "export_kind": "matrix_items",
+                "matrix_item_ids": [fixture["matrix_item_id"]],
+                "document_title": "Matrix Export",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        export_record = response.json()["export"]
+        markdown_path = Path(export_record["markdown_path"])
+        self.assertTrue(markdown_path.exists())
+        self.assertIn("team performance", markdown_path.read_text(encoding="utf-8"))
+
+    def test_paper_qa_endpoint_returns_grounded_answer(self) -> None:
+        fixture = self._create_export_card_fixture(card_id="card_for_qa", review_decision="accepted")
+        with patch("app.main.LLMCardEngine.is_enabled", return_value=True), patch(
+            "app.main.LLMCardEngine.answer_paper_question",
+            return_value={
+                "answer": "论文指出，显式冲突检查是提升质量的关键。",
+                "confidence_note": "证据集中在一个核心段落，支持较直接。",
+                "cannot_answer_from_paper": False,
+                "used_section_ids": [f"section_{fixture['card_id']}"],
+                "used_figure_ids": [],
+            },
+        ):
+            response = self.client.post(
+                f"/api/papers/{fixture['paper']['id']}/qa",
+                json={"question": "What improves quality according to this paper?", "max_sections": 4},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        answer = response.json()["answer"]
+        self.assertIn("显式冲突检查", answer["answer"])
+        self.assertEqual(answer["used_section_ids"], [f"section_{fixture['card_id']}"])
+
+    def test_memory_draft_and_activate_endpoints(self) -> None:
+        fixture = self._create_matrix_item_fixture(matrix_item_id="matrix_memory", review_decision="accepted")
+        draft_response = self.client.post(
+            "/api/memory/draft",
+            json={"task_type": "claim_evidence", "run_id": fixture["run"]["id"], "reviewer": "tester"},
+        )
+        self.assertEqual(draft_response.status_code, 200, draft_response.text)
+        memory_draft = draft_response.json()["memory_draft"]
+        self.assertEqual(memory_draft["source_task_type"], "claim_evidence")
+        self.assertGreaterEqual(memory_draft["signal_count"], 1)
+
+        activate_response = self.client.post(
+            "/api/memory/activate",
+            json={"reviewer": "tester", "memory_draft": memory_draft},
+        )
+        self.assertEqual(activate_response.status_code, 200, activate_response.text)
+        active_memory = activate_response.json()["active_memory"]
+        self.assertEqual(active_memory["status"], "active")
+
+        active_response = self.client.get("/api/memory/active")
+        self.assertEqual(active_response.status_code, 200, active_response.text)
+        self.assertEqual(active_response.json()["active_memory"]["id"], active_memory["id"])
 
     def test_review_items_csv_export_respects_filters(self) -> None:
         accepted = self._create_export_card_fixture(card_id="card_csv_accepted", review_decision="accepted")

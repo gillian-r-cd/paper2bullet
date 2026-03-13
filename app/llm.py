@@ -23,6 +23,10 @@ JUDGEMENT_PROMPT_VERSION = "llm-card-judge-v10-causal-reconstruction-zh"
 CARD_RUBRIC_VERSION = "llm-card-rubric-v8-causal-reconstruction"
 UNDERSTANDING_PROMPT_VERSION = "llm-paper-understanding-v6-causal-reconstruction"
 CARD_PLAN_PROMPT_VERSION = "llm-card-plan-v8-causal-reconstruction"
+RESEARCH_PLAN_PROMPT_VERSION = "llm-research-plan-v1-dual-mode"
+CLAIM_EVIDENCE_PROMPT_VERSION = "llm-claim-evidence-v4-strict-evidence-translation"
+PAPER_QA_PROMPT_VERSION = "llm-paper-qa-v1-grounded"
+PREFERENCE_MEMORY_PROMPT_VERSION = "llm-preference-memory-v1"
 MAX_PROMPT_SECTIONS = 14
 MAX_PROMPT_FIGURES = 4
 MAX_CALIBRATION_EXAMPLES = 6
@@ -88,6 +92,48 @@ PROMPT_VERSION_RECORDS = [
             "checks_reportable_aha_strength": True,
             "ontology_primary_axis": "old_model_to_new_model_then_course_use",
             "max_calibration_examples": MAX_CALIBRATION_EXAMPLES,
+        },
+    },
+    {
+        "version": RESEARCH_PLAN_PROMPT_VERSION,
+        "stage": "research_planning",
+        "summary": "Dual-mode research planning that classifies the task, drafts a structured search plan, and keeps the output directly executable.",
+        "details": {
+            "supports_dual_mode": True,
+            "modes": ["aha_exploration", "claim_evidence"],
+            "requires_confirmable_plan": True,
+        },
+    },
+    {
+        "version": CLAIM_EVIDENCE_PROMPT_VERSION,
+        "stage": "claim_evidence_generation",
+        "summary": "Grounded claim-evidence generation that turns one parsed paper into evidence matrix items while rejecting cross-domain analogies that are not direct evidence for the claim context.",
+        "details": {
+            "output_type": "matrix_item",
+            "requires_section_grounding": True,
+            "surfaces_limitations": True,
+            "surfaces_contradictions": True,
+            "rejects_cross_domain_analogies": True,
+        },
+    },
+    {
+        "version": PAPER_QA_PROMPT_VERSION,
+        "stage": "paper_qa",
+        "summary": "Single-paper grounded question answering over retrieved sections and linked figures.",
+        "details": {
+            "grounded_only": True,
+            "single_paper_only": True,
+            "requires_section_ids": True,
+        },
+    },
+    {
+        "version": PREFERENCE_MEMORY_PROMPT_VERSION,
+        "stage": "preference_memory",
+        "summary": "Preference-memory distillation from explicit accept/reject/comment signals into a human-confirmable memory draft.",
+        "details": {
+            "human_confirmed_loop": True,
+            "no_automatic_activation": True,
+            "source_of_truth": "review decisions and comments",
         },
     },
 ]
@@ -301,15 +347,59 @@ def looks_like_complete_translation(source_text: str, translated_text: str) -> b
     if not is_readable_text(source) or not is_readable_text(translated):
         return False
 
+    normalized_translated = re.sub(r"\s+", "", translated)
+    normalized_source = re.sub(r"\s+", " ", source.lower())
+    meta_summary_prefixes = (
+        "文中提到",
+        "文中指出",
+        "文章提到",
+        "文章指出",
+        "本文提到",
+        "本文指出",
+        "该文提到",
+        "该文指出",
+        "作者提到",
+        "作者指出",
+        "研究提到",
+        "研究指出",
+        "研究发现",
+        "该研究提到",
+        "该研究指出",
+        "该研究发现",
+        "这段话提到",
+        "这段证据提到",
+    )
+    source_has_self_reference = normalized_source.startswith(
+        (
+            "this study",
+            "the study",
+            "this paper",
+            "the paper",
+            "this article",
+            "the article",
+            "authors",
+            "the authors",
+            "we ",
+            "our ",
+        )
+    )
+    if any(normalized_translated.startswith(prefix) for prefix in meta_summary_prefixes) and not source_has_self_reference:
+        return False
+
     source_length = compact_text_length(source)
     translated_length = compact_text_length(translated)
     if source_length < 80:
-        return translated_length >= 10
+        return translated_length >= 12
     if source_length < 160:
-        return translated_length >= max(18, int(source_length * 0.16))
+        return translated_length >= max(24, int(source_length * 0.2))
     if source_length < 320:
-        return translated_length >= max(32, int(source_length * 0.18))
-    return translated_length >= max(60, int(source_length * 0.2))
+        return translated_length >= max(40, int(source_length * 0.23))
+
+    source_sentence_count = len([part for part in re.split(r"[.!?;:]+", source) if compact_text_length(part) >= 24])
+    translated_sentence_count = len([part for part in re.split(r"[。！？；：]+", translated) if compact_text_length(part) >= 8])
+    if source_sentence_count >= 3 and translated_sentence_count < max(2, int(source_sentence_count * 0.5)):
+        return False
+    return translated_length >= max(72, int(source_length * 0.26))
 
 
 @dataclass(frozen=True)
@@ -545,6 +635,10 @@ class LLMRouter:
                 ("anthropic", "openai_compatible", "gemini"),
                 prefer_provider_type_before_priority=True,
             ),
+            "research_planning": StageRoutePolicy("research_planning", ("anthropic", "openai_compatible", "gemini")),
+            "claim_evidence_generation": StageRoutePolicy("claim_evidence_generation", ("anthropic", "openai_compatible", "gemini")),
+            "paper_qa": StageRoutePolicy("paper_qa", ("anthropic", "openai_compatible", "gemini")),
+            "preference_memory": StageRoutePolicy("preference_memory", ("anthropic", "openai_compatible", "gemini")),
             "smoke": StageRoutePolicy("smoke", ("anthropic", "openai_compatible", "gemini")),
         }
         for provider in self.providers:
@@ -1036,6 +1130,7 @@ class LLMCardEngine:
         planning_context: Optional[dict[str, Any]] = None,
         calibration_examples: Optional[list[dict]] = None,
         calibration_set_name: str = "",
+        active_memory: Optional[dict[str, Any]] = None,
     ) -> dict[str, list[dict]]:
         if not self.client:
             return {"cards": [], "excluded_content": []}
@@ -1055,6 +1150,7 @@ class LLMCardEngine:
                 calibration_examples=selected_examples,
                 stage_examples=stage_examples,
                 calibration_set_name=calibration_set_name,
+                active_memory=active_memory or {},
             ),
             ensure_ascii=False,
             indent=2,
@@ -1089,6 +1185,7 @@ class LLMCardEngine:
         figures: Optional[list[dict]] = None,
         calibration_examples: Optional[list[dict]] = None,
         calibration_set_name: str = "",
+        active_memory: Optional[dict[str, Any]] = None,
     ) -> dict[str, list[dict]]:
         if not self.client or not extracted_cards:
             return {"cards": []}
@@ -1144,6 +1241,7 @@ class LLMCardEngine:
                 calibration_examples=selected_examples,
                 stage_examples=stage_examples,
                 calibration_set_name=calibration_set_name,
+                active_memory=active_memory or {},
             ),
             ensure_ascii=False,
             indent=2,
@@ -1558,6 +1656,461 @@ class LLMCardEngine:
             "provider_route": self._last_provider_route,
         }
 
+    def draft_research_plan(
+        self,
+        research_brief: str,
+        *,
+        requested_task_type: str = "auto",
+        max_terms: int = 6,
+        active_memory: Optional[dict[str, Any]] = None,
+        also_generate_aha_cards: bool = False,
+    ) -> dict[str, Any]:
+        if not self.is_enabled():
+            raise LLMGenerationError("LLM provider is not enabled")
+        normalized_brief = str(research_brief or "").strip()
+        if not normalized_brief:
+            raise ValueError("research_brief is required")
+        bounded_max_terms = max(1, min(int(max_terms or 6), 12))
+        requested_mode = str(requested_task_type or "auto").strip().lower() or "auto"
+        system_prompt = "\n".join(
+            [
+                "You turn one internal research brief into a confirmable execution plan for a paper research workflow.",
+                "Return strict JSON only.",
+                "First decide whether the task is aha_exploration or claim_evidence unless the requested mode is already explicit.",
+                "aha_exploration means open-ended discovery of high-value learner-facing aha moments.",
+                "claim_evidence means the user already has a claim or framework and wants supporting, mixed, contradictory, and limiting evidence.",
+                "Keep the plan minimal, executable, and directly useful for the downstream search pipeline.",
+                "For aha_exploration, output short search topics only; do not output long explanations.",
+                "For claim_evidence, output search_topics as structured entries with dimension labels, query anchors, and outcome terms.",
+                "Do not output prose outside the JSON schema.",
+                "Output schema:",
+                "{",
+                '  "suggested_task_type": "aha_exploration|claim_evidence",',
+                '  "summary": "string",',
+                '  "claim": "string",',
+                '  "recommended_topics": ["string"],',
+                '  "search_topics": [',
+                "    {",
+                '      "topic_name": "string",',
+                '      "dimension_key": "string",',
+                '      "dimension_label": "string",',
+                '      "query_anchor": "string",',
+                '      "outcome_terms": ["string"]',
+                "    }",
+                "  ],",
+                '  "outcomes": ["string"],',
+                '  "evidence_policy": {',
+                '    "surface_contradictions": true,',
+                '    "minimum_supporting_papers_per_dimension": 3',
+                "  },",
+                '  "also_generate_aha_cards": false',
+                "}",
+            ]
+        )
+        user_prompt = json.dumps(
+            {
+                "stage": "research_planning",
+                "prompt_version": RESEARCH_PLAN_PROMPT_VERSION,
+                "research_brief": normalized_brief,
+                "requested_task_type": requested_mode,
+                "max_terms": bounded_max_terms,
+                "also_generate_aha_cards": also_generate_aha_cards,
+                "active_preference_memory": active_memory or {},
+                "requirements": [
+                    "If the brief asks to prove, support, validate, or challenge a known framework or claim, choose claim_evidence.",
+                    "If the brief asks to discover unknown high-value insights, choose aha_exploration.",
+                    "For aha_exploration, prefer 3 to max_terms short academic anchors.",
+                    "For claim_evidence, prefer one search topic per claim dimension whenever possible.",
+                    "For claim_evidence, outcome_terms should contain the most decision-relevant measurable outcomes, not generic filler.",
+                    "Do not invent more than max_terms search topics unless the brief explicitly contains more hard dimensions.",
+                    "Stay as close as possible to the user's phrasing, but convert it into search-ready academic anchors.",
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        payload = self._chat_json(stage="research_planning", system_prompt=system_prompt, user_prompt=user_prompt)
+        normalized = {
+            "suggested_task_type": str(payload.get("suggested_task_type", "")).strip().lower(),
+            "summary": str(payload.get("summary", "")).strip(),
+            "claim": str(payload.get("claim", "")).strip(),
+            "recommended_topics": payload.get("recommended_topics", []),
+            "search_topics": payload.get("search_topics", []),
+            "outcomes": payload.get("outcomes", []),
+            "evidence_policy": payload.get("evidence_policy", {}),
+            "also_generate_aha_cards": bool(payload.get("also_generate_aha_cards", also_generate_aha_cards)),
+            "provider_route": self._last_provider_route,
+        }
+        return normalized
+
+    def generate_matrix_items(
+        self,
+        *,
+        claim_text: str,
+        topic_name: str,
+        paper_title: str,
+        dimension: dict[str, Any],
+        sections: list[dict],
+        figures: Optional[list[dict]] = None,
+        active_memory: Optional[dict[str, Any]] = None,
+        evidence_policy: Optional[dict[str, Any]] = None,
+    ) -> dict[str, list[dict]]:
+        if not self.client:
+            return {"items": []}
+        prompt_sections = self._build_prompt_sections(sections)
+        prompt_figures = self._build_prompt_figures(figures or [])
+        dimension_alias_guidance = self._build_claim_evidence_dimension_alias_guidance(dimension)
+        system_prompt_lines = [
+            "You convert one paper into grounded evidence matrix items for a known claim.",
+            "Return strict JSON only.",
+            "Do not summarize the whole paper. Only emit items that directly matter for the given dimension and outcomes.",
+            "Each item must be grounded in section ids from the provided paper.",
+            "Use verdict among supporting, mixed, contradictory, or context_only.",
+            "Always surface limitations when they materially affect how strongly this paper supports the claim.",
+            "Write learner-facing and report-facing strings in Simplified Chinese.",
+            "If the claim is about human management, leadership, employees, teams, or workplace outcomes, only use direct evidence from human organizational or workplace contexts.",
+            "Do not use robots, AI systems, reinforcement learning, consumer journeys, classroom teaching, medical training, therapy, or other cross-domain analogies as evidence unless the paper directly studies managerial or workplace communication.",
+            "If a paper is off-domain for the claim, emit zero items rather than filling the matrix with analogy-based context_only items.",
+            "For workplace leadership claims, near-domain organizational outcomes such as role clarity, communication satisfaction, trust in leader, employee commitment, mentoring quality, supervisor support, engagement, and burnout are valid evidence targets when the paper makes the link explicit.",
+            "Dimension labels should be interpreted by management-literature meaning, not literal wording only. Valid workplace proxy constructs count as direct evidence when the paper makes the behavior-outcome link explicit.",
+            "For every cited section, quote_zh must be a complete Simplified Chinese translation of the full original section text for that same section_id.",
+            "Do not turn quote_zh into a leader-facing summary, evidence interpretation, paraphrase, or selective restatement.",
+            "If you cannot translate the full cited evidence faithfully, emit zero items instead of faking a shorter Chinese summary.",
+            "If the provided evidence is abstract-only or metadata-derived rather than full text, emit at most one matrix item, keep the claim modest, and treat the evidence as weaker than full-text evidence.",
+        ]
+        if dimension_alias_guidance:
+            system_prompt_lines.append(dimension_alias_guidance)
+        system_prompt = "\n".join(system_prompt_lines)
+        user_prompt = json.dumps(
+            {
+                "stage": "claim_evidence_generation",
+                "prompt_version": CLAIM_EVIDENCE_PROMPT_VERSION,
+                "claim_text": claim_text,
+                "topic_name": topic_name,
+                "paper_title": paper_title,
+                "dimension": dimension,
+                "dimension_alias_guidance": dimension_alias_guidance,
+                "sections": prompt_sections,
+                "figures": prompt_figures,
+                "active_preference_memory": active_memory or {},
+                "evidence_policy": evidence_policy or {},
+                "requirements": [
+                    "Emit zero items if the paper only gives broad background without a usable link to the claim dimension or outcomes.",
+                    "Prefer papers that directly support or challenge the claim over papers that only provide distant context.",
+                    "For management or leadership claims, distant analogies from robots, AI, RL, consumer, student, or medical settings should normally be treated as off-domain and produce zero items.",
+                    "For direct-domain workplace papers, proxy organizational outcomes like role clarity, commitment, communication satisfaction, supervisor support, trust, engagement, mentoring quality, and burnout count as usable evidence when they materially connect to the claim.",
+                    "If the paper is in a workplace or organizational context but mainly supports a mechanism or intermediate outcome, mixed or context_only is acceptable; do not force zero items unless the paper is clearly off-domain.",
+                    "Use dimension_alias_guidance to map management-literature proxy constructs onto the target dimension; do not require the paper to repeat the exact dimension label literally.",
+                    "quote_zh must translate the complete original section text for each cited section_id, not a shorter claim-focused rewrite.",
+                    "Do not prepend meta-summary language such as '文中提到' or '作者指出' unless those words are explicitly present in the source evidence.",
+                    "If the available evidence is only an abstract or metadata summary, emit at most one weak item and explicitly state in limitation_text that the full paper was not available for verification.",
+                    "A supporting item should make the direction of support clear and name the relevant outcome.",
+                    "A mixed item should state both the support and the limitation or boundary condition.",
+                    "A contradictory item should only be used when the paper materially undermines the claim or reverses the expected direction.",
+                    "A context_only item is allowed only for near-domain organizational framing, not for cross-domain analogies.",
+                    "Use primary_section_ids for the strongest evidence, supporting_section_ids for secondary evidence.",
+                    "The summary should be one concise Chinese paragraph suitable for a leader-facing evidence matrix.",
+                ],
+                "output_schema": {
+                    "items": [
+                        {
+                            "dimension_key": "string",
+                            "dimension_label": "string",
+                            "outcome_key": "string",
+                            "outcome_label": "string",
+                            "claim_text": "string",
+                            "verdict": "supporting|mixed|contradictory|context_only",
+                            "evidence_strength": "strong|medium|weak",
+                            "summary": "中文简短总结",
+                            "limitation_text": "中文限制或边界条件",
+                            "citation_text": "作者与年份",
+                            "primary_section_ids": ["section_id"],
+                            "supporting_section_ids": ["section_id"],
+                            "figure_ids": ["figure_id"],
+                            "evidence_analysis": [
+                                {
+                                    "section_id": "section_id",
+                                    "quote_zh": "对应 section_id 原文整段内容的完整中文译文，不得总结、提炼、改写或只翻译其中一部分",
+                                    "analysis": "为什么这段证据支持或限制该命题",
+                                }
+                            ],
+                        }
+                    ]
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        payload = self._chat_json(stage="claim_evidence_generation", system_prompt=system_prompt, user_prompt=user_prompt)
+        return self._normalize_matrix_items_output(payload, sections, figures or [], dimension, claim_text)
+
+    def _build_claim_evidence_dimension_alias_guidance(self, dimension: dict[str, Any]) -> str:
+        dimension_key = str(dimension.get("dimension_key", "") or "").strip().lower()
+        guidance_by_dimension = {
+            "expression": (
+                "For the expression dimension, leadership communication clarity, goal clarity, sensegiving, framing,"
+                " expectation-setting, supervisory communication quality, and message clarity are valid direct evidence"
+                " proxies when the paper links them to employee or team outcomes."
+            ),
+            "listening": (
+                "For the listening dimension, leader listening behavior, perceived listening quality, receptiveness to"
+                " employee voice, supportive listening, and leader responsiveness count as direct evidence proxies when"
+                " the paper links them to trust, psychological safety, voice, satisfaction, or performance."
+            ),
+            "questioning": (
+                "For the questioning dimension, managerial coaching, coaching leadership, inquiry-based leadership,"
+                " developmental feedback conversations, reflective inquiry, and coach-like prompting count as direct"
+                " evidence proxies when the paper shows that leader dialogue prompts employee thinking, learning,"
+                " role clarity, problem solving, development, or performance. Do not require the literal word"
+                " 'questioning' if the coaching or inquiry mechanism is explicit."
+            ),
+            "empathy": (
+                "For the empathy dimension, leader compassion, individualized consideration, empathic concern,"
+                " supportive concern, mindful communication, and emotionally attuned leadership count as direct"
+                " evidence proxies when linked to relationship quality, trust, burnout, well-being, or performance."
+            ),
+            "action_facilitation": (
+                "For the action facilitation dimension, action planning, accountability, follow-up, implementation"
+                " intentions, goal setting, feedback-to-action, and behavioral commitment mechanisms count as direct"
+                " evidence proxies when they connect leader dialogue to execution, goal attainment, or task performance."
+            ),
+            "integrative_framework": (
+                "For the integrative framework dimension, combined leadership behaviors, multidimensional leadership"
+                " communication, mediated or moderated leadership pathways, and interaction or bundle effects count as"
+                " relevant evidence even if the paper does not name the exact five-dimension framework."
+            ),
+            "boundary_contradictions": (
+                "For the boundary and contradiction dimension, null effects, inconsistent findings, curvilinear results,"
+                " moderator effects, task or culture contingencies, and remote-work limitations count as direct evidence"
+                " even when they challenge only part of the broader claim."
+            ),
+            "measurement_methods": (
+                "For the measurement and methods dimension, longitudinal designs, diary studies, experience sampling,"
+                " matched supervisor-subordinate data, multilevel models, behavioral coding, text analysis, and field"
+                " experiments count as direct evidence about evidence quality even if they do not test the full claim."
+            ),
+        }
+        return guidance_by_dimension.get(dimension_key, "")
+
+    def answer_paper_question(
+        self,
+        *,
+        paper_title: str,
+        question: str,
+        sections: list[dict],
+        figures: Optional[list[dict]] = None,
+        active_memory: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        if not self.is_enabled():
+            raise LLMGenerationError("LLM provider is not enabled")
+        system_prompt = "\n".join(
+            [
+                "You answer a question about one specific paper using only the provided retrieved sections and linked figures.",
+                "Return strict JSON only.",
+                "If the provided evidence is insufficient, say so explicitly instead of guessing.",
+                "Do not use external knowledge beyond the retrieved paper evidence.",
+                "Write the answer in Simplified Chinese.",
+            ]
+        )
+        user_prompt = json.dumps(
+            {
+                "stage": "paper_qa",
+                "prompt_version": PAPER_QA_PROMPT_VERSION,
+                "paper_title": paper_title,
+                "question": question,
+                "sections": self._build_prompt_sections(sections),
+                "figures": self._build_prompt_figures(figures or []),
+                "active_preference_memory": active_memory or {},
+                "requirements": [
+                    "Only cite section ids that appear in the provided sections list.",
+                    "Answer directly and concisely.",
+                    "If the question asks for causality but the paper only shows correlation or qualitative evidence, say that clearly.",
+                ],
+                "output_schema": {
+                    "answer": "中文回答",
+                    "confidence_note": "中文，说明证据是否充分",
+                    "cannot_answer_from_paper": False,
+                    "used_section_ids": ["section_id"],
+                    "used_figure_ids": ["figure_id"],
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        payload = self._chat_json(stage="paper_qa", system_prompt=system_prompt, user_prompt=user_prompt)
+        normalized = {
+            "answer": str(payload.get("answer", "")).strip(),
+            "confidence_note": str(payload.get("confidence_note", "")).strip(),
+            "cannot_answer_from_paper": bool(payload.get("cannot_answer_from_paper", False)),
+            "used_section_ids": [str(item).strip() for item in payload.get("used_section_ids", []) if str(item).strip()],
+            "used_figure_ids": [str(item).strip() for item in payload.get("used_figure_ids", []) if str(item).strip()],
+            "provider_route": self._last_provider_route,
+        }
+        section_map = {section["id"]: section for section in sections}
+        figure_map = {figure["id"]: figure for figure in (figures or []) if figure.get("id")}
+        normalized["used_sections"] = [
+            {
+                "section_id": section_id,
+                "section_title": section_map[section_id].get("section_title", ""),
+                "page_number": section_map[section_id].get("page_number"),
+                "paragraph_text": section_map[section_id].get("paragraph_text", ""),
+            }
+            for section_id in normalized["used_section_ids"]
+            if section_id in section_map
+        ]
+        normalized["used_figures"] = [figure_map[figure_id] for figure_id in normalized["used_figure_ids"] if figure_id in figure_map]
+        return normalized
+
+    def distill_preference_memory(
+        self,
+        review_items: list[dict],
+        *,
+        task_type: str = "",
+        active_memory: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        if not self.is_enabled():
+            raise LLMGenerationError("LLM provider is not enabled")
+        condensed_items = []
+        for item in review_items[:80]:
+            condensed_items.append(
+                {
+                    "object_type": item.get("object_type", ""),
+                    "topic_name": item.get("topic_name", ""),
+                    "paper_title": item.get("paper_title", ""),
+                    "display_title": item.get("display_title", ""),
+                    "review_status": item.get("review_status", ""),
+                    "comment_text": item.get("comment_text", ""),
+                    "verdict": item.get("verdict", ""),
+                    "evidence_strength": item.get("evidence_strength", ""),
+                    "dimension_label": item.get("dimension_label", ""),
+                    "outcome_label": item.get("outcome_label", ""),
+                }
+            )
+        system_prompt = "\n".join(
+            [
+                "You distill explicit user review behavior into a small, human-confirmable preference memory draft.",
+                "Return strict JSON only.",
+                "This is not model retraining and not a hidden automatic optimization loop.",
+                "Summarize only stable, review-supported preferences that should influence future planning and filtering.",
+                "Do not invent preferences that are not visible in the review data.",
+            ]
+        )
+        user_prompt = json.dumps(
+            {
+                "stage": "preference_memory",
+                "prompt_version": PREFERENCE_MEMORY_PROMPT_VERSION,
+                "task_type": task_type,
+                "active_preference_memory": active_memory or {},
+                "review_items": condensed_items,
+                "requirements": [
+                    "Prefer stable rules over one-off anecdotes.",
+                    "Write prefer and avoid as direct filtering or planning instructions.",
+                    "review_signals should cite the repeated behavior pattern, not restate the whole dataset.",
+                    "Keep the draft compact and human-reviewable.",
+                ],
+                "output_schema": {
+                    "scope": "project",
+                    "mode": "aha_exploration|claim_evidence|mixed",
+                    "summary": "一句话总结",
+                    "prefer": ["string"],
+                    "avoid": ["string"],
+                    "review_signals": ["string"],
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        payload = self._chat_json(stage="preference_memory", system_prompt=system_prompt, user_prompt=user_prompt)
+        return {
+            "scope": str(payload.get("scope", "project")).strip() or "project",
+            "mode": str(payload.get("mode", task_type or "mixed")).strip() or (task_type or "mixed"),
+            "summary": str(payload.get("summary", "")).strip(),
+            "prefer": [str(item).strip() for item in payload.get("prefer", []) if str(item).strip()],
+            "avoid": [str(item).strip() for item in payload.get("avoid", []) if str(item).strip()],
+            "review_signals": [str(item).strip() for item in payload.get("review_signals", []) if str(item).strip()],
+            "provider_route": self._last_provider_route,
+        }
+
+    def _normalize_matrix_items_output(
+        self,
+        payload: dict[str, Any],
+        sections: list[dict],
+        figures: list[dict],
+        dimension: dict[str, Any],
+        claim_text: str,
+    ) -> dict[str, list[dict]]:
+        raw_items = payload.get("items", [])
+        if not isinstance(raw_items, list):
+            raw_items = []
+        section_map = {section["id"]: section for section in sections}
+        figure_id_set = {figure["id"] for figure in figures}
+        normalized_items = []
+        for raw_item in raw_items[:8]:
+            if not isinstance(raw_item, dict):
+                continue
+            primary_section_ids = [
+                str(section_id).strip()
+                for section_id in raw_item.get("primary_section_ids", [])
+                if str(section_id).strip() in section_map
+            ]
+            supporting_section_ids = [
+                str(section_id).strip()
+                for section_id in raw_item.get("supporting_section_ids", [])
+                if str(section_id).strip() in section_map and str(section_id).strip() not in primary_section_ids
+            ]
+            if not primary_section_ids:
+                continue
+            analysis_by_section_id = {}
+            for item in raw_item.get("evidence_analysis", []) if isinstance(raw_item.get("evidence_analysis", []), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                section_id = str(item.get("section_id", "")).strip()
+                if section_id and section_id in section_map:
+                    analysis_by_section_id[section_id] = {
+                        "quote_zh": str(item.get("quote_zh", "")).strip(),
+                        "analysis": str(item.get("analysis", "")).strip(),
+                    }
+            evidence = []
+            for section_id in primary_section_ids + supporting_section_ids:
+                section = section_map[section_id]
+                localized = analysis_by_section_id.get(section_id, {})
+                quote_zh = localized.get("quote_zh", "")
+                if not looks_like_complete_translation(section.get("paragraph_text", ""), quote_zh):
+                    evidence = []
+                    break
+                evidence.append(
+                    {
+                        "section_id": section_id,
+                        "quote": section.get("paragraph_text", ""),
+                        "quote_zh": quote_zh,
+                        "analysis": localized.get("analysis", ""),
+                        "page_number": section.get("page_number"),
+                    }
+                )
+            figure_ids = [
+                str(figure_id).strip()
+                for figure_id in raw_item.get("figure_ids", [])
+                if str(figure_id).strip() in figure_id_set
+            ]
+            normalized_items.append(
+                {
+                    "dimension_key": str(raw_item.get("dimension_key", "") or dimension.get("dimension_key", "")).strip(),
+                    "dimension_label": str(raw_item.get("dimension_label", "") or dimension.get("dimension_label", "")).strip(),
+                    "outcome_key": str(raw_item.get("outcome_key", "")).strip(),
+                    "outcome_label": str(raw_item.get("outcome_label", "")).strip(),
+                    "claim_text": str(raw_item.get("claim_text", "") or claim_text).strip(),
+                    "verdict": str(raw_item.get("verdict", "")).strip().lower() or "context_only",
+                    "evidence_strength": str(raw_item.get("evidence_strength", "")).strip().lower() or "medium",
+                    "summary": str(raw_item.get("summary", "")).strip(),
+                    "limitation_text": str(raw_item.get("limitation_text", "")).strip(),
+                    "citation_text": str(raw_item.get("citation_text", "")).strip(),
+                    "evidence": evidence,
+                    "figure_ids": figure_ids,
+                    "supporting_section_ids": supporting_section_ids,
+                }
+            )
+        return {"items": normalized_items}
+
     def _build_extraction_prompt_payload(
         self,
         *,
@@ -1570,6 +2123,7 @@ class LLMCardEngine:
         calibration_examples: list[dict],
         stage_examples: list[dict],
         calibration_set_name: str,
+        active_memory: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         context_sections = [section for section in prompt_sections if section.get("role_hint") == "context"]
         primary_sections = [section for section in prompt_sections if section.get("role_hint") == "primary"]
@@ -1600,6 +2154,7 @@ class LLMCardEngine:
             "stage_spec": self._stage_spec("candidate_extraction"),
             "stage_examples": stage_examples,
             "calibration_examples": calibration_examples,
+            "active_preference_memory": active_memory or {},
             "paper_relevance_verdict": paper_relevance_verdict,
             "paper_relevance_reason": paper_relevance_reason,
             "relevance_failure_type": relevance_failure_type,
@@ -1713,6 +2268,7 @@ class LLMCardEngine:
         calibration_examples: list[dict],
         stage_examples: list[dict],
         calibration_set_name: str,
+        active_memory: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         ontology = self._ideal_aha_ontology()
         return {
@@ -1731,6 +2287,7 @@ class LLMCardEngine:
             "stage_spec": self._stage_spec("candidate_judgement"),
             "stage_examples": stage_examples,
             "calibration_examples": calibration_examples,
+            "active_preference_memory": active_memory or {},
             "candidates": prompt_candidates,
             "judgement_rules": {
                 "must_be_true_for_a_card": [
