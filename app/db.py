@@ -557,6 +557,37 @@ def ensure_migrations(connection: sqlite3.Connection) -> None:
     ensure_review_item_comment_indexes(connection)
     ensure_discovery_indexes(connection)
     ensure_evidence_matrix_indexes(connection)
+    ensure_query_path_indexes(connection)
+
+
+def ensure_query_path_indexes(connection: sqlite3.Connection) -> None:
+    existing_tables = {
+        row["name"]
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    index_specs = [
+        ("candidate_cards", "CREATE INDEX IF NOT EXISTS idx_candidate_cards_run_id ON candidate_cards(run_id)"),
+        ("candidate_cards", "CREATE INDEX IF NOT EXISTS idx_candidate_cards_topic_id ON candidate_cards(topic_id)"),
+        ("candidate_cards", "CREATE INDEX IF NOT EXISTS idx_candidate_cards_paper_id ON candidate_cards(paper_id)"),
+        ("access_queue", "CREATE INDEX IF NOT EXISTS idx_access_queue_run_id ON access_queue(run_id)"),
+        ("access_queue", "CREATE INDEX IF NOT EXISTS idx_access_queue_paper_id ON access_queue(paper_id)"),
+        ("topic_runs", "CREATE INDEX IF NOT EXISTS idx_topic_runs_run_id ON topic_runs(run_id)"),
+        ("papers", "CREATE INDEX IF NOT EXISTS idx_papers_access_status ON papers(access_status)"),
+        ("papers", "CREATE INDEX IF NOT EXISTS idx_papers_parse_status ON papers(parse_status)"),
+        ("judgements", "CREATE INDEX IF NOT EXISTS idx_judgements_card_created ON judgements(card_id, created_at DESC)"),
+        ("review_decisions", "CREATE INDEX IF NOT EXISTS idx_review_decisions_target ON review_decisions(target_type, target_id, created_at DESC)"),
+        ("paper_topics", "CREATE INDEX IF NOT EXISTS idx_paper_topics_run ON paper_topics(run_id)"),
+        ("paper_topics", "CREATE INDEX IF NOT EXISTS idx_paper_topics_run_topic ON paper_topics(run_id, topic_id)"),
+        ("paper_sections", "CREATE INDEX IF NOT EXISTS idx_paper_sections_paper ON paper_sections(paper_id)"),
+        ("paper_excluded_content", "CREATE INDEX IF NOT EXISTS idx_paper_excluded_content_ptr ON paper_excluded_content(paper_id, topic_id, run_id)"),
+    ]
+    for table, stmt in index_specs:
+        if table not in existing_tables:
+            continue
+        try:
+            connection.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column may not exist yet in this migration context
 
 
 def ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, column_sql: str) -> None:

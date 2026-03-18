@@ -1314,6 +1314,20 @@ def is_card_export_eligible(review_decision: str) -> bool:
     return review_decision == "accepted"
 
 
+_CARD_COLS_NO_EMBED = (
+    "candidate_cards.id, candidate_cards.paper_id, candidate_cards.topic_id, candidate_cards.run_id, "
+    "candidate_cards.title, candidate_cards.granularity_level, candidate_cards.course_transformation, "
+    "candidate_cards.teachable_one_liner, candidate_cards.draft_body, candidate_cards.evidence_json, "
+    "candidate_cards.figure_ids_json, candidate_cards.status, candidate_cards.source_excluded_content_id, "
+    "candidate_cards.primary_section_ids_json, candidate_cards.supporting_section_ids_json, "
+    "candidate_cards.paper_specific_object, candidate_cards.claim_type, candidate_cards.evidence_level, "
+    "candidate_cards.body_grounding_reason, candidate_cards.grounding_quality, "
+    "candidate_cards.duplicate_cluster_id, candidate_cards.duplicate_rank, "
+    "candidate_cards.duplicate_disposition, candidate_cards.created_at"
+)
+_CARD_COLS_WITH_EMBED = _CARD_COLS_NO_EMBED + ", candidate_cards.embedding_json"
+
+
 class Repository:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -1345,12 +1359,67 @@ class Repository:
     def _hydrate_card_row(self, row: dict) -> dict:
         row["evidence"] = self._hydrate_evidence(json.loads(row["evidence_json"]))
         row["figure_ids"] = json.loads(row["figure_ids_json"])
-        row["embedding"] = json.loads(row["embedding_json"])
+        row["embedding"] = json.loads(row["embedding_json"]) if row.get("embedding_json") is not None else []
         row["primary_section_ids"] = json.loads(row.get("primary_section_ids_json", "[]") or "[]")
         row["supporting_section_ids"] = json.loads(row.get("supporting_section_ids_json", "[]") or "[]")
         row["paper_url"] = row.get("paper_url", "")
         row["source_excluded_content_id"] = row.get("source_excluded_content_id")
         return row
+
+    def _batch_get_judgements(self, card_ids: list[str]) -> dict[str, dict]:
+        """Batch fetch latest judgement per card_id — avoids N correlated subqueries."""
+        if not card_ids:
+            return {}
+        result: dict[str, dict] = {}
+        batch_size = 400
+        for start in range(0, len(card_ids), batch_size):
+            chunk = card_ids[start:start + batch_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._fetchall(
+                f"""
+                SELECT j.* FROM judgements j
+                INNER JOIN (
+                    SELECT card_id, MAX(created_at) AS max_created
+                    FROM judgements
+                    WHERE card_id IN ({placeholders})
+                    GROUP BY card_id
+                ) latest ON j.card_id = latest.card_id AND j.created_at = latest.max_created
+                """,
+                tuple(chunk),
+            )
+            for row in rows:
+                result[row["card_id"]] = row
+        return result
+
+    def _batch_get_latest_review_decisions(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], dict]:
+        """Batch fetch latest review_decisions for [(target_type, target_id), ...] — avoids N correlated subqueries."""
+        if not pairs:
+            return {}
+        result: dict[tuple[str, str], dict] = {}
+        batch_size = 400
+        for start in range(0, len(pairs), batch_size):
+            chunk = pairs[start:start + batch_size]
+            conditions = " OR ".join("(target_type = ? AND target_id = ?)" for _ in chunk)
+            params: list[str] = []
+            for t_type, t_id in chunk:
+                params.extend([t_type, t_id])
+            rows = self._fetchall(
+                f"""
+                SELECT rd.* FROM review_decisions rd
+                INNER JOIN (
+                    SELECT target_type, target_id, MAX(created_at) AS max_created
+                    FROM review_decisions
+                    WHERE {conditions}
+                    GROUP BY target_type, target_id
+                ) latest ON rd.target_type = latest.target_type
+                    AND rd.target_id = latest.target_id
+                    AND rd.created_at = latest.max_created
+                """,
+                tuple(params),
+            )
+            for row in rows:
+                result[(row["target_type"], row["target_id"])] = row
+        return result
 
     def _build_paper_qa_capability(
         self,
@@ -3423,6 +3492,8 @@ class Repository:
         topic: str = "",
         paper_id: Optional[str] = None,
         topic_id: Optional[str] = None,
+        *,
+        include_embedding: bool = False,
     ) -> list[dict]:
         params: list[str] = []
         filters = []
@@ -3439,25 +3510,15 @@ class Repository:
             filters.append("lower(topics.name) = lower(?)")
             params.append(topic)
         where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+        cols = _CARD_COLS_WITH_EMBED if include_embedding else _CARD_COLS_NO_EMBED
         rows = self._fetchall(
             f"""
             SELECT
-                candidate_cards.*,
+                {cols},
                 papers.title AS paper_title,
                 papers.original_url AS paper_url,
                 papers.publication_year AS publication_year,
-                topics.name AS topic_name,
-                (
-                    SELECT color FROM judgements
-                    WHERE judgements.card_id = candidate_cards.id
-                    ORDER BY created_at DESC LIMIT 1
-                ) AS color,
-                (
-                    SELECT decision FROM review_decisions
-                    WHERE review_decisions.target_type = 'card'
-                      AND review_decisions.target_id = candidate_cards.id
-                    ORDER BY created_at DESC LIMIT 1
-                ) AS review_decision
+                topics.name AS topic_name
             FROM candidate_cards
             JOIN papers ON papers.id = candidate_cards.paper_id
             JOIN topics ON topics.id = candidate_cards.topic_id
@@ -3466,7 +3527,12 @@ class Repository:
             """,
             tuple(params),
         )
+        card_ids = [row["id"] for row in rows]
+        judgements_map = self._batch_get_judgements(card_ids)
+        reviews_map = self._batch_get_latest_review_decisions([("card", cid) for cid in card_ids])
         for row in rows:
+            row["color"] = (judgements_map.get(row["id"]) or {}).get("color", "")
+            row["review_decision"] = (reviews_map.get(("card", row["id"])) or {}).get("decision", "")
             self._hydrate_card_row(row)
         return rows
 
@@ -3503,13 +3569,7 @@ class Repository:
                 papers.publication_year AS publication_year,
                 papers.access_status AS paper_access_status,
                 papers.parse_status AS paper_parse_status,
-                topics.name AS topic_name,
-                (
-                    SELECT decision FROM review_decisions
-                    WHERE review_decisions.target_type = 'matrix_item'
-                      AND review_decisions.target_id = evidence_matrix_items.id
-                    ORDER BY created_at DESC LIMIT 1
-                ) AS review_decision
+                topics.name AS topic_name
             FROM evidence_matrix_items
             JOIN papers ON papers.id = evidence_matrix_items.paper_id
             JOIN topics ON topics.id = evidence_matrix_items.topic_id
@@ -3518,8 +3578,11 @@ class Repository:
             """,
             tuple(params),
         )
+        item_ids = [row["id"] for row in rows]
+        reviews_map = self._batch_get_latest_review_decisions([("matrix_item", mid) for mid in item_ids])
         paper_qa_capability_cache: dict[str, dict[str, Any]] = {}
         for row in rows:
+            row["review_decision"] = (reviews_map.get(("matrix_item", row["id"])) or {}).get("decision", "")
             self._hydrate_matrix_row(
                 row,
                 include_paper_qa=include_paper_qa,
@@ -3885,7 +3948,7 @@ class Repository:
         if not current:
             return []
         neighbors = []
-        for candidate in self.list_cards(topic=current["topic_name"]):
+        for candidate in self.list_cards(topic=current["topic_name"], include_embedding=True):
             if candidate["id"] == card_id:
                 continue
             similarity = cosine_similarity(current["embedding"], candidate["embedding"])
@@ -3907,6 +3970,8 @@ class Repository:
 
 
 class DiscoveryService:
+    _PROVIDER_CONCURRENCY = 2
+
     def __init__(
         self,
         providers: Optional[list[Any]] = None,
@@ -3919,25 +3984,63 @@ class DiscoveryService:
             SemanticScholarDiscoveryProvider(),
         ]
         self.strategy_builder = strategy_builder or build_topic_search_strategies
+        self._provider_semaphores: dict[str, threading.Semaphore] = {
+            self._provider_key(p): threading.Semaphore(self._PROVIDER_CONCURRENCY)
+            for p in self.providers
+        }
+
+    @staticmethod
+    def _provider_key(provider: Any) -> str:
+        return str(getattr(provider, "provider_name", provider.__class__.__name__)).strip().lower()
 
     def discover(self, topic: str) -> list[dict]:
-        raw_results = []
         strategies = self.strategy_builder(topic)
         return self.discover_with_strategies(topic, strategies)
 
+    def _discover_with_provider_throttled(self, provider: Any, topic: str, strategy: dict[str, Any]) -> list[dict]:
+        key = self._provider_key(provider)
+        sem = self._provider_semaphores.get(key)
+        if sem:
+            sem.acquire()
+        try:
+            return self._discover_with_provider(provider, topic, strategy)
+        finally:
+            if sem:
+                sem.release()
+
     def discover_with_strategies(self, topic: str, strategies: list[dict[str, Any]]) -> list[dict]:
-        raw_results = []
+        raw_results: list[dict] = []
+        tasks: list[tuple[Any, dict[str, Any]]] = []
         for strategy in strategies:
             allowlist = {
                 str(item).strip().lower()
                 for item in strategy.get("provider_allowlist", [])
                 if str(item).strip()
             }
-            for provider in self.providers:
-                provider_name = str(getattr(provider, "provider_name", provider.__class__.__name__)).strip().lower()
-                if allowlist and provider_name not in allowlist:
-                    continue
+            eligible = [
+                p for p in self.providers
+                if not allowlist or self._provider_key(p) in allowlist
+            ]
+            for provider in eligible:
+                tasks.append((provider, strategy))
+
+        if len(tasks) <= 1:
+            for provider, strategy in tasks:
                 raw_results.extend(self._discover_with_provider(provider, topic, strategy))
+        else:
+            total_timeout = max(30, len(strategies) * 10)
+            with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+                futures = {
+                    executor.submit(self._discover_with_provider_throttled, p, topic, s): p
+                    for p, s in tasks
+                }
+                for future in as_completed(futures, timeout=total_timeout):
+                    try:
+                        raw_results.extend(future.result())
+                    except Exception:
+                        provider = futures.get(future)
+                        provider_name = self._provider_key(provider) if provider else "unknown"
+                        pass  # individual provider failure should not abort the whole discovery
         deduped: dict[str, dict] = {}
         for result in raw_results:
             dedupe_key = build_discovery_identity(
@@ -8343,7 +8446,7 @@ class RunCoordinator:
 
     def _build_topic_run_metrics(self, run_id: str, topic: dict, topic_run: dict, stats: dict[str, Any]) -> dict[str, Any]:
         task_context = self._get_run_task_context(run_id)
-        cards = self.repository.list_cards(run_id=run_id, topic=topic["name"])
+        cards = self.repository.list_cards(run_id=run_id, topic=topic["name"], include_embedding=True)
         matrix_items = self.repository.list_matrix_items(run_id=run_id, topic=topic["name"])
         strategies = self.repository.list_discovery_strategies(topic_run_id=topic_run["id"])
         discovery_results = self.repository.list_discovery_results(topic_run_id=topic_run["id"])
