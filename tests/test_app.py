@@ -6,10 +6,10 @@ Data structures: temporary app settings, a minimal PDF fixture, and API-level as
 from __future__ import annotations
 
 import base64
-import io
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.error
 import unittest
+import zlib
 from unittest.mock import patch
 from pathlib import Path
 
@@ -117,12 +118,29 @@ def build_pdf_with_non_text_tj_noise(valid_text: str) -> bytes:
 
 
 def build_png_bytes(size: tuple[int, int] = (24, 16), color: tuple[int, int, int] = (60, 120, 220)) -> bytes:
-    from PIL import Image
+    width, height = size
+    red, green, blue = color
+    row = b"\x00" + bytes([red, green, blue]) * width
+    pixel_stream = b"".join(row for _ in range(height))
+    compressed = zlib.compress(pixel_stream)
 
-    image = Image.new("RGB", size, color)
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
+    def chunk(chunk_type: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack("!I", len(payload))
+            + chunk_type
+            + payload
+            + struct.pack("!I", zlib.crc32(chunk_type + payload) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"".join(
+        [
+            b"\x89PNG\r\n\x1a\n",
+            chunk(b"IHDR", header),
+            chunk(b"IDAT", compressed),
+            chunk(b"IEND", b""),
+        ]
+    )
 
 
 def build_pdf_with_embedded_png(image_bytes: bytes, caption_text: str) -> bytes:
@@ -305,6 +323,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         matrix_item_id: str,
         review_decision: str | None,
         run: dict | None = None,
+        abstract_only: bool = False,
     ) -> dict:
         run = run or self.repository.create_run(
             "",
@@ -335,25 +354,27 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
             source_type="local",
             local_path="",
             original_url="https://example.com/matrix-paper",
-            access_status="open_fulltext",
+            access_status="manual_needed" if abstract_only else "open_fulltext",
             ingestion_status="ready",
-            parse_status="parsed",
+            parse_status="pending" if abstract_only else "parsed",
             artifact_path="",
         )
         self.repository.link_paper_to_topic(paper["id"], topic["id"], run["id"], "local_pdf")
-        self.repository.replace_sections(
-            paper["id"],
-            [
-                {
-                    "id": f"section_{matrix_item_id}",
-                    "section_order": 1,
-                    "section_title": "Results",
-                    "paragraph_text": "Leaders who were perceived as strong listeners produced higher psychological safety and stronger team commitment.",
-                    "page_number": 3,
-                    "embedding": [0.0] * 64,
-                }
-            ],
-        )
+        supporting_section_id = f"abstract_meta::{paper['id']}" if abstract_only else f"section_{matrix_item_id}"
+        if not abstract_only:
+            self.repository.replace_sections(
+                paper["id"],
+                [
+                    {
+                        "id": supporting_section_id,
+                        "section_order": 1,
+                        "section_title": "Results",
+                        "paragraph_text": "Leaders who were perceived as strong listeners produced higher psychological safety and stronger team commitment.",
+                        "page_number": 3,
+                        "embedding": [0.0] * 64,
+                    }
+                ],
+            )
         self.repository.replace_matrix_items_for_paper_topic(
             paper["id"],
             topic["id"],
@@ -373,15 +394,23 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                     "citation_text": "Test Author, 2026",
                     "evidence": [
                         {
-                            "section_id": f"section_{matrix_item_id}",
-                            "quote": "Leaders who were perceived as strong listeners produced higher psychological safety and stronger team commitment.",
-                            "quote_zh": "被感知为强倾听者的领导，会带来更高的心理安全与更强的团队承诺。",
+                            "section_id": supporting_section_id,
+                            "quote": (
+                                "The abstract reports that stronger empathic listening is associated with higher psychological safety and stronger team commitment."
+                                if abstract_only
+                                else "Leaders who were perceived as strong listeners produced higher psychological safety and stronger team commitment."
+                            ),
+                            "quote_zh": (
+                                "摘要指出，更强的共情倾听与更高的心理安全和更强的团队承诺相关。"
+                                if abstract_only
+                                else "被感知为强倾听者的领导，会带来更高的心理安全与更强的团队承诺。"
+                            ),
                             "analysis": "这说明管理对话中的高质量表达与倾听会带来更好的团队结果。",
-                            "page_number": 3,
+                            "page_number": 1 if abstract_only else 3,
                         }
                     ],
                     "figure_ids": [],
-                    "supporting_section_ids": [f"section_{matrix_item_id}"],
+                    "supporting_section_ids": [supporting_section_id],
                     "created_at": "2026-03-06T00:00:03+00:00",
                 }
             ],
@@ -411,7 +440,8 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                         "cards": [
                             {
                                 "title": "适应性销售会明显提升客户感知匹配度",
-                                "section_ids": [section_id],
+                                "primary_section_ids": [section_id],
+                                "supporting_section_ids": [],
                                 "granularity_level": "detail",
                                 "draft_body": "当客户匹配度重要时，适应性销售比僵硬话术更值得教。",
                                 "evidence_analysis": [
@@ -725,7 +755,8 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                             "cards": [
                                 {
                                     "title": "旧标准会在正式替换后继续支配真实流程",
-                                    "section_ids": [section_id],
+                                    "primary_section_ids": [section_id],
+                                    "supporting_section_ids": [],
                                     "granularity_level": "detail",
                                     "draft_body": "正式替换和现场迁移之间往往隔着很长的惯性期。",
                                     "evidence_analysis": [
@@ -815,7 +846,8 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                         "cards": [
                             {
                                 "title": "旧标准退役后仍会长期留在实际流程里",
-                                "section_ids": [section_id],
+                                "primary_section_ids": [section_id],
+                                "supporting_section_ids": [],
                                 "granularity_level": "detail",
                                 "draft_body": "这暴露了制度更新和实际执行之间的惯性差。",
                                 "evidence_analysis": [
@@ -1244,6 +1276,9 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["object_type"], "matrix_item")
         self.assertEqual(items[0]["dimension_label"], "表达")
+        self.assertTrue(items[0]["paper_qa_available"])
+        self.assertEqual(items[0]["paper_content_basis"], "parsed_fulltext")
+        self.assertEqual(items[0]["paper_qa_status"], "ready")
         detail = self.client.get(f"/api/review-items/matrix_item/{fixture['matrix_item_id']}")
         self.assertEqual(detail.status_code, 200, detail.text)
         self.assertEqual(detail.json()["item"]["verdict"], "supporting")
@@ -1285,6 +1320,116 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         answer = response.json()["answer"]
         self.assertIn("显式冲突检查", answer["answer"])
         self.assertEqual(answer["used_section_ids"], [f"section_{fixture['card_id']}"])
+
+    def test_paper_qa_status_endpoint_returns_ready_for_parsed_paper(self) -> None:
+        fixture = self._create_matrix_item_fixture(matrix_item_id="matrix_ready", review_decision=None)
+        response = self.client.get(f"/api/papers/{fixture['paper']['id']}/qa-status")
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["paper"]["id"], fixture["paper"]["id"])
+        self.assertEqual(payload["paper"]["access_status"], "open_fulltext")
+        self.assertEqual(payload["paper"]["parse_status"], "parsed")
+        self.assertTrue(payload["qa_status"]["available"])
+        self.assertEqual(payload["qa_status"]["status"], "ready")
+        self.assertEqual(payload["qa_status"]["paper_content_basis"], "parsed_fulltext")
+        self.assertEqual(payload["qa_status"]["section_count"], 1)
+        self.assertFalse(payload["qa_status"]["has_abstract_backed_matrix_items"])
+
+    def test_paper_qa_status_endpoint_blocks_abstract_only_matrix_paper(self) -> None:
+        fixture = self._create_matrix_item_fixture(
+            matrix_item_id="matrix_abstract_only",
+            review_decision=None,
+            abstract_only=True,
+        )
+        response = self.client.get(f"/api/papers/{fixture['paper']['id']}/qa-status")
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["paper"]["access_status"], "manual_needed")
+        self.assertEqual(payload["paper"]["parse_status"], "pending")
+        self.assertFalse(payload["qa_status"]["available"])
+        self.assertEqual(payload["qa_status"]["status"], "blocked_abstract_only")
+        self.assertEqual(payload["qa_status"]["paper_content_basis"], "abstract_only")
+        self.assertEqual(payload["qa_status"]["section_count"], 0)
+        self.assertTrue(payload["qa_status"]["has_abstract_backed_matrix_items"])
+        self.assertIn("abstract-level evidence", payload["qa_status"]["message"])
+
+    def test_paper_qa_status_endpoint_blocks_without_sections_or_matrix_items(self) -> None:
+        run = self.repository.create_run("qa blocked", {"operator": "tester"})
+        topic = self.repository.create_or_get_topic("qa blocked")
+        paper = self.repository.create_or_get_paper(
+            title="QA Blocked Paper",
+            authors=["Test Author"],
+            publication_year=2026,
+            external_id="paper::qa-blocked-no-sections",
+            source_type="local",
+            local_path="",
+            original_url="https://example.com/qa-blocked",
+            access_status="manual_needed",
+            ingestion_status="queued",
+            parse_status="pending",
+            artifact_path="",
+        )
+        self.repository.link_paper_to_topic(paper["id"], topic["id"], run["id"], "search")
+
+        response = self.client.get(f"/api/papers/{paper['id']}/qa-status")
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertFalse(payload["qa_status"]["available"])
+        self.assertEqual(payload["qa_status"]["status"], "blocked_no_parsed_sections")
+        self.assertEqual(payload["qa_status"]["paper_content_basis"], "unavailable")
+        self.assertEqual(payload["qa_status"]["section_count"], 0)
+        self.assertFalse(payload["qa_status"]["has_abstract_backed_matrix_items"])
+
+    def test_paper_qa_endpoint_returns_structured_409_for_blocked_paper(self) -> None:
+        fixture = self._create_matrix_item_fixture(
+            matrix_item_id="matrix_blocked_qa",
+            review_decision=None,
+            abstract_only=True,
+        )
+        response = self.client.post(
+            f"/api/papers/{fixture['paper']['id']}/qa",
+            json={"question": "What does this paper say?", "max_sections": 4},
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+        detail = response.json()["detail"]
+        self.assertEqual(detail["code"], "paper_qa_not_ready")
+        self.assertEqual(detail["status"], "blocked_abstract_only")
+        self.assertEqual(detail["qa_status"], "blocked_abstract_only")
+        self.assertEqual(detail["paper_content_basis"], "abstract_only")
+        self.assertEqual(detail["access_status"], "manual_needed")
+        self.assertEqual(detail["parse_status"], "pending")
+        self.assertEqual(detail["section_count"], 0)
+        self.assertIn("abstract-level evidence", detail["message"])
+
+    def test_matrix_item_payload_includes_paper_qa_fields(self) -> None:
+        fixture = self._create_matrix_item_fixture(
+            matrix_item_id="matrix_payload_qa",
+            review_decision=None,
+            abstract_only=True,
+        )
+        list_response = self.client.get(
+            "/api/matrix-items",
+            params={"paper_id": fixture["paper"]["id"]},
+        )
+        self.assertEqual(list_response.status_code, 200, list_response.text)
+        matrix_items = list_response.json()["matrix_items"]
+        self.assertEqual(len(matrix_items), 1)
+        self.assertFalse(matrix_items[0]["paper_qa_available"])
+        self.assertEqual(matrix_items[0]["paper_content_basis"], "abstract_only")
+        self.assertEqual(matrix_items[0]["paper_qa_status"], "blocked_abstract_only")
+        self.assertEqual(matrix_items[0]["paper_access_status"], "manual_needed")
+        self.assertEqual(matrix_items[0]["paper_parse_status"], "pending")
+        self.assertEqual(matrix_items[0]["paper_section_count"], 0)
+        self.assertFalse(matrix_items[0]["paper_has_parsed_sections"])
+        self.assertEqual(matrix_items[0]["matrix_evidence_basis"], "abstract_only")
+
+        detail_response = self.client.get(f"/api/matrix-items/{fixture['matrix_item_id']}")
+        self.assertEqual(detail_response.status_code, 200, detail_response.text)
+        detail = detail_response.json()["matrix_item"]
+        self.assertFalse(detail["paper_qa_available"])
+        self.assertEqual(detail["paper_content_basis"], "abstract_only")
+        self.assertEqual(detail["paper_qa_status"], "blocked_abstract_only")
+        self.assertEqual(detail["paper_qa_message"], matrix_items[0]["paper_qa_message"])
 
     def test_memory_draft_and_activate_endpoints(self) -> None:
         fixture = self._create_matrix_item_fixture(matrix_item_id="matrix_memory", review_decision="accepted")
@@ -1591,7 +1736,8 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                         "cards": [
                             {
                                 "title": "旧标准退役后仍会长期留在实际流程里",
-                                "section_ids": [section_id],
+                                "primary_section_ids": [section_id],
+                                "supporting_section_ids": [],
                                 "granularity_level": "detail",
                                 "draft_body": "这条内容指出制度替换和现场替换之间总有惯性差。",
                                 "evidence_analysis": [
@@ -3339,7 +3485,8 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                         "cards": [
                             {
                                 "title": "验证者先找冲突再继续协作",
-                                "section_ids": ["section_demo_1", "section_demo_2"],
+                                "primary_section_ids": ["section_demo_1"],
+                                "supporting_section_ids": ["section_demo_2"],
                                 "granularity_level": "subpattern",
                                 "draft_body": "多智能体协作里先显式找冲突，再继续汇总。",
                                 "evidence_analysis": [
@@ -3487,7 +3634,8 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                         "cards": [
                             {
                                 "title": "验证者智能体能降低多智能体流程中的不一致",
-                                "section_ids": ["section_demo_1", "section_demo_2"],
+                                "primary_section_ids": ["section_demo_1"],
+                                "supporting_section_ids": ["section_demo_2"],
                                 "granularity_level": "subpattern",
                                 "draft_body": "当多个执行智能体可能相互矛盾时，单独加一个验证者会显著提高稳定性。",
                                 "evidence_analysis": [
@@ -3985,18 +4133,14 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                     test_case.assertEqual(payload["output_language"], "zh-CN")
                     test_case.assertEqual(payload["figures"][0]["caption"], "Legacy migration curve")
                     test_case.assertEqual(payload["calibration_examples"][0]["source_text"], "Old standards can outlive their replacements in practice.")
-                    test_case.assertIn("shared_policy", payload)
-                    test_case.assertIn("ideal_aha_definition", payload)
-                    test_case.assertIn("four_conditions", payload)
-                    test_case.assertEqual(payload["four_conditions"][0]["name"], "causal_reconstruction")
-                    test_case.assertIn("stage_spec", payload)
                     test_case.assertIn("stage_examples", payload)
                     test_case.assertIn("ontology_lesson", payload["stage_examples"][0])
                     return {
                         "cards": [
                             {
                                 "title": "退役标准仍会在真实工作流里长期存在",
-                                "section_ids": ["section_demo_1"],
+                                "primary_section_ids": ["section_demo_1"],
+                                "supporting_section_ids": [],
                                 "figure_ids": ["figure_demo_1"],
                                 "granularity_level": "detail",
                                 "draft_body": "这条候选强调的是流程惯性，而不是制度文本本身。",
@@ -4073,13 +4217,7 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
         self.assertEqual(client.calls[1]["stage"], "candidate_judgement")
         self.assertEqual(client.calls[1]["active_calibration_set"], "context-engineering-v1")
         self.assertEqual(client.calls[1]["calibration_examples"][0]["title"], "Legacy standard inertia")
-        self.assertIn("shared_policy", client.calls[1])
-        self.assertIn("stage_spec", client.calls[1])
         self.assertIn("stage_examples", client.calls[1])
-        self.assertIn("ideal_aha_definition", client.calls[1])
-        self.assertIn("four_conditions", client.calls[1])
-        self.assertEqual(client.calls[1]["four_conditions"][0]["name"], "causal_reconstruction")
-        self.assertIn("evaluation_split", client.calls[1])
         self.assertIn("old causal model", client.calls[1]["required_judgement_questions"][3])
         self.assertIn(
             "complete Simplified Chinese translation",
@@ -4914,7 +5052,8 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                         "cards": [
                             {
                                 "title": "把验证反馈变成持续纠偏回路",
-                                "section_ids": ["section_demo_1"],
+                                "primary_section_ids": ["section_demo_1"],
+                                "supporting_section_ids": [],
                                 "granularity_level": "subpattern",
                                 "draft_body": "这条候选强调形式化验证不只是审计，而是持续反馈。",
                                 "evidence_analysis": [
@@ -5066,7 +5205,8 @@ class PhaseZeroWorkflowTests(unittest.TestCase):
                         "cards": [
                             {
                                 "title": "先统一骨架，再并行展开",
-                                "section_ids": ["section_demo_1"],
+                                "primary_section_ids": ["section_demo_1"],
+                                "supporting_section_ids": [],
                                 "granularity_level": "subpattern",
                                 "draft_body": "这张卡强调骨架是后续并行扩写的控制面。",
                                 "evidence_analysis": [

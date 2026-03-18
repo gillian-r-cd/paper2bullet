@@ -10,6 +10,8 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 
 TaskType = Literal["aha_exploration", "claim_evidence"]
+PaperContentBasis = Literal["parsed_fulltext", "abstract_only", "unavailable"]
+PaperQAStatus = Literal["ready", "blocked_abstract_only", "blocked_no_parsed_sections"]
 
 
 class LocalPdfInput(BaseModel):
@@ -25,6 +27,7 @@ class RunCreateRequest(BaseModel):
     use_active_memory: bool = Field(default=True)
     metadata: dict = Field(default_factory=dict)
     local_pdfs: List[LocalPdfInput] = Field(default_factory=list)
+    local_only: bool = Field(default=False)
 
 
 class SearchTermRecommendationRequest(BaseModel):
@@ -143,3 +146,26 @@ class CardSummary(BaseModel):
     teachable_one_liner: str
     review_decision: str
     status: str
+
+
+class PaperQAPaperSummary(BaseModel):
+    id: str
+    title: str
+    access_status: str = Field(default="")
+    parse_status: str = Field(default="")
+
+
+class PaperQACapabilitySummary(BaseModel):
+    available: bool
+    status: PaperQAStatus
+    paper_content_basis: PaperContentBasis
+    message: str
+    section_count: int
+    has_abstract_backed_matrix_items: bool
+    access_status: str = Field(default="")
+    parse_status: str = Field(default="")
+
+
+class PaperQACapabilityResponse(BaseModel):
+    paper: PaperQAPaperSummary
+    qa_status: PaperQACapabilitySummary

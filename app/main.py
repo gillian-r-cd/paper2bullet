@@ -23,6 +23,7 @@ from .schemas import (
     ExportRequest,
     MemoryActivateRequest,
     MemoryDraftRequest,
+    PaperQACapabilityResponse,
     PaperQuestionRequest,
     PromoteExcludedRequest,
     ResearchPlanDraftRequest,
@@ -37,6 +38,7 @@ from .services import (
     AccessQueueService,
     EvaluationService,
     ExportService,
+    PaperQANotReadyError,
     PaperQAService,
     PreferenceMemoryService,
     PreferenceMemoryStore,
@@ -94,6 +96,26 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     def index() -> str:
         return index_html
 
+    def build_paper_qa_capability_response(capability: dict) -> dict:
+        return {
+            "paper": {
+                "id": capability["paper_id"],
+                "title": capability["paper_title"],
+                "access_status": capability["access_status"],
+                "parse_status": capability["parse_status"],
+            },
+            "qa_status": {
+                "available": capability["qa_available"],
+                "status": capability["qa_status"],
+                "paper_content_basis": capability["paper_content_basis"],
+                "message": capability["qa_message"],
+                "section_count": capability["section_count"],
+                "has_abstract_backed_matrix_items": capability["has_abstract_backed_matrix_items"],
+                "access_status": capability["access_status"],
+                "parse_status": capability["parse_status"],
+            },
+        }
+
     @app.get("/api/health")
     def health() -> dict:
         return {"status": "ok", "data_dir": str(app_settings.data_dir), "db_path": str(app_settings.db_path)}
@@ -108,6 +130,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 metadata["task_brief"] = payload.research_brief.strip()
             if payload.confirmed_plan:
                 metadata["confirmed_plan"] = payload.confirmed_plan
+            if payload.local_only:
+                metadata["local_only"] = True
             if payload.use_active_memory:
                 active_memory = memory_store.get_active_memory()
                 if active_memory:
@@ -319,6 +343,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Card plan record not found")
         return {"card_plan": record}
 
+    @app.get("/api/papers/{paper_id}/qa-status", response_model=PaperQACapabilityResponse)
+    def get_paper_qa_status(paper_id: str) -> dict:
+        capability = repository.get_paper_qa_capability(paper_id)
+        if not capability:
+            raise HTTPException(status_code=404, detail="Paper not found")
+        return build_paper_qa_capability_response(capability)
+
     @app.post("/api/papers/{paper_id}/qa")
     def answer_paper_question(paper_id: str, payload: PaperQuestionRequest) -> dict:
         try:
@@ -329,6 +360,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             )
         except LookupError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+        except PaperQANotReadyError as error:
+            raise HTTPException(status_code=409, detail=error.to_detail()) from error
         except (ValueError, LLMGenerationError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {"answer": answer}
@@ -541,6 +574,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         except LookupError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except (ValueError, FileNotFoundError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return result
+
+    @app.post("/api/access-queue/{queue_item_id}/auto-download")
+    def auto_download_access_queue_item(queue_item_id: str) -> dict:
+        try:
+            result = access_queue_service.auto_download_item(queue_item_id, reviewer="internal-ui")
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return result
 

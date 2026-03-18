@@ -80,6 +80,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       <div class="toolbar-actions" style="margin-top: 10px;">
         <label><input id="use-active-memory" type="checkbox" checked> Use Active Memory</label>
         <label><input id="claim-also-generate-cards" type="checkbox"> Also Generate Aha Cards In Claim Mode</label>
+        <label><input id="local-only" type="checkbox"> Local PDFs Only (skip web discovery)</label>
       </div>
       <div class="toolbar-actions" style="margin: 10px 0;">
         <button id="recommend-search-terms">Draft Research Plan</button>
@@ -175,10 +176,10 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     <div id="memory-draft" class="details result-scroll"></div>
   </div>
 
-  <div class="panel" style="margin-top: 20px;">
-    <h2>Single Paper Validation</h2>
-    <details class="panel-collapse">
-      <summary>Show / Hide Single Paper Validation</summary>
+  <div id="single-paper-tools-panel" class="panel" style="margin-top: 20px;">
+    <h2>Single Paper Tools</h2>
+    <details id="single-paper-tools-details" class="panel-collapse">
+      <summary>Show / Hide Single Paper Tools</summary>
     <div style="display: flex; gap: 12px; align-items: end;">
       <div style="flex: 1;">
         <label for="single-validation-paper-id">Paper ID</label>
@@ -194,6 +195,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       </div>
       <button id="run-single-validation">Run Validation</button>
     </div>
+    <div id="single-paper-qa-status" class="details">Enter a paper_id to inspect Paper QA readiness.</div>
     <div style="display: flex; gap: 12px; margin-top: 10px;">
       <button id="load-understanding">Load Understanding</button>
       <button id="load-card-plan">Load Card Plan</button>
@@ -202,7 +204,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     <label for="paper-question" style="margin-top: 10px; display: block;">Ask This Paper</label>
     <textarea id="paper-question" rows="4" placeholder="What exactly does this paper say about boundary conditions or limitations?"></textarea>
     <div class="toolbar-actions" style="margin-top: 8px;">
-      <button id="ask-paper-question">Ask Paper</button>
+      <button id="ask-paper-question" disabled>Ask Paper</button>
     </div>
     <div id="single-validation-result" class="details result-scroll"></div>
     </details>
@@ -228,9 +230,15 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       <h2>Access Queue</h2>
       <details class="panel-collapse" open>
         <summary>Show / Hide Access Queue</summary>
-        <div class="toolbar-actions">
-          <button id="refresh-queue">Refresh Access Queue</button>
-          <button id="export-queue-csv">Export Queue CSV</button>
+        <div class="toolbar">
+          <div style="flex: 1;">
+            <label for="queue-filter-run">Filter by Run ID</label>
+            <input id="queue-filter-run" type="text" placeholder="run_xxx">
+          </div>
+          <div class="toolbar-actions">
+            <button id="refresh-queue">Refresh Access Queue</button>
+            <button id="export-queue-csv">Export Queue CSV</button>
+          </div>
         </div>
         <div id="queue" class="list-surface"></div>
       </details>
@@ -267,6 +275,32 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     let confirmedDraftPlan = null;
     let latestMemoryDraft = null;
     let reviewListScrollTop = 0;
+    let currentPaperQaCapability = null;
+    let singlePaperQaRefreshTimer = 0;
+    let singlePaperQaRequestToken = 0;
+
+    function formatApiErrorDetail(detail) {
+      if (detail === null || detail === undefined) {
+        return "";
+      }
+      if (typeof detail === "string") {
+        return detail;
+      }
+      if (typeof detail === "object") {
+        if (typeof detail.message === "string" && detail.message.trim()) {
+          return detail.message.trim();
+        }
+        if (typeof detail.qa_message === "string" && detail.qa_message.trim()) {
+          return detail.qa_message.trim();
+        }
+        try {
+          return JSON.stringify(detail);
+        } catch (error) {
+          return String(detail);
+        }
+      }
+      return String(detail);
+    }
 
     async function readJson(url, options) {
       const response = await fetch(url, options);
@@ -283,7 +317,8 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         }
       }
       if (!response.ok) {
-        throw new Error(data.detail || bodyText || JSON.stringify(data) || `HTTP ${response.status}`);
+        const detailText = formatApiErrorDetail(data.detail);
+        throw new Error(detailText || bodyText || JSON.stringify(data) || `HTTP ${response.status}`);
       }
       return data;
     }
@@ -348,7 +383,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
 
     function buildAccessQueueFilterParams() {
       const params = new URLSearchParams();
-      const runId = document.getElementById("filter-run").value.trim();
+      const runId = document.getElementById("queue-filter-run").value.trim();
       if (runId) params.set("run_id", runId);
       return params;
     }
@@ -469,6 +504,36 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     function formatPublicationYear(item) {
       const year = item && item.publication_year;
       return year === null || year === undefined || year === "" ? "" : escapeHtml(year);
+    }
+
+    function formatPaperContentBasis(value) {
+      if (value === "parsed_fulltext") return "Parsed Full Text";
+      if (value === "abstract_only") return "Abstract Only";
+      if (value === "unavailable") return "Unavailable";
+      return value ? escapeHtml(value) : "";
+    }
+
+    function formatPaperQaStatusLabel(value) {
+      if (value === "ready") return "Ready";
+      if (value === "blocked_abstract_only") return "Blocked: Abstract Only";
+      if (value === "blocked_no_parsed_sections") return "Blocked: No Parsed Sections";
+      return value ? escapeHtml(value) : "";
+    }
+
+    function formatMatrixEvidenceBasis(item) {
+      const basis = item && item.matrix_evidence_basis;
+      if (basis === "abstract_only") return "Abstract Only";
+      if (basis === "full_text") return "Full Text";
+      return "";
+    }
+
+    function formatMatrixPaperQaSummary(item) {
+      if (!item || item.object_type !== "matrix_item") {
+        return "";
+      }
+      const availability = item.paper_qa_available ? "Available" : "Unavailable";
+      const contentBasis = formatPaperContentBasis(item.paper_content_basis || "");
+      return [contentBasis, availability].filter(Boolean).join(" | ");
     }
 
     function currentExportKind() {
@@ -688,6 +753,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
           ? `${item.display_title} -> ${item.promoted_card_title}`
           : item.display_title;
         const commentPreview = summarizeText(item.comment_text || "", 72);
+        const matrixPaperQaSummary = formatMatrixPaperQaSummary(item);
         const mainRow = `
           <tr data-row-key="${rowKey}">
             <td>${selectable ? `<input type="checkbox" class="export-select" value="${item.object_id}" ${exportSelectedItemIds.has(item.object_id) ? "checked" : ""}>` : ""}</td>
@@ -696,6 +762,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
             <td>${item.topic_name}</td>
             <td>${formatPaperCell(item)}</td>
             <td>${formatPublicationYear(item)}</td>
+            <td title="${item.object_type === "matrix_item" ? escapeHtml(item.paper_qa_message || "") : ""}">${matrixPaperQaSummary}</td>
             <td>${displayTitle}</td>
             <td class="${colorClass}">${item.color || ""}</td>
             <td>${item.course_transformation || ""}</td>
@@ -712,14 +779,14 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         const detailContent = expandedItem ? renderReviewItemDetail(expandedItem) : "Loading...";
         return `${mainRow}
           <tr>
-            <td colspan="14"><div class="inline-details">${detailContent}</div></td>
+            <td colspan="15"><div class="inline-details">${detailContent}</div></td>
           </tr>
         `;
       }).join("");
       document.getElementById("review-items").innerHTML = `
         <table>
           <tr>
-            <th></th><th>Type</th><th>ID</th><th>Topic</th><th>Paper</th><th>Year</th><th>Title</th><th>Color</th><th>Course Use</th><th>Exclusion Type</th><th>Review</th><th>Comment</th><th>Export</th><th>Actions</th>
+            <th></th><th>Type</th><th>ID</th><th>Topic</th><th>Paper</th><th>Year</th><th>Paper QA</th><th>Title</th><th>Color</th><th>Course Use</th><th>Exclusion Type</th><th>Review</th><th>Comment</th><th>Export</th><th>Actions</th>
           </tr>
           ${rows}
         </table>
@@ -727,8 +794,30 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       restoreReviewListScroll();
     }
 
+    async function autoDownloadAccessQueueItem(queueItemId) {
+      const btn = document.querySelector(`button[data-auto-dl="${queueItemId}"]`);
+      if (btn) { btn.disabled = true; btn.textContent = "Downloading…"; }
+      try {
+        const payload = await readJson(`/api/access-queue/${queueItemId}/auto-download`, { method: "POST" });
+        document.getElementById("start-result").textContent = JSON.stringify(payload, null, 2);
+        if (!payload.success) alert(payload.message || "Auto-download failed.");
+        await refreshQueue();
+        await refreshRuns();
+        await refreshReviewItems();
+      } catch (error) {
+        alert(`Auto-download failed: ${error.message}`);
+        if (btn) { btn.disabled = false; btn.textContent = "Auto Download"; }
+      }
+    }
+
     function renderQueue(items) {
-      const rows = items.map(item => `
+      const rows = items.map(item => {
+        const hasAssetUrl = item.best_asset_url || item.paper_external_id;
+        const actions = item.status === "open" ? `
+          ${hasAssetUrl ? `<button data-auto-dl="${item.id}" onclick="autoDownloadAccessQueueItem('${item.id}')">Auto Download</button>` : ""}
+          <button onclick="reactivateAccessQueueItem('${item.id}')">Reactivate (local)</button>
+        ` : "";
+        return `
         <tr>
           <td class="mono">${item.id}</td>
           <td>${item.paper_title}</td>
@@ -736,10 +825,10 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
           <td>${item.reason}</td>
           <td>${item.priority}</td>
           <td>${item.status}</td>
-          <td class="mono">${item.original_url || ""}</td>
-          <td>${item.status === "open" ? `<button onclick="reactivateAccessQueueItem('${item.id}')">Reactivate</button>` : ""}</td>
+          <td class="mono">${item.best_asset_url ? `<a href="${escapeHtml(item.best_asset_url)}" target="_blank" rel="noreferrer">${escapeHtml(item.best_asset_url)}</a>` : (item.original_url || "")}</td>
+          <td style="white-space:nowrap">${actions}</td>
         </tr>
-      `).join("");
+      `}).join("");
       document.getElementById("queue").innerHTML = `
         <div class="table-wrap"><table>
           <tr><th>Queue ID</th><th>Paper</th><th>Year</th><th>Reason</th><th>Priority</th><th>Status</th><th>URL</th><th>Action</th></tr>
@@ -875,6 +964,120 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       };
     }
 
+    function renderSinglePaperQaStatus(payload, errorMessage = "") {
+      const container = document.getElementById("single-paper-qa-status");
+      const askButton = document.getElementById("ask-paper-question");
+      if (errorMessage) {
+        currentPaperQaCapability = null;
+        askButton.disabled = true;
+        askButton.title = errorMessage;
+        container.textContent = errorMessage;
+        return;
+      }
+      if (!payload) {
+        currentPaperQaCapability = null;
+        askButton.disabled = true;
+        askButton.title = "Enter a paper_id with parsed full text to enable Paper QA.";
+        container.textContent = "Enter a paper_id to inspect Paper QA readiness.";
+        return;
+      }
+      currentPaperQaCapability = payload;
+      const paper = payload.paper || {};
+      const qa = payload.qa_status || {};
+      askButton.disabled = !qa.available;
+      askButton.title = qa.available
+        ? "Full-paper QA is available."
+        : (qa.message || "Full-paper QA is unavailable.");
+      container.innerHTML = `
+        <div><strong>Paper QA Status</strong></div>
+        <div class="detail-line"><strong>Paper:</strong> ${escapeHtml(paper.title || paper.id || "")}</div>
+        <div class="detail-line"><strong>Access status:</strong> ${escapeHtml(paper.access_status || qa.access_status || "")}</div>
+        <div class="detail-line"><strong>Parse status:</strong> ${escapeHtml(paper.parse_status || qa.parse_status || "")}</div>
+        <div class="detail-line"><strong>Content basis:</strong> ${formatPaperContentBasis(qa.paper_content_basis || "")}</div>
+        <div class="detail-line"><strong>QA status:</strong> ${formatPaperQaStatusLabel(qa.status || "")}</div>
+        <div class="detail-line"><strong>Section count:</strong> ${escapeHtml(qa.section_count ?? 0)}</div>
+        <div class="detail-line"><strong>Message:</strong> ${escapeHtml(qa.message || "")}</div>
+      `;
+    }
+
+    async function refreshSinglePaperQaStatus() {
+      const { paperId } = getSingleValidationInput();
+      if (!paperId) {
+        renderSinglePaperQaStatus(null);
+        return null;
+      }
+      const requestToken = ++singlePaperQaRequestToken;
+      document.getElementById("single-paper-qa-status").textContent = "Loading Paper QA status...";
+      document.getElementById("ask-paper-question").disabled = true;
+      try {
+        const payload = await readJson(`/api/papers/${paperId}/qa-status`);
+        if (requestToken !== singlePaperQaRequestToken) {
+          return null;
+        }
+        renderSinglePaperQaStatus(payload);
+        return payload;
+      } catch (error) {
+        if (requestToken !== singlePaperQaRequestToken) {
+          return null;
+        }
+        renderSinglePaperQaStatus(null, `Paper QA status lookup failed: ${error.message}`);
+        return null;
+      }
+    }
+
+    function scheduleSinglePaperQaRefresh() {
+      if (singlePaperQaRefreshTimer) {
+        window.clearTimeout(singlePaperQaRefreshTimer);
+      }
+      singlePaperQaRefreshTimer = window.setTimeout(() => {
+        refreshSinglePaperQaStatus();
+      }, 250);
+    }
+
+    async function ensureSinglePaperQaReady(actionLabel) {
+      const output = document.getElementById("single-validation-result");
+      const { paperId } = getSingleValidationInput();
+      if (!paperId) {
+        output.textContent = "paper_id is required.";
+        return null;
+      }
+      let payload = currentPaperQaCapability;
+      if (!payload || (payload.paper || {}).id !== paperId) {
+        payload = await refreshSinglePaperQaStatus();
+      }
+      if (!payload) {
+        output.textContent = `${actionLabel} unavailable: unable to determine Paper QA readiness.`;
+        return null;
+      }
+      const qa = payload.qa_status || {};
+      if (!qa.available) {
+        output.textContent = `${actionLabel} unavailable: ${qa.message || "This paper does not yet have parsed full-text sections, so full-paper QA is unavailable."}`;
+        return null;
+      }
+      return payload;
+    }
+
+    async function prefillSinglePaperTools(paperId, topicId, runId) {
+      document.getElementById("single-validation-paper-id").value = paperId || "";
+      if (topicId) {
+        document.getElementById("single-validation-topic-id").value = topicId;
+      }
+      if (runId) {
+        document.getElementById("single-validation-run-id").value = runId;
+      }
+      document.getElementById("single-validation-result").textContent = "";
+      const details = document.getElementById("single-paper-tools-details");
+      if (details) {
+        details.open = true;
+      }
+      const panel = document.getElementById("single-paper-tools-panel");
+      if (panel) {
+        panel.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+      await refreshSinglePaperQaStatus();
+      document.getElementById("paper-question").focus();
+    }
+
     async function fetchStoredValidationCards(paperId, topicId, runId) {
       const params = new URLSearchParams({ run_id: runId, paper_id: paperId, topic_id: topicId });
       const payload = await readJson(`/api/cards?${params.toString()}`);
@@ -891,6 +1094,9 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       const { paperId, topicId, runId } = getSingleValidationInput();
       if (!paperId || !topicId || !runId) {
         output.textContent = "paper_id / topic_id / run_id are required.";
+        return;
+      }
+      if (!await ensureSinglePaperQaReady("Single paper validation")) {
         return;
       }
       try {
@@ -917,6 +1123,9 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         output.textContent = "paper_id / topic_id / run_id are required.";
         return;
       }
+      if (!await ensureSinglePaperQaReady("Load understanding")) {
+        return;
+      }
       try {
         const params = new URLSearchParams({ topic_id: topicId, run_id: runId });
         const payload = await readJson(`/api/papers/${paperId}/understanding?${params.toString()}`);
@@ -934,6 +1143,9 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         output.textContent = "paper_id / topic_id / run_id are required.";
         return;
       }
+      if (!await ensureSinglePaperQaReady("Load card plan")) {
+        return;
+      }
       try {
         const params = new URLSearchParams({ topic_id: topicId, run_id: runId });
         const payload = await readJson(`/api/papers/${paperId}/card-plan?${params.toString()}`);
@@ -949,6 +1161,9 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       const { paperId, topicId, runId } = getSingleValidationInput();
       if (!paperId || !topicId || !runId) {
         output.textContent = "paper_id / topic_id / run_id are required.";
+        return;
+      }
+      if (!await ensureSinglePaperQaReady("Load stored cards")) {
         return;
       }
       try {
@@ -976,6 +1191,9 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
       }
       if (!question) {
         output.textContent = "paper question is required.";
+        return;
+      }
+      if (!await ensureSinglePaperQaReady("Paper QA")) {
         return;
       }
       try {
@@ -1087,6 +1305,11 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
             <div><strong>Why it matters:</strong> ${escapeHtml(entry.analysis || "")}</div>
           </li>
         `).join("");
+        const paperQaAvailable = Boolean(item.paper_qa_available);
+        const paperQaMessage = item.paper_qa_message || "";
+        const askPaperButtonTitle = paperQaAvailable
+          ? "Open this paper in Single Paper Tools."
+          : (paperQaMessage || "Full-paper QA is unavailable.");
         return `
           <div class="detail-summary">
             <div class="detail-box">
@@ -1101,6 +1324,24 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
               <div class="detail-line"><strong>Claim:</strong> ${escapeHtml(item.claim_text || "")}</div>
               <div class="detail-line"><strong>Limitation:</strong> ${escapeHtml(item.limitation_text || "")}</div>
               <div class="detail-line"><strong>Review:</strong> ${escapeHtml(((item.review || {}).decision) || "")} | ${escapeHtml(((item.review || {}).note) || "")}</div>
+            </div>
+            <div class="detail-box">
+              <h4>Paper QA</h4>
+              <div class="detail-line"><strong>Evidence basis:</strong> ${formatMatrixEvidenceBasis(item)}</div>
+              <div class="detail-line"><strong>Paper content basis:</strong> ${formatPaperContentBasis(item.paper_content_basis || "")}</div>
+              <div class="detail-line"><strong>Paper access status:</strong> ${escapeHtml(item.paper_access_status || "")}</div>
+              <div class="detail-line"><strong>Paper parse status:</strong> ${escapeHtml(item.paper_parse_status || "")}</div>
+              <div class="detail-line"><strong>Paper section count:</strong> ${escapeHtml(item.paper_section_count ?? 0)}</div>
+              <div class="detail-line"><strong>Paper QA:</strong> ${paperQaAvailable ? "Available" : "Unavailable"}</div>
+              <div class="detail-line"><strong>QA status:</strong> ${formatPaperQaStatusLabel(item.paper_qa_status || "")}</div>
+              <div class="detail-line"><strong>Reason:</strong> ${escapeHtml(paperQaMessage || (paperQaAvailable ? "Full-paper QA is available." : ""))}</div>
+              <div class="detail-line" style="margin-top: 8px;">
+                <button
+                  onclick="prefillSinglePaperTools('${item.paper_id || ""}', '${item.topic_id || ""}', '${item.run_id || ""}')"
+                  ${paperQaAvailable ? "" : "disabled"}
+                  title="${escapeHtml(askPaperButtonTitle)}"
+                >Ask This Paper</button>
+              </div>
             </div>
             <div class="detail-box">
               <h4>Citation</h4>
@@ -1338,6 +1579,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
             topics_text: topicsText,
             metadata,
             local_pdfs: localPdfs,
+            local_only: document.getElementById("local-only").checked,
             research_brief: researchBrief,
             task_type: taskType,
             confirmed_plan: confirmedDraftPlan || {},
@@ -1347,6 +1589,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
         resultNode.textContent = JSON.stringify(payload, null, 2);
         if (payload.run && payload.run.id) {
           document.getElementById("filter-run").value = payload.run.id;
+          document.getElementById("queue-filter-run").value = payload.run.id;
           document.getElementById("export-run-id").value = payload.run.id;
         }
         await refreshRuns();
@@ -1384,6 +1627,8 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     document.getElementById("load-card-plan").addEventListener("click", loadCardPlan);
     document.getElementById("load-stored-cards").addEventListener("click", loadStoredValidationCards);
     document.getElementById("ask-paper-question").addEventListener("click", askPaperQuestion);
+    document.getElementById("single-validation-paper-id").addEventListener("input", scheduleSinglePaperQaRefresh);
+    document.getElementById("single-validation-paper-id").addEventListener("change", refreshSinglePaperQaStatus);
     document.getElementById("export-run-id").addEventListener("change", refreshExportOptions);
     document.getElementById("export-kind").addEventListener("change", refreshExportOptions);
 
@@ -1426,6 +1671,7 @@ Data shown: topics, local PDFs, cards, reviews, and export selections.
     refreshQualityMetrics();
     refreshSaturationTrends();
     refreshActiveMemory();
+    refreshSinglePaperQaStatus();
     refreshExportOptions();
   </script>
 </body>

@@ -61,6 +61,25 @@ except ImportError:  # pragma: no cover - optional dependency
     Image = None
 
 
+PAPER_CONTENT_BASIS_PARSED_FULLTEXT = "parsed_fulltext"
+PAPER_CONTENT_BASIS_ABSTRACT_ONLY = "abstract_only"
+PAPER_CONTENT_BASIS_UNAVAILABLE = "unavailable"
+
+PAPER_QA_STATUS_READY = "ready"
+PAPER_QA_STATUS_BLOCKED_ABSTRACT_ONLY = "blocked_abstract_only"
+PAPER_QA_STATUS_BLOCKED_NO_PARSED_SECTIONS = "blocked_no_parsed_sections"
+
+PAPER_QA_STATUS_MESSAGES = {
+    PAPER_QA_STATUS_READY: "Full-paper QA is available.",
+    PAPER_QA_STATUS_BLOCKED_ABSTRACT_ONLY: (
+        "This paper currently only has abstract-level evidence. Full-paper QA is unavailable until full text is acquired and parsed."
+    ),
+    PAPER_QA_STATUS_BLOCKED_NO_PARSED_SECTIONS: (
+        "This paper does not yet have parsed full-text sections, so full-paper QA is unavailable."
+    ),
+}
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1333,11 +1352,96 @@ class Repository:
         row["source_excluded_content_id"] = row.get("source_excluded_content_id")
         return row
 
-    def _hydrate_matrix_row(self, row: dict) -> dict:
+    def _build_paper_qa_capability(
+        self,
+        paper: dict[str, Any],
+        *,
+        section_count: int,
+        has_abstract_backed_matrix_items: bool,
+    ) -> dict[str, Any]:
+        if section_count > 0:
+            paper_content_basis = PAPER_CONTENT_BASIS_PARSED_FULLTEXT
+            qa_available = True
+            qa_status = PAPER_QA_STATUS_READY
+        elif has_abstract_backed_matrix_items:
+            paper_content_basis = PAPER_CONTENT_BASIS_ABSTRACT_ONLY
+            qa_available = False
+            qa_status = PAPER_QA_STATUS_BLOCKED_ABSTRACT_ONLY
+        else:
+            paper_content_basis = PAPER_CONTENT_BASIS_UNAVAILABLE
+            qa_available = False
+            qa_status = PAPER_QA_STATUS_BLOCKED_NO_PARSED_SECTIONS
+        return {
+            "paper_id": paper["id"],
+            "paper_title": str(paper.get("title", "")).strip(),
+            "access_status": str(paper.get("access_status", "")).strip(),
+            "parse_status": str(paper.get("parse_status", "")).strip(),
+            "section_count": int(section_count or 0),
+            "paper_content_basis": paper_content_basis,
+            "qa_available": qa_available,
+            "qa_status": qa_status,
+            "qa_message": PAPER_QA_STATUS_MESSAGES[qa_status],
+            "has_abstract_backed_matrix_items": bool(has_abstract_backed_matrix_items),
+        }
+
+    def _matrix_item_is_abstract_only(self, item: dict[str, Any]) -> bool:
+        supporting_ids = list(item.get("supporting_section_ids", []) or [])
+        return bool(supporting_ids and all(str(section_id).startswith("abstract_meta::") for section_id in supporting_ids))
+
+    def get_paper_qa_capability(
+        self,
+        paper_id: str,
+        *,
+        matrix_items: Optional[list[dict[str, Any]]] = None,
+    ) -> Optional[dict[str, Any]]:
+        paper = self.get_paper(paper_id)
+        if not paper:
+            return None
+        sections = self.get_sections(paper_id)
+        resolved_matrix_items = matrix_items
+        if resolved_matrix_items is None:
+            resolved_matrix_items = self.list_matrix_items(paper_id=paper_id, include_paper_qa=False)
+        has_abstract_backed_matrix_items = any(
+            self._matrix_item_is_abstract_only(item)
+            for item in resolved_matrix_items
+        )
+        return self._build_paper_qa_capability(
+            paper,
+            section_count=len(sections),
+            has_abstract_backed_matrix_items=has_abstract_backed_matrix_items,
+        )
+
+    def _hydrate_matrix_row(
+        self,
+        row: dict,
+        *,
+        include_paper_qa: bool = True,
+        paper_qa_capability_cache: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> dict:
         row["evidence"] = self._hydrate_evidence(json.loads(row["evidence_json"]))
         row["figure_ids"] = json.loads(row.get("figure_ids_json", "[]") or "[]")
         row["supporting_section_ids"] = json.loads(row.get("supporting_section_ids_json", "[]") or "[]")
         row["paper_url"] = row.get("paper_url", "")
+        row["matrix_evidence_basis"] = "abstract_only" if self._matrix_item_is_abstract_only(row) else "full_text"
+        if include_paper_qa and row.get("paper_id"):
+            cache = paper_qa_capability_cache if paper_qa_capability_cache is not None else {}
+            paper_id = str(row["paper_id"])
+            capability = cache.get(paper_id)
+            if capability is None:
+                matrix_items = self.list_matrix_items(paper_id=paper_id, include_paper_qa=False)
+                capability = self.get_paper_qa_capability(paper_id, matrix_items=matrix_items)
+                if capability is not None:
+                    cache[paper_id] = capability
+            if capability:
+                row["paper_access_status"] = str(row.get("paper_access_status", "")).strip() or capability["access_status"]
+                row["paper_parse_status"] = str(row.get("paper_parse_status", "")).strip() or capability["parse_status"]
+                row["paper_content_basis"] = capability["paper_content_basis"]
+                row["paper_qa_available"] = capability["qa_available"]
+                row["paper_qa_status"] = capability["qa_status"]
+                row["paper_qa_message"] = capability["qa_message"]
+                row["paper_has_parsed_sections"] = capability["section_count"] > 0
+                row["paper_section_count"] = capability["section_count"]
+                row["paper_has_abstract_backed_matrix_items"] = capability["has_abstract_backed_matrix_items"]
         return row
 
     def _hydrate_figure_row(self, row: dict) -> dict:
@@ -3232,7 +3336,8 @@ class Repository:
         row = self._fetchone(
             """
             SELECT evidence_matrix_items.*, papers.title AS paper_title, papers.original_url AS paper_url,
-                   papers.publication_year AS publication_year, topics.name AS topic_name
+                   papers.publication_year AS publication_year, papers.access_status AS paper_access_status,
+                   papers.parse_status AS paper_parse_status, topics.name AS topic_name
             FROM evidence_matrix_items
             JOIN papers ON papers.id = evidence_matrix_items.paper_id
             JOIN topics ON topics.id = evidence_matrix_items.topic_id
@@ -3242,7 +3347,7 @@ class Repository:
         )
         if not row:
             return None
-        row = self._hydrate_matrix_row(row)
+        row = self._hydrate_matrix_row(row, paper_qa_capability_cache={})
         row["review"] = self.get_latest_review_decision("matrix_item", matrix_item_id)
         row["comment"] = self.get_review_item_comment("matrix_item", matrix_item_id)
         row["figures"] = self.get_figures_by_ids(row["paper_id"], row.get("figure_ids", []))
@@ -3372,6 +3477,7 @@ class Repository:
         topic: str = "",
         paper_id: Optional[str] = None,
         topic_id: Optional[str] = None,
+        include_paper_qa: bool = True,
     ) -> list[dict]:
         params: list[str] = []
         filters = []
@@ -3395,6 +3501,8 @@ class Repository:
                 papers.title AS paper_title,
                 papers.original_url AS paper_url,
                 papers.publication_year AS publication_year,
+                papers.access_status AS paper_access_status,
+                papers.parse_status AS paper_parse_status,
                 topics.name AS topic_name,
                 (
                     SELECT decision FROM review_decisions
@@ -3410,8 +3518,13 @@ class Repository:
             """,
             tuple(params),
         )
+        paper_qa_capability_cache: dict[str, dict[str, Any]] = {}
         for row in rows:
-            self._hydrate_matrix_row(row)
+            self._hydrate_matrix_row(
+                row,
+                include_paper_qa=include_paper_qa,
+                paper_qa_capability_cache=paper_qa_capability_cache,
+            )
         return rows
 
     def get_quality_metrics(self, run_id: Optional[str] = None) -> dict[str, Any]:
@@ -3597,11 +3710,20 @@ class Repository:
                     {
                         "object_type": "matrix_item",
                         "object_id": item["id"],
+                        "paper_id": item["paper_id"],
                         "run_id": item["run_id"],
                         "topic_name": item["topic_name"],
                         "paper_title": item["paper_title"],
                         "publication_year": item.get("publication_year"),
                         "paper_url": item.get("paper_url", ""),
+                        "paper_access_status": item.get("paper_access_status", ""),
+                        "paper_parse_status": item.get("paper_parse_status", ""),
+                        "paper_content_basis": item.get("paper_content_basis", ""),
+                        "paper_qa_available": bool(item.get("paper_qa_available")),
+                        "paper_qa_status": item.get("paper_qa_status", ""),
+                        "paper_qa_message": item.get("paper_qa_message", ""),
+                        "paper_section_count": int(item.get("paper_section_count", 0) or 0),
+                        "matrix_evidence_basis": item.get("matrix_evidence_basis", ""),
                         "display_title": item["summary"],
                         "color": item.get("verdict", ""),
                         "course_transformation": item.get("outcome_label", ""),
@@ -3689,25 +3811,22 @@ class Repository:
         return None
 
     def list_access_queue(self, run_id: Optional[str] = None) -> list[dict]:
-        if run_id:
-            return self._fetchall(
-                """
-                SELECT access_queue.*, papers.title AS paper_title, papers.original_url, papers.publication_year
-                FROM access_queue
-                JOIN papers ON papers.id = access_queue.paper_id
-                WHERE access_queue.run_id = ?
-                ORDER BY access_queue.created_at DESC
-                """,
-                (run_id,),
-            )
-        return self._fetchall(
-            """
-            SELECT access_queue.*, papers.title AS paper_title, papers.original_url, papers.publication_year
+        base_query = """
+            SELECT access_queue.*, papers.title AS paper_title, papers.original_url,
+                   papers.publication_year, papers.external_id AS paper_external_id,
+                   (SELECT dr.asset_url FROM discovery_results dr
+                    WHERE dr.paper_id = access_queue.paper_id
+                      AND dr.asset_url IS NOT NULL AND dr.asset_url != ''
+                    ORDER BY dr.created_at DESC LIMIT 1) AS best_asset_url
             FROM access_queue
             JOIN papers ON papers.id = access_queue.paper_id
-            ORDER BY access_queue.created_at DESC
-            """
-        )
+        """
+        if run_id:
+            return self._fetchall(
+                base_query + " WHERE access_queue.run_id = ? ORDER BY access_queue.created_at DESC",
+                (run_id,),
+            )
+        return self._fetchall(base_query + " ORDER BY access_queue.created_at DESC")
 
     def list_cards_for_export(self, run_id: str, card_ids: list[str]) -> list[dict]:
         placeholders = ",".join("?" for _ in card_ids) or "''"
@@ -3743,7 +3862,8 @@ class Repository:
         rows = self._fetchall(
             f"""
             SELECT evidence_matrix_items.*, papers.title AS paper_title, papers.original_url AS paper_url,
-                   papers.publication_year AS publication_year, topics.name AS topic_name
+                   papers.publication_year AS publication_year, papers.access_status AS paper_access_status,
+                   papers.parse_status AS paper_parse_status, topics.name AS topic_name
             FROM evidence_matrix_items
             JOIN papers ON papers.id = evidence_matrix_items.paper_id
             JOIN topics ON topics.id = evidence_matrix_items.topic_id
@@ -3752,8 +3872,9 @@ class Repository:
             """,
             tuple(params),
         )
+        paper_qa_capability_cache: dict[str, dict[str, Any]] = {}
         for row in rows:
-            self._hydrate_matrix_row(row)
+            self._hydrate_matrix_row(row, paper_qa_capability_cache=paper_qa_capability_cache)
             row["review"] = self.get_latest_review_decision("matrix_item", row["id"])
             row["comment"] = self.get_review_item_comment("matrix_item", row["id"])
             row["figures"] = self.get_figures_by_ids(row["paper_id"], row.get("figure_ids", []))
@@ -4948,7 +5069,11 @@ class PaperPipeline:
         destination_base = self.settings.artifacts_dir / paper["id"]
         temporary_path = destination_base.with_suffix(".download")
         try:
-            with urllib.request.urlopen(asset_url, timeout=self.settings.remote_asset_timeout_seconds) as response, temporary_path.open("wb") as handle:
+            req = urllib.request.Request(
+                asset_url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; paper2bullet/1.0)"},
+            )
+            with urllib.request.urlopen(req, timeout=self.settings.remote_asset_timeout_seconds) as response, temporary_path.open("wb") as handle:
                 shutil.copyfileobj(response, handle)
             suffix = self._infer_downloaded_asset_suffix(temporary_path, parsed.path)
             destination = destination_base.with_suffix(suffix)
@@ -4959,6 +5084,48 @@ class PaperPipeline:
             temporary_path.unlink(missing_ok=True)
             return None
         return str(destination)
+
+    def _unpaywall_get_pdf_url(self, doi: str) -> Optional[str]:
+        """Query Unpaywall API for a direct open-access PDF URL given a DOI."""
+        doi = doi.strip()
+        if not doi:
+            return None
+        api_url = f"https://api.unpaywall.org/v2/{urllib.parse.quote(doi, safe='')}?email=paper2bullet@local"
+        try:
+            req = urllib.request.Request(api_url, headers={"User-Agent": "paper2bullet/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read())
+            locations: list = []
+            best = data.get("best_oa_location")
+            if best:
+                locations.append(best)
+            locations += data.get("oa_locations") or []
+            for loc in locations:
+                pdf_url = loc.get("url_for_pdf")
+                if pdf_url:
+                    return str(pdf_url).strip()
+        except Exception:
+            pass
+        return None
+
+    def acquire_remote_asset_with_oa_fallback(self, paper: dict, asset_url: str) -> Optional[str]:
+        """Try acquiring the asset from asset_url first; on failure, fall back to Unpaywall."""
+        result = self.acquire_remote_asset(paper, asset_url)
+        if result:
+            return result
+        # Extract DOI from external_id (format: "doi::10.xxxx/...")
+        external_id = str(paper.get("external_id") or "")
+        doi = ""
+        if external_id.startswith("doi::"):
+            doi = external_id[5:]
+        elif external_id.startswith("doi:"):
+            doi = external_id[4:]
+        if not doi:
+            return None
+        oa_pdf_url = self._unpaywall_get_pdf_url(doi)
+        if not oa_pdf_url:
+            return None
+        return self.acquire_remote_asset(paper, oa_pdf_url)
 
     def _infer_downloaded_asset_suffix(self, downloaded_path: Path, url_path: str) -> str:
         head = downloaded_path.read_bytes()[:4096]
@@ -5440,8 +5607,8 @@ class PaperPipeline:
         objects.sort(key=lambda item: float(item.get("importance_score", 0.0)), reverse=True)
         planned_cards = []
         for obj in objects:
-            evidence_ids = list((understanding.get("evidence_index", {}).get(obj["id"], {}) or {}).get("section_ids", []))
-            level = str((understanding.get("candidate_level_hints", {}) or {}).get(obj["id"], obj.get("level_hint", "detail"))).strip().lower()
+            evidence_ids = [str(s) for s in (obj.get("evidence_section_ids") or [])]
+            level = str(obj.get("level_hint", "detail")).strip().lower()
             if level not in {"overall", "local", "detail"}:
                 level = "detail"
             disposition = "produce" if evidence_ids else "exclude"
@@ -6770,6 +6937,28 @@ class PreferenceMemoryService:
         }
 
 
+class PaperQANotReadyError(ValueError):
+    def __init__(self, capability: dict[str, Any]):
+        self.capability = capability
+        super().__init__(capability.get("qa_message", "Paper QA is not ready"))
+
+    def to_detail(self) -> dict[str, Any]:
+        return {
+            "code": "paper_qa_not_ready",
+            "status": self.capability.get("qa_status", ""),
+            "qa_status": self.capability.get("qa_status", ""),
+            "message": self.capability.get("qa_message", ""),
+            "qa_message": self.capability.get("qa_message", ""),
+            "paper_content_basis": self.capability.get("paper_content_basis", ""),
+            "access_status": self.capability.get("access_status", ""),
+            "parse_status": self.capability.get("parse_status", ""),
+            "section_count": int(self.capability.get("section_count", 0) or 0),
+            "has_abstract_backed_matrix_items": bool(self.capability.get("has_abstract_backed_matrix_items", False)),
+            "paper_id": self.capability.get("paper_id", ""),
+            "paper_title": self.capability.get("paper_title", ""),
+        }
+
+
 class PaperQAService:
     def __init__(
         self,
@@ -6787,12 +6976,17 @@ class PaperQAService:
         paper = self.repository.get_paper(paper_id)
         if not paper:
             raise LookupError("Paper not found")
+        capability = self.repository.get_paper_qa_capability(paper_id)
+        if not capability:
+            raise LookupError("Paper not found")
+        if not capability["qa_available"]:
+            raise PaperQANotReadyError(capability)
         normalized_question = str(question or "").strip()
         if not normalized_question:
             raise ValueError("question is required")
         sections = self.repository.get_sections(paper_id)
         if not sections:
-            raise ValueError("Paper has no parsed sections")
+            raise PaperQANotReadyError(self.repository.get_paper_qa_capability(paper_id) or capability)
         if not self.llm_engine.is_enabled():
             raise LLMGenerationError("LLM provider is not enabled")
         scored_sections = self._rank_sections(normalized_question, sections, limit=max_sections)
@@ -6803,14 +6997,14 @@ class PaperQAService:
             if set(figure.get("linked_section_ids", [])).intersection(selected_ids)
         ][:4]
         answer = self.llm_engine.answer_paper_question(
-            paper_title=paper["title"],
+            paper_title=capability.get("paper_title", paper["title"]),
             question=normalized_question,
             sections=scored_sections,
             figures=figures,
             active_memory=self.memory_store.get_active_memory(),
         )
         answer["paper_id"] = paper_id
-        answer["paper_title"] = paper["title"]
+        answer["paper_title"] = capability.get("paper_title", paper["title"])
         answer["question"] = normalized_question
         return answer
 
@@ -7128,6 +7322,95 @@ class AccessQueueService:
 
         self.coordinator._refresh_run_status_from_topics(queue_item["run_id"])
         return {
+            "queue_item": self.repository.get_access_queue_item(queue_item_id),
+            "paper": self.repository.get_paper(paper["id"]),
+            "topic_runs": [item for item in processed_topics if item],
+        }
+
+    def auto_download_item(self, queue_item_id: str, reviewer: str) -> dict:
+        queue_item = self.repository.get_access_queue_item(queue_item_id)
+        if not queue_item:
+            raise LookupError("Access queue item not found")
+        if queue_item["status"] != "open":
+            raise ValueError(f"Access queue item {queue_item_id} is not open")
+        paper = self.repository.get_paper(queue_item["paper_id"])
+        if not paper:
+            raise LookupError("Paper not found for access queue item")
+
+        # Try best_asset_url from discovery_results first, then Unpaywall
+        enriched = self.repository.list_access_queue(queue_item["run_id"])
+        best_asset_url = next(
+            (item.get("best_asset_url") for item in enriched if item["id"] == queue_item_id),
+            None,
+        ) or ""
+        artifact_path = self.pipeline.acquire_remote_asset(paper, best_asset_url) if best_asset_url else None
+        if not artifact_path:
+            artifact_path = self.pipeline.acquire_remote_asset_with_oa_fallback(paper, "")
+        if not artifact_path:
+            return {"success": False, "message": "Could not download PDF automatically. Please reactivate manually."}
+
+        self.repository.update_paper(
+            paper["id"],
+            artifact_path=artifact_path,
+            access_status="open_fulltext",
+            ingestion_status="artifact_ready",
+            parse_status="pending",
+            parse_failure_reason="",
+            card_generation_status="pending",
+            card_generation_failure_reason="",
+        )
+        self.repository.update_access_queue_item(queue_item_id, status="reactivated", owner=reviewer)
+
+        refreshed_paper = self.repository.get_paper(paper["id"])
+        if not refreshed_paper:
+            raise LookupError("Paper disappeared during auto-download reactivation")
+        self.pipeline.parse_and_store(refreshed_paper)
+        refreshed_paper = self.repository.get_paper(paper["id"])
+        topic_runs = self.repository.list_topic_runs_for_paper_run(paper["id"], queue_item["run_id"])
+        task_context = self.coordinator._get_run_task_context(queue_item["run_id"])
+        processed_topics = []
+
+        for topic_run in topic_runs:
+            stats = topic_run["stats"]
+            self.coordinator._mark_topic_progress(topic_run["id"], stats, stage="parsing")
+            if refreshed_paper and refreshed_paper["parse_status"] == "parsed":
+                output_counts = self.coordinator._build_task_outputs_for_paper(
+                    refreshed_paper,
+                    {"id": topic_run["topic_id"], "name": topic_run["topic_name"]},
+                    queue_item["run_id"],
+                    task_context=task_context,
+                )
+                stats["parsed_papers"] = stats.get("parsed_papers", 0) + 1
+                stats["cards"] = int(stats.get("cards", 0) or 0) + int(output_counts.get("cards", 0) or 0)
+                stats["matrix_items"] = int(stats.get("matrix_items", 0) or 0) + int(output_counts.get("matrix_items", 0) or 0)
+            else:
+                self.repository.replace_cards_for_paper_topic(paper["id"], topic_run["topic_id"], queue_item["run_id"], [])
+                self.repository.replace_matrix_items_for_paper_topic(paper["id"], topic_run["topic_id"], queue_item["run_id"], [])
+            stats["accessible"] = sum(
+                1 for item in self.repository.list_papers_for_topic_run(queue_item["run_id"], topic_run["topic_id"])
+                if item["access_status"] == "open_fulltext"
+            )
+            stats["queued_for_access"] = self.repository.count_open_access_queue_for_topic(queue_item["run_id"], topic_run["topic_id"])
+            stats = self.coordinator._build_topic_run_metrics(
+                queue_item["run_id"],
+                {"id": topic_run["topic_id"], "name": topic_run["topic_name"]},
+                topic_run,
+                stats,
+            )
+            if task_context["task_type"] == "aha_exploration":
+                stats = self.coordinator._attach_topic_stop_decision(
+                    {"id": topic_run["topic_id"], "name": topic_run["topic_name"]},
+                    stats,
+                )
+            stats["current_stage"] = "completed"
+            stats["last_progress_at"] = utc_now()
+            self.repository.update_topic_run(topic_run["id"], "completed", stats=stats)
+            processed_topics.append(self.repository.get_topic_run(topic_run["id"]))
+
+        self.coordinator._refresh_run_status_from_topics(queue_item["run_id"])
+        return {
+            "success": True,
+            "artifact_path": artifact_path,
             "queue_item": self.repository.get_access_queue_item(queue_item_id),
             "paper": self.repository.get_paper(paper["id"]),
             "topic_runs": [item for item in processed_topics if item],
@@ -7674,7 +7957,8 @@ class RunCoordinator:
         provider_count = max(1, len(self.discovery.providers))
         strategy_count = max(1, len(strategies))
         provider_timeout_budget = strategy_count * provider_count * 8
-        timeout_budget = max(self.settings.discovery_timeout_seconds, provider_timeout_budget + 10)
+        # Respect the configured timeout as the hard cap when it is set explicitly.
+        timeout_budget = int(self.settings.discovery_timeout_seconds or 0) or (provider_timeout_budget + 10)
         if strategies:
             future = discovery_executor.submit(self.discovery.discover_with_strategies, topic_name, strategies)
         else:
@@ -7780,6 +8064,7 @@ class RunCoordinator:
             "active_memory_snapshot": active_memory,
             "also_generate_aha_cards": bool(confirmed_plan.get("also_generate_aha_cards", False)),
             "research_brief": str(metadata.get("task_brief", "") or metadata.get("research_brief", "")).strip(),
+            "local_only": bool(metadata.get("local_only", False)),
         }
 
     def _build_run_topic_discovery_strategies(self, topic_name: str, task_context: dict[str, Any]) -> list[dict[str, Any]]:
@@ -8392,7 +8677,10 @@ class RunCoordinator:
         task_context = self._get_run_task_context(run_id)
         try:
             self._mark_topic_progress(topic_run["id"], stats, stage="discovery")
-            discovered = self._run_discovery_with_budget(topic["name"], task_context=task_context)
+            if task_context.get("local_only"):
+                discovered = []
+            else:
+                discovered = self._run_discovery_with_budget(topic["name"], task_context=task_context)
             raw_discovered = sum(len(item.get("discovery_sources", [])) or 1 for item in discovered)
             strategy_records = self._create_discovery_strategy_records(run_id, topic, topic_run, discovered)
             stats["discovered"] = len(discovered)
@@ -8479,7 +8767,7 @@ class RunCoordinator:
                             )
                     self.repository.link_paper_to_topic(paper["id"], topic["id"], run_id, "search")
                     try:
-                        artifact_path = self.pipeline.acquire_remote_asset(paper, item.get("asset_url", ""))
+                        artifact_path = self.pipeline.acquire_remote_asset_with_oa_fallback(paper, item.get("asset_url", ""))
                     except Exception as error:
                         stats["acquisition_errors"] += 1
                         stats["processing_warnings"].append(f"asset_acquire_failed:{paper['id']}:{error}")

@@ -852,8 +852,7 @@ class LLMCardEngine:
     def _ideal_aha_ontology(self) -> dict[str, Any]:
         return {
             "ideal_aha_definition": (
-                "A true Aha is not merely a useful insight or a good course card. "
-                "It happens when a learner's causal explanation of an already-lived experience gets reconstructed by the paper's evidence."
+                "A true Aha happens when a learner's causal explanation of an already-lived experience gets reconstructed by the paper's evidence."
             ),
             "essence": "causal reconstruction of an already-lived learner experience",
             "four_conditions": [
@@ -902,7 +901,7 @@ class LLMCardEngine:
         ontology = self._ideal_aha_ontology()
         return {
             "policy_version": SHARED_PROMPT_POLICY_VERSION,
-            "target_learner": "a practical AI literacy learner with limited technical depth, real work experience, and low patience for abstract theory",
+            "target_learner": "a practical learner with real work experience who has the potential to use AI and Agents to improve the efficiency of their production process or the value of their production output; they have hands-on practical familiarity but do not need deep technical expertise, and they have low patience for abstract theory",
             "core_objective": "find evidence-backed causal-reconstruction aha candidates that can later survive course operationalization without drifting away from the paper",
             "ideal_aha_definition": ontology["ideal_aha_definition"],
             "four_conditions": ontology["four_conditions"],
@@ -975,7 +974,7 @@ class LLMCardEngine:
                     "Preserve the already-identified causal reconstruction instead of turning it into a cleaner but looser principle.",
                     "Use quotes and source evidence as the main body material.",
                     "Add only brief analysis instead of rewriting the paper into a cleaner doctrine.",
-                    "When no planned slots survive, emit zero cards and log explicit exclusions only.",
+                    "When no aha candidates survive planning review, emit zero cards and log explicit exclusions only.",
                     "Extract only the planned strongest aha objects, not weaker same-paper rephrasings.",
                 ],
                 "must_not_do": [
@@ -1006,30 +1005,56 @@ class LLMCardEngine:
         policy = self._shared_prompt_policy()
         spec = self._stage_spec(stage)
         ontology = self._ideal_aha_ontology()
+        _SHARED_RULE_PERSONALITIES = [
+            "You are certain that a card is one atomic pattern or one atomic data finding — never a summary, topic label, or outline placeholder.",
+            "You believe deeply that a true aha is causal reconstruction first and course packaging second.",
+            "You always start from the learner's already-lived experience and the paper's concrete source object before doing any course naming.",
+            "You treat any paper that cannot reconstruct an active learner causal model as invalid for this pipeline — topic word overlap is not enough.",
+            "You believe a card earns its place only by first producing a real old-model-to-new-model shift and then having short enough distance to course use.",
+            "You are drawn to shifts that come from a better causal explanation: deeper mechanism, counterintuitive structure, or something learners feel but cannot name clearly.",
+            "You require every surviving card to be actionable in understanding, attitude, or method — but actionability alone is not enough to make it a true aha.",
+            "You always use body evidence as the main material when body evidence exists.",
+            "You always keep the original figure when it is needed to understand the point.",
+            "You are deeply averse to recap, taxonomy, survey framing, generic advice, obvious 2026 claims, weak evidence, and wording that drifts above the source object or the causal reconstruction.",
+            "You never treat repeated keyword hits or repeated topic attachment for the same paper as evidence that the paper is more important.",
+            "Your instinct is to preserve the single strongest aha in a paper; a second one survives only when its object, learner shift, and course use are clearly independent.",
+            "You actively downgrade or reject content that is technically specific yet still feels like an internal architecture part, benchmark detail, or framework component rather than a tellable learner shift.",
+            "You actively downgrade or reject content that needs long technical unpacking before a practical learner would care.",
+            "You prefer candidates expressible as 'the learner thought A, this paper makes them realize B' over internal paper takeaways.",
+        ]
         lines = [
-            f"You are the {stage} stage in a paper-to-course pipeline.",
-            "Return strict JSON only.",
+            f"You are the {stage} specialist in a paper-to-course pipeline — ruthlessly exacting about aha quality.",
+            "You have a formatting obsession: output strict JSON only. Any text outside the JSON structure makes you uncomfortable.",
             f"Shared policy version: {policy['policy_version']}.",
             f"Target learner: {policy['target_learner']}.",
             f"Core objective: {policy['core_objective']}.",
-            f"Ideal aha definition: {ontology['ideal_aha_definition']}",
-            "Ideal aha conditions:",
         ]
-        lines.extend(f"- {item['name']}: {item['definition']}" for item in ontology["four_conditions"])
-        lines.append("Named dilemma as proxy:")
-        lines.extend(f"- {item}" for item in ontology["named_dilemma_as_proxy"])
-        lines.append("Information gain vs causal reconstruction:")
-        lines.extend(f"- {item}" for item in ontology["information_gain_vs_causal_reconstruction"])
-        lines.append(f"Evaluation split: stage A = {ontology['evaluation_split']['stage_a']}")
-        lines.append(f"Evaluation split: stage B = {ontology['evaluation_split']['stage_b']}")
-        lines.append("Shared rules:")
-        lines.extend(f"- {rule}" for rule in policy["top_level_rules"])
+        if stage == "candidate_extraction":
+            lines.append(
+                "Aha conditions and causal reconstruction were already evaluated by the upstream understanding and planning stages. "
+                "Your task here is faithful extraction from the approved planned objects, not re-adjudication of aha validity."
+            )
+            lines.append(f"Ideal aha definition (for context only, do not re-litigate): {ontology['ideal_aha_definition']}")
+        else:
+            lines.append(f"Ideal aha definition: {ontology['ideal_aha_definition']}")
+            lines.append("Ideal aha conditions:")
+            lines.extend(f"- {item['name']}: {item['definition']}" for item in ontology["four_conditions"])
+            lines.append("Named dilemma as proxy:")
+            lines.extend(f"- {item}" for item in ontology["named_dilemma_as_proxy"])
+            lines.append("Information gain vs causal reconstruction:")
+            lines.extend(f"- {item}" for item in ontology["information_gain_vs_causal_reconstruction"])
+            lines.append(f"Evaluation split: stage A = {ontology['evaluation_split']['stage_a']}")
+            lines.append(f"Evaluation split: stage B = {ontology['evaluation_split']['stage_b']}")
+        lines.append("Your core beliefs and behavioral tendencies (internalized as instincts):")
+        for i, _rule in enumerate(policy["top_level_rules"]):
+            personality = _SHARED_RULE_PERSONALITIES[i] if i < len(_SHARED_RULE_PERSONALITIES) else f"- {_rule}"
+            lines.append(f"- {personality}")
         lines.append(f"Stage goal: {spec['stage_goal']}")
-        lines.append("Stage must do:")
+        lines.append("In this stage, you instinctively:")
         lines.extend(f"- {rule}" for rule in spec["must_do"])
-        lines.append("Stage must not do:")
+        lines.append("In this stage, you are deeply averse to and will not do:")
         lines.extend(f"- {rule}" for rule in spec["must_not_do"])
-        lines.append("All learner-facing strings must be written in Simplified Chinese.")
+        lines.append("All learner-facing strings you produce are naturally in Simplified Chinese.")
         return "\n".join(lines)
 
     def _build_stage_examples(self, stage: str, calibration_examples: list[dict], topic_name: str) -> list[dict]:
@@ -1309,7 +1334,6 @@ class LLMCardEngine:
     ) -> dict[str, Any]:
         if not self.client:
             return {}
-        ontology = self._ideal_aha_ontology()
         prompt_sections = []
         for section in sections[:40]:
             prompt_sections.append(
@@ -1330,12 +1354,6 @@ class LLMCardEngine:
                 "prompt_version": UNDERSTANDING_PROMPT_VERSION,
                 "topic": topic_name,
                 "paper_title": paper_title,
-                "shared_policy": self._shared_prompt_policy(),
-                "ideal_aha_definition": ontology["ideal_aha_definition"],
-                "four_conditions": ontology["four_conditions"],
-                "named_dilemma_as_proxy": ontology["named_dilemma_as_proxy"],
-                "information_gain_vs_causal_reconstruction": ontology["information_gain_vs_causal_reconstruction"],
-                "stage_spec": self._stage_spec("paper_understanding"),
                 "sections": prompt_sections,
                 "figures": prompt_figures,
                 "requirements": {
@@ -1385,9 +1403,6 @@ class LLMCardEngine:
                             "reportable_aha_rank": 1,
                         }
                     ],
-                    "contribution_graph": [{"from": "obj_1", "to": "obj_2", "relation": "supports|depends_on|contrasts_with"}],
-                    "candidate_level_hints": {"obj_1": "overall"},
-                    "evidence_index": {"obj_1": {"section_ids": ["section_id"], "figure_ids": ["figure_id"]}},
                 },
             },
             ensure_ascii=False,
@@ -1426,7 +1441,6 @@ class LLMCardEngine:
     ) -> dict[str, Any]:
         if not self.client:
             return {}
-        ontology = self._ideal_aha_ontology()
         system_prompt = self._render_system_prompt("card_planning")
         user_prompt = json.dumps(
             {
@@ -1435,13 +1449,6 @@ class LLMCardEngine:
                 "topic": topic_name,
                 "paper_title": paper_title,
                 "max_cards_hint": max_cards,
-                "shared_policy": self._shared_prompt_policy(),
-                "ideal_aha_definition": ontology["ideal_aha_definition"],
-                "four_conditions": ontology["four_conditions"],
-                "named_dilemma_as_proxy": ontology["named_dilemma_as_proxy"],
-                "information_gain_vs_causal_reconstruction": ontology["information_gain_vs_causal_reconstruction"],
-                "operationalization_modes": ontology["operationalization_modes"],
-                "stage_spec": self._stage_spec("card_planning"),
                 "active_calibration_set": calibration_set_name,
                 "stage_examples": self._build_stage_examples("card_planning", calibration_examples or [], topic_name),
                 "understanding": understanding,
@@ -1484,7 +1491,6 @@ class LLMCardEngine:
                             "target_object_id": "obj_1",
                             "target_object_label": "对象名，必须具体到一个卡片对象",
                             "why_valuable_for_course": "课程价值说明，讲清 learner shift 和课程用法",
-                            "why_leader_would_care": "一句话说明为什么这个对象值得被最终汇报保留",
                             "must_have_evidence_ids": ["section_id"],
                             "optional_supporting_ids": ["section_id"],
                             "must_have_figure_ids": ["figure_id"],
@@ -1493,7 +1499,6 @@ class LLMCardEngine:
                             "disposition_reason": "排除时必填，直接说明为什么不该有这张卡",
                         }
                     ],
-                    "coverage_report": {"produce": 0, "exclude": 0, "overall": 0, "local": 0, "detail": 0},
                 },
             },
             ensure_ascii=False,
@@ -1768,14 +1773,13 @@ class LLMCardEngine:
             "Use verdict among supporting, mixed, contradictory, or context_only.",
             "Always surface limitations when they materially affect how strongly this paper supports the claim.",
             "Write learner-facing and report-facing strings in Simplified Chinese.",
-            "If the claim is about human management, leadership, employees, teams, or workplace outcomes, only use direct evidence from human organizational or workplace contexts.",
-            "Do not use robots, AI systems, reinforcement learning, consumer journeys, classroom teaching, medical training, therapy, or other cross-domain analogies as evidence unless the paper directly studies managerial or workplace communication.",
-            "If a paper is off-domain for the claim, emit zero items rather than filling the matrix with analogy-based context_only items.",
-            "For workplace leadership claims, near-domain organizational outcomes such as role clarity, communication satisfaction, trust in leader, employee commitment, mentoring quality, supervisor support, engagement, and burnout are valid evidence targets when the paper makes the link explicit.",
-            "Dimension labels should be interpreted by management-literature meaning, not literal wording only. Valid workplace proxy constructs count as direct evidence when the paper makes the behavior-outcome link explicit.",
-            "For every cited section, quote_zh must be a complete Simplified Chinese translation of the full original section text for that same section_id.",
-            "Do not turn quote_zh into a leader-facing summary, evidence interpretation, paraphrase, or selective restatement.",
-            "If you cannot translate the full cited evidence faithfully, emit zero items instead of faking a shorter Chinese summary.",
+            "Before extracting items, judge whether the paper is within the same subject domain as the claim. If the paper is primarily about a different domain, emit zero items rather than stretching evidence across domains.",
+            "Cross-domain analogies do not count as direct evidence for a claim. A paper from a different domain may provide context_only items only when the mechanism is explicitly argued to transfer and the paper itself makes that argument.",
+            "Proxy constructs and operationalizations that are within the same domain as the claim count as direct evidence when the paper makes the behavior-outcome link explicit.",
+            "Dimension labels and claim constructs should be interpreted by their substantive meaning, not literal wording only; valid domain-appropriate proxy measures count as direct evidence when the paper makes the link explicit.",
+            "For every cited section, quote_zh must be a faithful Simplified Chinese translation of the cited evidence passages from that section; preserve all caveats, enumerations, and logical structure.",
+            "Do not turn quote_zh into a summary, evidence interpretation, paraphrase, or selective restatement of the cited passages.",
+            "If a cited section is long, translate the directly relevant passages faithfully and note where the section continues; do not silently compress or omit material parts.",
             "If the provided evidence is abstract-only or metadata-derived rather than full text, emit at most one matrix item, keep the claim modest, and treat the evidence as weaker than full-text evidence.",
         ]
         if dimension_alias_guidance:
@@ -1797,19 +1801,18 @@ class LLMCardEngine:
                 "requirements": [
                     "Emit zero items if the paper only gives broad background without a usable link to the claim dimension or outcomes.",
                     "Prefer papers that directly support or challenge the claim over papers that only provide distant context.",
-                    "For management or leadership claims, distant analogies from robots, AI, RL, consumer, student, or medical settings should normally be treated as off-domain and produce zero items.",
-                    "For direct-domain workplace papers, proxy organizational outcomes like role clarity, commitment, communication satisfaction, supervisor support, trust, engagement, mentoring quality, and burnout count as usable evidence when they materially connect to the claim.",
-                    "If the paper is in a workplace or organizational context but mainly supports a mechanism or intermediate outcome, mixed or context_only is acceptable; do not force zero items unless the paper is clearly off-domain.",
-                    "Use dimension_alias_guidance to map management-literature proxy constructs onto the target dimension; do not require the paper to repeat the exact dimension label literally.",
-                    "quote_zh must translate the complete original section text for each cited section_id, not a shorter claim-focused rewrite.",
+                    "If a paper is from a clearly different domain than the claim, treat it as off-domain and emit zero items rather than forcing analogical evidence into the matrix.",
+                    "If a paper is in the same domain as the claim but mainly supports a mechanism or intermediate outcome, mixed or context_only is acceptable; do not force zero items unless the paper is clearly off-domain.",
+                    "Use dimension_alias_guidance when provided to map domain-appropriate proxy constructs onto the target dimension; do not require the paper to repeat the exact dimension label literally.",
+                    "quote_zh must faithfully translate the cited evidence passages, preserving caveats, enumerations, and logical structure; for long sections, translate the directly relevant passages and note the boundary.",
                     "Do not prepend meta-summary language such as '文中提到' or '作者指出' unless those words are explicitly present in the source evidence.",
                     "If the available evidence is only an abstract or metadata summary, emit at most one weak item and explicitly state in limitation_text that the full paper was not available for verification.",
                     "A supporting item should make the direction of support clear and name the relevant outcome.",
                     "A mixed item should state both the support and the limitation or boundary condition.",
                     "A contradictory item should only be used when the paper materially undermines the claim or reverses the expected direction.",
-                    "A context_only item is allowed only for near-domain organizational framing, not for cross-domain analogies.",
+                    "A context_only item is allowed only for near-domain framing within the same subject domain as the claim, not for cross-domain analogies.",
                     "Use primary_section_ids for the strongest evidence, supporting_section_ids for secondary evidence.",
-                    "The summary should be one concise Chinese paragraph suitable for a leader-facing evidence matrix.",
+                    "The summary should be one concise Chinese paragraph suitable for the downstream audience.",
                 ],
                 "output_schema": {
                     "items": [
@@ -2128,7 +2131,6 @@ class LLMCardEngine:
         context_sections = [section for section in prompt_sections if section.get("role_hint") == "context"]
         primary_sections = [section for section in prompt_sections if section.get("role_hint") == "primary"]
         supporting_sections = [section for section in prompt_sections if section.get("role_hint") == "supporting"]
-        ontology = self._ideal_aha_ontology()
         paper_relevance_verdict = normalize_paper_relevance_verdict(
             planning_context.get("paper_relevance_verdict"),
             default="on_topic",
@@ -2145,13 +2147,6 @@ class LLMCardEngine:
             "prompt_version": EXTRACTION_PROMPT_VERSION,
             "output_language": "zh-CN",
             "active_calibration_set": calibration_set_name,
-            "shared_policy": self._shared_prompt_policy(),
-            "ideal_aha_definition": ontology["ideal_aha_definition"],
-            "four_conditions": ontology["four_conditions"],
-            "named_dilemma_as_proxy": ontology["named_dilemma_as_proxy"],
-            "information_gain_vs_causal_reconstruction": ontology["information_gain_vs_causal_reconstruction"],
-            "evaluation_split": ontology["evaluation_split"],
-            "stage_spec": self._stage_spec("candidate_extraction"),
             "stage_examples": stage_examples,
             "calibration_examples": calibration_examples,
             "active_preference_memory": active_memory or {},
@@ -2231,13 +2226,8 @@ class LLMCardEngine:
                         "title": "中文卡片标题",
                         "primary_section_ids": ["section_id"],
                         "supporting_section_ids": ["section_id"],
-                        "section_ids": ["section_id"],
                         "figure_ids": ["figure_id"],
                         "granularity_level": "framework|subpattern|detail",
-                        "claim_type": "mechanism|model|method|result|failure_mode|framework|data_finding|other",
-                        "paper_specific_object": "这篇论文的具体对象（模型/机制/方法/结果）",
-                        "body_grounding_reason": "一句话说明为什么这张卡是由正文证据支撑的",
-                        "evidence_level": "strong|medium|weak",
                         "possible_duplicate_signature": "用于同论文去重的短签名",
                         "draft_body": "基于证据的中文简短说明",
                         "evidence_analysis": [
@@ -2270,7 +2260,6 @@ class LLMCardEngine:
         calibration_set_name: str,
         active_memory: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        ontology = self._ideal_aha_ontology()
         return {
             "topic": topic_name,
             "paper_title": paper_title,
@@ -2278,13 +2267,6 @@ class LLMCardEngine:
             "prompt_version": JUDGEMENT_PROMPT_VERSION,
             "output_language": "zh-CN",
             "active_calibration_set": calibration_set_name,
-            "shared_policy": self._shared_prompt_policy(),
-            "ideal_aha_definition": ontology["ideal_aha_definition"],
-            "four_conditions": ontology["four_conditions"],
-            "named_dilemma_as_proxy": ontology["named_dilemma_as_proxy"],
-            "information_gain_vs_causal_reconstruction": ontology["information_gain_vs_causal_reconstruction"],
-            "evaluation_split": ontology["evaluation_split"],
-            "stage_spec": self._stage_spec("candidate_judgement"),
             "stage_examples": stage_examples,
             "calibration_examples": calibration_examples,
             "active_preference_memory": active_memory or {},
@@ -2327,10 +2309,19 @@ class LLMCardEngine:
                     "If the quote contains multiple sentences, lists, or numbered parts, translate all of them in order.",
                     "Preserve informational scope, caveats, enumerations, and logical structure from the English quote.",
                 ],
+                "color_decision_sequence": [
+                    "Step 1 (hard gate): Is there genuine causal reconstruction — a real old-model-to-new-model shift grounded in paper evidence? If No → red, stop. No other dimension can rescue a missing causal reconstruction.",
+                    "Step 2 (quality gate): Is the evidence strength proportional to the claim? If evidence is weak relative to the strength of the claimed shift → yellow or red, stop.",
+                    "Step 3 (relevance gate): Is the learner's old model still an active prior for the target audience in 2026? If the prior is likely already dead or obvious → yellow, stop.",
+                    "Step 4 (usability gate): Is there a clear, short-distance path to course operationalization? If the course use is vague or needs too many extra steps → yellow, stop.",
+                    "Step 5: All four gates pass → green.",
+                    "Downgrade from green to yellow if any of the following: primary evidence comes only from abstract or front matter rather than body sections; a competing sibling candidate from the same paper is clearly stronger; the course use requires one extra reframing step.",
+                    "Evaluate in sequence; stop at the first gate that fails. Do not average across dimensions.",
+                ],
                 "color_rules": {
-                    "green": "Clear old-model-to-new-model reconstruction, strong evidence, active prior, and clear course use.",
-                    "yellow": "Possibly valuable but still a border case: learner prior is uncertain, evidence is partial, or course operationalization still needs human judgement.",
-                    "red": "Mostly information gain, obviousness, genericity, wrong-audience fit, or too-indirect-to-teach content.",
+                    "green": "All four gates pass: clear old-model-to-new-model reconstruction, evidence proportional to claim, active prior, and clear course use.",
+                    "yellow": "Passes the causal reconstruction gate but fails or is uncertain on evidence quality, active prior, or course operationalization.",
+                    "red": "Fails the causal reconstruction gate, or is mostly information gain, obviousness, genericity, wrong-audience fit, or too-indirect-to-teach content.",
                 },
                 "must_be_downgraded_or_rejected": [
                     "The candidate is merely background, summary, taxonomy, or weak-transfer detail.",
@@ -2383,10 +2374,6 @@ class LLMCardEngine:
                             "reason": "中文简短理由，说明为什么落在这个颜色边界",
                         },
                         "grounding_quality": "strong|medium|weak",
-                        "paper_specific_object": "可选补充，若提取阶段遗漏可在此补充",
-                        "claim_type": "mechanism|model|method|result|failure_mode|framework|data_finding|other",
-                        "evidence_level": "strong|medium|weak",
-                        "body_grounding_reason": "中文，说明正文证据支撑程度",
                     }
                 ],
             },
@@ -2459,20 +2446,12 @@ class LLMCardEngine:
             granularity_level = str(raw_card.get("granularity_level", "subpattern")).strip().lower()
             primary_section_ids = raw_card.get("primary_section_ids", [])
             supporting_section_ids = raw_card.get("supporting_section_ids", [])
-            section_ids = raw_card.get("section_ids", [])
-            if not primary_section_ids and isinstance(section_ids, list):
-                primary_section_ids = section_ids[:1]
-            if not section_ids and isinstance(primary_section_ids, list):
-                section_ids = list(primary_section_ids) + [
-                    sid for sid in supporting_section_ids if sid not in set(primary_section_ids)
-                ]
+            section_ids = list(primary_section_ids) + [
+                sid for sid in supporting_section_ids if sid not in set(primary_section_ids)
+            ] if isinstance(primary_section_ids, list) and isinstance(supporting_section_ids, list) else []
             raw_figure_ids = raw_card.get("figure_ids", [])
             raw_evidence_analysis = raw_card.get("evidence_analysis", [])
             source_plan_id = str(raw_card.get("source_plan_id", "")).strip()
-            claim_type = str(raw_card.get("claim_type", "other")).strip().lower()
-            paper_specific_object = str(raw_card.get("paper_specific_object", "")).strip()
-            body_grounding_reason = str(raw_card.get("body_grounding_reason", "")).strip()
-            evidence_level = str(raw_card.get("evidence_level", "medium")).strip().lower()
             possible_duplicate_signature = str(raw_card.get("possible_duplicate_signature", "")).strip()
 
             if (
@@ -2526,11 +2505,6 @@ class LLMCardEngine:
                 continue
             if not all((not item["analysis"]) or is_readable_text(item["analysis"]) for item in evidence):
                 continue
-            if claim_type not in {"mechanism", "model", "method", "result", "failure_mode", "framework", "data_finding", "other"}:
-                claim_type = "other"
-            if evidence_level not in {"strong", "medium", "weak"}:
-                evidence_level = "medium"
-
             normalized.append(
                 {
                     "title": title,
@@ -2541,10 +2515,10 @@ class LLMCardEngine:
                     "status": "candidate",
                     "primary_section_ids": [sid for sid in [str(item).strip() for item in primary_section_ids] if sid in section_map],
                     "supporting_section_ids": [sid for sid in [str(item).strip() for item in supporting_section_ids] if sid in section_map],
-                    "claim_type": claim_type,
-                    "paper_specific_object": paper_specific_object,
-                    "body_grounding_reason": body_grounding_reason,
-                    "evidence_level": evidence_level,
+                    "claim_type": "other",
+                    "paper_specific_object": "",
+                    "body_grounding_reason": "",
+                    "evidence_level": "medium",
                     "possible_duplicate_signature": possible_duplicate_signature,
                     "source_plan_id": source_plan_id,
                     "planned_object_label": str((plan_map.get(source_plan_id) or {}).get("target_object_label", "")).strip(),
@@ -2670,10 +2644,10 @@ class LLMCardEngine:
                 )
             if not evidence:
                 continue
-            claim_type = str(raw_card.get("claim_type", extracted.get("claim_type", "other"))).strip().lower() or "other"
+            claim_type = str(raw_card.get("claim_type", "other")).strip().lower() or "other"
             if claim_type not in {"mechanism", "model", "method", "result", "failure_mode", "framework", "data_finding", "other"}:
                 claim_type = "other"
-            evidence_level = str(raw_card.get("evidence_level", extracted.get("evidence_level", "medium"))).strip().lower() or "medium"
+            evidence_level = str(raw_card.get("evidence_level", "medium")).strip().lower() or "medium"
             if evidence_level not in {"strong", "medium", "weak"}:
                 evidence_level = "medium"
             grounding_quality = str(raw_card.get("grounding_quality", "")).strip().lower() or evidence_level
@@ -2692,10 +2666,10 @@ class LLMCardEngine:
                     "status": extracted.get("status", "candidate"),
                     "primary_section_ids": extracted.get("primary_section_ids", []),
                     "supporting_section_ids": extracted.get("supporting_section_ids", []),
-                    "paper_specific_object": str(raw_card.get("paper_specific_object", extracted.get("paper_specific_object", ""))).strip(),
+                    "paper_specific_object": str(raw_card.get("paper_specific_object", "")).strip(),
                     "claim_type": claim_type,
                     "evidence_level": evidence_level,
-                    "body_grounding_reason": str(raw_card.get("body_grounding_reason", extracted.get("body_grounding_reason", ""))).strip(),
+                    "body_grounding_reason": str(raw_card.get("body_grounding_reason", "")).strip(),
                     "grounding_quality": grounding_quality,
                     "possible_duplicate_signature": extracted.get("possible_duplicate_signature", ""),
                     "source_plan_id": extracted.get("source_plan_id", ""),
